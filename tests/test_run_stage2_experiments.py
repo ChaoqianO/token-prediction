@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from scripts import run_stage2_experiments as stage2
 from token_prediction.dataset import PredictionPosition, PredictionTarget
@@ -158,7 +158,7 @@ class Stage2RunnerTests(unittest.TestCase):
                     stage2._safe_output_root(root, unsafe)
 
     def test_compact_artifact_keys_fit_the_windows_legacy_path_budget(self) -> None:
-        root = Path(__file__).resolve().parents[1]
+        root = PureWindowsPath(r"E:\kabuda\token prediction")
         experiment_key = stage2._artifact_key("e", "x" * 200)
         candidate_key = stage2._artifact_key("c", "y" * 200)
         self.assertEqual(len(experiment_key), 18)
