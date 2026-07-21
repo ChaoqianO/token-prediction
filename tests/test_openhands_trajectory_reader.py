@@ -15,6 +15,7 @@ from token_prediction.collection.openhands_trajectory import (
     OpenHandsArchiveSchemaError,
 )
 from token_prediction.contracts import EventType, Observable
+from token_prediction.dataset import PredictionPosition, build_supervised_dataset
 from token_prediction.features import replay_feature_snapshots
 
 
@@ -441,53 +442,168 @@ class OpenHandsTrajectoryReaderTests(unittest.TestCase):
                 ],
             )
 
-    def test_condition_identity_includes_response_provider_and_resolved_model(
+    def test_task_condition_and_task_pre_identity_ignore_suffix_response_route(
         self,
     ) -> None:
-        baseline = _completion(
+        first = _completion(
             timestamp=1.0,
             created=1_700_000_001,
-            response_id="response-baseline",
+            response_id="response-first",
         )
-        changed_provider = copy.deepcopy(baseline)
-        changed_provider["response"]["id"] = "response-provider"  # type: ignore[index]
-        changed_provider["response"]["provider"] = "azure"  # type: ignore[index]
-        changed_model = copy.deepcopy(baseline)
-        changed_model["response"]["id"] = "response-model"  # type: ignore[index]
-        changed_model["response"]["model"] = "gpt-5.2-2026-01-15"  # type: ignore[index]
+        baseline_suffix = _completion(
+            timestamp=2.0,
+            created=1_700_000_002,
+            response_id="response-baseline-suffix",
+            messages=[*_base_messages(), _historical_assistant()],
+        )
+        perturbed_suffix = copy.deepcopy(baseline_suffix)
+        perturbed_suffix["response"]["id"] = "response-perturbed-suffix"  # type: ignore[index]
+        perturbed_suffix["response"]["provider"] = "azure"  # type: ignore[index]
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             reader = OpenHandsArchiveReader()
-            trajectories = []
-            for name, completion in (
-                ("baseline", baseline),
-                ("provider", changed_provider),
-                ("model", changed_model),
-            ):
-                path = _write_archive(
-                    root / name / "fixture.tar.gz",
-                    [(_member(1, TASK_ID, _completion_name(1.0)), completion)],
+            trajectories = [
+                reader.read(
+                    _write_archive(
+                        root / name / "fixture.tar.gz",
+                        [
+                            (_member(1, TASK_ID, _completion_name(1.0)), first),
+                            (_member(1, TASK_ID, _completion_name(2.0)), suffix),
+                        ],
+                    ),
+                    _metadata(),
+                )[0]
+                for name, suffix in (
+                    ("baseline", baseline_suffix),
+                    ("perturbed", perturbed_suffix),
                 )
-                first = reader.read(path, _metadata())[0]
-                second = reader.read(path, _metadata())[0]
-                self.assertEqual(first.condition_id, second.condition_id)
-                trajectories.append(first)
+            ]
 
-        self.assertEqual(len({item.condition_id for item in trajectories}), 3)
-        started = [item.events[0].payload for item in trajectories]
-        self.assertEqual(
-            [payload["provider"] for payload in started],
-            ["openai", "azure", "openai"],
-        )
-        self.assertEqual(
-            [payload["resolved_model_id"] for payload in started],
+        baseline, perturbed = trajectories
+        self.assertEqual(baseline.condition_id, perturbed.condition_id)
+        self.assertEqual(baseline.events[0].payload, perturbed.events[0].payload)
+        self.assertNotIn("provider", baseline.events[0].payload)
+        self.assertNotIn("resolved_model_id", baseline.events[0].payload)
+
+        launch_snapshots = [
+            replay_feature_snapshots(
+                trajectory.events,
+                include_task_started=True,
+            )[0]
+            for trajectory in trajectories
+        ]
+        self.assertEqual(launch_snapshots[0], launch_snapshots[1])
+
+        task_pre_points = []
+        for trajectory in trajectories:
+            rows = [
+                row
+                for row in build_supervised_dataset([trajectory]).rows
+                if row.point.position == PredictionPosition.TASK_PRE
+            ]
+            self.assertEqual(len(rows), 1)
+            task_pre_points.append(rows[0].point)
+        self.assertEqual(task_pre_points[0], task_pre_points[1])
+
+        attempts = [
             [
-                "gpt-5.2-2025-12-11",
-                "gpt-5.2-2025-12-11",
-                "gpt-5.2-2026-01-15",
+                event.payload
+                for event in trajectory.events
+                if event.event_type == EventType.API_ATTEMPT_STARTED
+            ]
+            for trajectory in trajectories
+        ]
+        self.assertEqual(attempts[0], attempts[1])
+        for payload in attempts[0]:
+            self.assertEqual(
+                payload,
+                {
+                    "configured_provider": "openai",
+                    "configured_model": MODEL,
+                    "tool_config_hash": baseline.events[0].payload["tool_config_hash"],
+                },
+            )
+
+        completed_routes = [
+            [
+                (event.payload["provider"], event.payload["resolved_model"])
+                for event in trajectory.events
+                if event.event_type == EventType.API_COMPLETED
+            ]
+            for trajectory in trajectories
+        ]
+        self.assertEqual(
+            completed_routes[0],
+            [
+                ("openai", "gpt-5.2-2025-12-11"),
+                ("openai", "gpt-5.2-2025-12-11"),
             ],
         )
+        self.assertEqual(
+            completed_routes[1],
+            [
+                ("openai", "gpt-5.2-2025-12-11"),
+                ("azure", "gpt-5.2-2025-12-11"),
+            ],
+        )
+
+    def test_run_configured_provider_tool_config_and_resolved_model_are_stable(
+        self,
+    ) -> None:
+        first_task = _completion(
+            timestamp=1.0,
+            created=1_700_000_001,
+            response_id="response-first-task",
+        )
+        second_task = _completion(
+            timestamp=1.0,
+            created=1_700_000_002,
+            response_id="response-second-task",
+        )
+        azure_task = copy.deepcopy(second_task)
+        azure_task["response"]["provider"] = "azure"  # type: ignore[index]
+        changed_tools = copy.deepcopy(second_task)
+        changed_tools["kwargs"]["tools"][0]["function"][  # type: ignore[index]
+            "description"
+        ] = "Different configured tool."
+        changed_model = copy.deepcopy(second_task)
+        changed_model["response"]["model"] = "gpt-5.2-other"  # type: ignore[index]
+
+        cases = {
+            "configured provider": (
+                azure_task,
+                _completion_name(1.0).replace("openai__", "azure__"),
+                "stable configured filename provider",
+            ),
+            "tool config": (
+                changed_tools,
+                _completion_name(1.0),
+                "stable completion tool configuration",
+            ),
+            "resolved model": (
+                changed_model,
+                _completion_name(1.0),
+                "stable resolved response model",
+            ),
+        }
+        for label, (completion, filename, error) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                path = _write_archive(
+                    Path(temporary) / "fixture.tar.gz",
+                    [
+                        (
+                            _member(1, f"{TASK_ID}-a", _completion_name(1.0)),
+                            first_task,
+                        ),
+                        (
+                            _member(1, f"{TASK_ID}-b", filename),
+                            completion,
+                        ),
+                    ],
+                )
+                with self.assertRaisesRegex(OpenHandsArchiveSchemaError, error):
+                    OpenHandsArchiveReader().read(path, _metadata())
 
     def test_archive_is_read_forward_only_without_extract_or_member_listing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -766,7 +882,14 @@ class OpenHandsTrajectoryReaderTests(unittest.TestCase):
             {event.logical_call_id for event in requests},
             {event.logical_call_id for event in attempts},
         )
-        self.assertTrue(all(event.payload["retry_observable"] is False for event in attempts))
+        completed = [
+            event
+            for event in trajectory.events
+            if event.event_type == EventType.API_COMPLETED
+        ]
+        self.assertTrue(
+            all(event.payload["retry_observable"] is False for event in completed)
+        )
         terminal = trajectory.events[-1]
         self.assertEqual(
             terminal.payload["response_not_materialized_in_next_request_count"],
@@ -962,6 +1085,7 @@ class OpenHandsTrajectoryReaderTests(unittest.TestCase):
 
     def test_capabilities_and_payload_do_not_claim_local_counts_or_leak_raw_content(self) -> None:
         reader = OpenHandsArchiveReader()
+        self.assertEqual(reader.source_id, "openhands_archive_trajectory_v3")
         self.assertIn(Observable.TASK_USAGE, reader.capabilities.observables)
         self.assertIn(Observable.CALL_USAGE, reader.capabilities.observables)
         self.assertIn(Observable.ATTEMPT_USAGE, reader.capabilities.observables)
@@ -1110,6 +1234,8 @@ class OpenHandsTrajectoryReaderTests(unittest.TestCase):
             _event_types(zero_call),
             [EventType.TASK_STARTED, EventType.TASK_FINISHED],
         )
+        self.assertNotIn("provider", zero_call.events[0].payload)
+        self.assertNotIn("resolved_model_id", zero_call.events[0].payload)
         self.assertEqual(zero_call.events[-1].payload["completion_snapshot_count"], 0)
         self.assertEqual(zero_call.events[-1].payload["known_usage_attempts"], 0)
         self.assertEqual(zero_call.events[-1].payload["missing_usage_attempts"], 0)

@@ -187,6 +187,7 @@ class _CallSnapshot:
     member_name: str
     filename_timestamp: Decimal
     top_timestamp: Decimal
+    configured_provider: str
     request_message_count: int
     request_role_counts: tuple[tuple[str, int], ...]
     request_content_chars: int
@@ -208,8 +209,8 @@ class _PreparedTask:
     run: _RunDescriptor
     task_id: str
     tool_config_hash: str
-    provider: str
-    resolved_model: str
+    configured_provider: str
+    resolved_model: str | None
     calls: tuple[_CallSnapshot, ...]
     fallback_tools: tuple[tuple[_FallbackToolResult, ...], ...]
     message_prefix_reset_count: int
@@ -272,7 +273,7 @@ class OpenHandsArchiveReader:
     or retry events, and no generation checkpoint is synthesized.
     """
 
-    source_id = "openhands_archive_trajectory_v2"
+    source_id = "openhands_archive_trajectory_v3"
     capabilities = SourceCapabilities(
         source_id=source_id,
         observables=frozenset(
@@ -2002,7 +2003,6 @@ def _prepare_task_snapshots(
     tool_config_hashes = {snapshot.tool_config_hash for snapshot in ordered}
     filename_models = {snapshot.filename_model for snapshot in ordered}
     filename_providers = {snapshot.filename_provider for snapshot in ordered}
-    response_providers = {snapshot.response.provider for snapshot in ordered}
     resolved_models = {snapshot.response.model for snapshot in ordered}
     if len(tool_config_hashes) != 1:
         raise OpenHandsArchiveSchemaError(
@@ -2011,11 +2011,11 @@ def _prepare_task_snapshots(
     if (
         filename_models != {run.model}
         or len(filename_providers) != 1
-        or len(response_providers) != 1
         or len(resolved_models) != 1
     ):
         raise OpenHandsArchiveSchemaError(
-            "model/provider identity changes within one task trajectory"
+            "configured filename identity or resolved response model changes "
+            "within one task trajectory"
         )
     calls: list[_CallSnapshot] = []
     for snapshot in ordered:
@@ -2025,6 +2025,7 @@ def _prepare_task_snapshots(
                 member_name=snapshot.member_name,
                 filename_timestamp=snapshot.filename_timestamp,
                 top_timestamp=snapshot.top_timestamp,
+                configured_provider=snapshot.filename_provider,
                 request_message_count=len(snapshot.messages),
                 request_role_counts=tuple(sorted(role_counts.items())),
                 request_content_chars=sum(
@@ -2053,7 +2054,7 @@ def _prepare_task_snapshots(
         run=run,
         task_id=task_id,
         tool_config_hash=next(iter(tool_config_hashes)),
-        provider=next(iter(response_providers)),
+        configured_provider=next(iter(filename_providers)),
         resolved_model=next(iter(resolved_models)),
         calls=tuple(calls),
         fallback_tools=fallback_tools,
@@ -2105,19 +2106,28 @@ def _finalize_run(
         raise OpenHandsArchiveSchemaError("run contains no normalizable task-runs")
 
     tool_hashes = {item.tool_config_hash for item in prepared_tasks.values()}
-    providers = {item.provider for item in prepared_tasks.values()}
-    resolved_models = {item.resolved_model for item in prepared_tasks.values()}
+    configured_providers = {
+        item.configured_provider for item in prepared_tasks.values()
+    }
+    resolved_models = {
+        item.resolved_model
+        for item in prepared_tasks.values()
+        if item.calls and item.resolved_model is not None
+    }
     if not tool_hashes or len(tool_hashes) != 1:
         raise OpenHandsArchiveSchemaError(
             "run does not expose one stable completion tool configuration"
         )
-    if len(providers) != 1 or len(resolved_models) != 1:
+    if len(configured_providers) != 1:
         raise OpenHandsArchiveSchemaError(
-            "run does not expose one stable provider/model identity"
+            "run does not expose one stable configured filename provider"
+        )
+    if len(resolved_models) != 1:
+        raise OpenHandsArchiveSchemaError(
+            "run does not expose one stable resolved response model"
         )
     default_tool_hash = next(iter(tool_hashes))
-    default_provider = next(iter(providers))
-    default_resolved_model = next(iter(resolved_models))
+    default_configured_provider = next(iter(configured_providers))
     for task_id in sorted(task_ids):
         prepared = prepared_tasks.get(task_id)
         if prepared is None:
@@ -2125,8 +2135,8 @@ def _finalize_run(
                 run=run,
                 task_id=task_id,
                 tool_config_hash=default_tool_hash,
-                provider=default_provider,
-                resolved_model=default_resolved_model,
+                configured_provider=default_configured_provider,
+                resolved_model=None,
                 calls=(),
                 fallback_tools=(),
                 message_prefix_reset_count=0,
@@ -2183,15 +2193,18 @@ def _normalize_prepared_task(
     archive_identity_hash: str,
     archive_identity_source: str,
 ) -> Trajectory:
+    if bool(prepared.calls) != (prepared.resolved_model is not None):
+        raise OpenHandsArchiveSchemaError(
+            "realized response model must exist exactly when completion calls exist"
+        )
     run = prepared.run
     task_id = prepared.task_id
     tool_config_hash = prepared.tool_config_hash
-    provider = prepared.provider
-    resolved_model = prepared.resolved_model
+    # Task-pre identity may use only configured facts.  Realized response route
+    # and model are completion-time observations and therefore stay out of this
+    # semantic and the TASK_STARTED payload below.
     condition_semantic = {
         "model": run.model,
-        "provider": provider,
-        "resolved_model": resolved_model,
         "openhands_version": run.openhands_version,
         "max_iterations": run.max_iterations,
         "hint_mode": run.hint_mode,
@@ -2253,8 +2266,6 @@ def _normalize_prepared_task(
             "condition_id": condition_id,
             "benchmark_id": metadata.benchmark_id,
             "model_id": run.model,
-            "resolved_model_id": resolved_model,
-            "provider": provider,
             "agent_id": "OpenHands",
             "agent_version": run.openhands_version,
             "max_steps": run.max_iterations,
@@ -2284,6 +2295,9 @@ def _normalize_prepared_task(
                 "request_role_counts": dict(snapshot.request_role_counts),
                 "request_content_chars": snapshot.request_content_chars,
                 "request_content_hash": snapshot.request_content_hash,
+                "configured_provider": snapshot.configured_provider,
+                "configured_model": run.model,
+                "tool_config_hash": tool_config_hash,
                 "source_filename_timestamp": str(snapshot.filename_timestamp),
                 "source_log_timestamp": str(snapshot.top_timestamp),
             },
@@ -2294,13 +2308,9 @@ def _normalize_prepared_task(
             attempt_id=attempt_id,
             raw_ref=raw_ref,
             payload={
-                "provider": snapshot.response.provider,
+                "configured_provider": snapshot.configured_provider,
                 "configured_model": run.model,
-                "resolved_model": snapshot.response.model,
-                "response_id_hash": snapshot.response.response_id_hash,
-                "source_response_created": snapshot.response.created,
-                "retry_observable": False,
-                "attempt_ordinal_source": "one_completion_one_observed_attempt",
+                "tool_config_hash": tool_config_hash,
             },
         )
         append(
@@ -2310,8 +2320,13 @@ def _normalize_prepared_task(
             raw_ref=raw_ref,
             payload={
                 "usage": snapshot.response.usage.to_payload(),
+                "provider": snapshot.response.provider,
+                "resolved_model": snapshot.response.model,
                 "finish_reason": snapshot.response.finish_reason,
                 "response_id_hash": snapshot.response.response_id_hash,
+                "source_response_created": snapshot.response.created,
+                "retry_observable": False,
+                "attempt_ordinal_source": "one_completion_one_observed_attempt",
                 "output_content_hash": snapshot.response.content.content_hash,
                 "output_content_chars": snapshot.response.content.chars,
                 "output_content_bytes": snapshot.response.content.bytes,

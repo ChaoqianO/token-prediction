@@ -73,8 +73,8 @@ free-form local path:
 
 | Descriptor | Source ID | Revision / manifest binding | Capability contract hash |
 | --- | --- | --- | --- |
-| `configs/source_descriptors/bagen_swebench.json` | `bagen_swebench_traj_v1` | BAGEN revision above and manifest SHA256 `f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071` | `c874e805d47c3da064ce71e8327a0aebbd7481ade307e53f7bc4fd2a977c6488` |
-| `configs/source_descriptors/spend_openhands.json` | `openhands_archive_trajectory_v2` | Spend revision above and inventory SHA256 `11735ca3ec625a21c57f72d8172cdc0e0e67fbc44ee99225366739e5dbfffc24` | `5609d66f01c31580aea9fe50d1b3ede43e0f29d86116d1e13c449e3e8bf70d89` |
+| `configs/source_descriptors/bagen_swebench.json` | `bagen_swebench_traj_v2` | BAGEN revision above and manifest SHA256 `f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071` | `4f2ed89b0b0d2e31a8f8aa84a14d32f8eccb30c8bb1348fdb7427054ca038fc9` |
+| `configs/source_descriptors/spend_openhands.json` | `openhands_archive_trajectory_v3` | Spend revision above and inventory SHA256 `11735ca3ec625a21c57f72d8172cdc0e0e67fbc44ee99225366739e5dbfffc24` | `44a63f678831715afbd1d106f657661ca8a47eb48c1dbd3f5331f4bb7ab12f2e` |
 
 Schema-v2 dataset construction includes the entire source descriptor and its
 capability-contract hash in the dataset semantic payload. The resulting
@@ -83,6 +83,18 @@ declared observables, capability decisions, feature schema, and rows. Changing
 the descriptor changes the dataset ID even when the row values happen to be
 unchanged. The frozen IDs in the preceding tables remain the schema-v1 handoff
 identities and must not be silently relabeled as schema-v2 IDs.
+
+The source-ID versions distinguish normalization contracts from immutable raw
+revisions. The historical BAGEN family audits and handoff retain
+`bagen_swebench_traj_v1`, while the corrected proxy-free reader used by new
+schema-v2 builds is `bagen_swebench_traj_v2`. Likewise, the frozen Spend
+handoff retains `openhands_archive_trajectory_v2` and its pinned reader hash;
+the causal route-identity correction is published as
+`openhands_archive_trajectory_v3`. The old handoff, trajectory audits, source
+IDs, and code pins are not rewritten. New descriptors keep the same upstream
+revisions and raw manifest hashes, but their new source IDs and capability
+contract hashes ensure that new dataset IDs cannot alias the historical
+canonical semantics.
 
 ## Historical Stage 1 artifact
 

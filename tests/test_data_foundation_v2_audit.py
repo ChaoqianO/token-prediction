@@ -10,6 +10,9 @@ from pathlib import Path
 
 from scripts.audit_data_foundation_v2 import (
     BAGEN_COMBINED_AUDIT_SOURCE_ID,
+    BAGEN_DESCRIPTOR_SHA256,
+    BAGEN_FAMILY_AUDIT_SOURCE_ID,
+    SPEND_DESCRIPTOR_SHA256,
     SPEND_INVENTORY_SOURCE_ID,
     ArtifactEvidence,
     DataFoundationAuditError,
@@ -87,9 +90,24 @@ def _source_summary() -> dict[str, object]:
 
 
 class DataFoundationV2AuditTests(unittest.TestCase):
+    def test_production_descriptor_file_pins_match_tracked_bytes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            _sha256(root / "configs/source_descriptors/bagen_swebench.json"),
+            BAGEN_DESCRIPTOR_SHA256,
+        )
+        self.assertEqual(
+            _sha256(root / "configs/source_descriptors/spend_openhands.json"),
+            SPEND_DESCRIPTOR_SHA256,
+        )
+
     def test_artifact_source_ids_are_distinct_from_reader_source_ids(self) -> None:
         self.assertNotEqual(
             BAGEN_COMBINED_AUDIT_SOURCE_ID,
+            BagenSwebenchReader.source_id,
+        )
+        self.assertNotEqual(
+            BAGEN_FAMILY_AUDIT_SOURCE_ID,
             BagenSwebenchReader.source_id,
         )
         self.assertNotEqual(
@@ -103,9 +121,9 @@ class DataFoundationV2AuditTests(unittest.TestCase):
                 "BAGEN combined audit",
             ),
             (
-                {"source_id": BagenSwebenchReader.source_id},
-                BagenSwebenchReader.source_id,
-                "BAGEN family audit",
+                {"source_id": BAGEN_FAMILY_AUDIT_SOURCE_ID},
+                BAGEN_FAMILY_AUDIT_SOURCE_ID,
+                "historical BAGEN family audit",
             ),
             (
                 {"source_id": SPEND_INVENTORY_SOURCE_ID},
@@ -127,6 +145,11 @@ class DataFoundationV2AuditTests(unittest.TestCase):
                 {"source_id": BagenSwebenchReader.source_id},
                 BAGEN_COMBINED_AUDIT_SOURCE_ID,
                 "BAGEN combined audit",
+            ),
+            (
+                {"source_id": BagenSwebenchReader.source_id},
+                BAGEN_FAMILY_AUDIT_SOURCE_ID,
+                "historical BAGEN family audit",
             ),
             (
                 {"source_id": OpenHandsArchiveReader.source_id},

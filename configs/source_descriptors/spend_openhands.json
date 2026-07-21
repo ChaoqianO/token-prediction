@@ -1,13 +1,13 @@
 {
   "descriptor_schema_version": 1,
-  "source_id": "openhands_archive_trajectory_v2",
+  "source_id": "openhands_archive_trajectory_v3",
   "revision": "fa9cbb063f770df596da95af24f7af3b8f595778",
   "manifest": {
     "path": "workspace/external/spend_your_money/gpt_5.2_inventory.json",
     "sha256": "11735ca3ec625a21c57f72d8172cdc0e0e67fbc44ee99225366739e5dbfffc24"
   },
   "capabilities": {
-    "source_id": "openhands_archive_trajectory_v2",
+    "source_id": "openhands_archive_trajectory_v3",
     "source": "declared",
     "observables": [
       "attempt_usage",
@@ -19,5 +19,5 @@
       "tool_events"
     ]
   },
-  "capability_contract_hash": "5609d66f01c31580aea9fe50d1b3ede43e0f29d86116d1e13c449e3e8bf70d89"
+  "capability_contract_hash": "44a63f678831715afbd1d106f657661ca8a47eb48c1dbd3f5331f4bb7ab12f2e"
 }

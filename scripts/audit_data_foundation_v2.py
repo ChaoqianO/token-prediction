@@ -47,15 +47,16 @@ DEFAULT_OUTPUT = Path(
 )
 
 BAGEN_DESCRIPTOR_SHA256 = (
-    "fa54a5c80e386a3bd12c00e8525f3c119c88407c8e88de8e2f97d06f2596a97d"
+    "83cb0ada4514ea9892d25822bc5a93da15b8ac39c40b71b7e1f1e2f08b935206"
 )
 SPEND_DESCRIPTOR_SHA256 = (
-    "1306c6b4c74b0af72ade350edb0eefc6146d35db465cd5a88543583477386c1a"
+    "7a0c2905ad286cd4d0131ca822960c082c74165f33a1ef9b1427b9eec3edc997"
 )
 BAGEN_COMBINED_AUDIT_SHA256 = (
     "2d8f3abe10b526f80488554d672039c9f9bc81b31e230b7bb6b14c94b0ffaea5"
 )
 BAGEN_COMBINED_AUDIT_SOURCE_ID = "bagen_swebench_combined_audit_v1"
+BAGEN_FAMILY_AUDIT_SOURCE_ID = "bagen_swebench_traj_v1"
 BAGEN_MANIFEST_SHA256 = (
     "f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071"
 )
@@ -673,7 +674,7 @@ def _family_raw_index(
         audit = load_strict_json(audit_path, label=f"BAGEN family audit {family_name}")
         _require_source_id(
             audit,
-            expected=BagenSwebenchReader.source_id,
+            expected=BAGEN_FAMILY_AUDIT_SOURCE_ID,
             label="BAGEN family audit",
         )
         family_root = _canonical_relative_path(

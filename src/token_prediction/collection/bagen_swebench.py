@@ -84,7 +84,7 @@ class BagenSwebenchReader:
     advertises ``REQUEST_LOCAL_COUNT``.
     """
 
-    source_id = "bagen_swebench_traj_v1"
+    source_id = "bagen_swebench_traj_v2"
     capabilities = SourceCapabilities(
         source_id=source_id,
         observables=frozenset(

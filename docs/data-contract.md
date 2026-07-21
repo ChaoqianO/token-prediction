@@ -73,6 +73,15 @@ Provider usage, current output length, finish reason, future tools, final
 outcome, total Calls, and true total tokens are forbidden as current features.
 Missing request counts remain `None`; they are never converted to zero.
 
+Configured request facts and realized response facts are also distinct. For the
+OpenHands archive, the filename provider and run model may be recorded at the
+request/attempt boundary after their stability is verified. The actual serving
+provider, resolved response model, response ID, and response timestamp appear
+only on `api_completed`. They cannot determine `TASK_STARTED`, `condition_id`,
+Task-pre features, or Call-pre features. The source-revision route policy
+allows the observed OpenAI-to-Azure serving route; any undeclared provider
+mapping still fails closed.
+
 The BAGEN adapters record provider input usage only on the response terminal as
 `provider_input_tokens_post_response_audit`. Their request boundary always has
 `request_tokens_local=None`, and they do not advertise `REQUEST_LOCAL_COUNT`.
@@ -121,9 +130,11 @@ The split plan is created once from distinct `task_id` values and frozen before
 candidate training. Every run, prefix, checkpoint, and continuation of a task
 uses the same fold.
 
-Evaluation cells are additionally conditioned on one `condition_id` (resolved
-target model, Agent/version, reasoning and relevant runtime configuration).
-Baselines are fitted within that condition rather than pooled across models.
+Evaluation cells are additionally conditioned on one `condition_id`
+(configured target model, Agent/version, reasoning and relevant launch-time
+runtime configuration). Post-response serving routes do not redefine the
+condition. Baselines are fitted within that condition rather than pooled across
+configured models.
 
 For the current request-level targets, a row weight is:
 
