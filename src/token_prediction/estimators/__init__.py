@@ -7,6 +7,7 @@ from .base import (
     ObservedTransition,
     PredictionSession,
     RunContext,
+    SessionSeed,
     TokenEstimator,
     TokenForecast,
     TrainingExample,
@@ -14,6 +15,12 @@ from .base import (
 )
 from .baselines import DirectFeatureEstimator, EmpiricalQuantileEstimator, LengthOnlyEstimator
 from .deduct import DeductOnlyEstimator, DeductOnlySession, FittedDeductOnly
+from .cross_position_deduct import (
+    CROSS_POSITION_INPUT_CONTRACT_HASH,
+    CrossPositionDeductEstimator,
+    CrossPositionDeductSession,
+    FittedCrossPositionDeduct,
+)
 from .lightgbm import (
     FeatureImportanceRecord,
     FittedLightGBMQuantiles,
@@ -32,6 +39,28 @@ from .lightgbm_bundle import (
     load_lightgbm_bundle,
     save_lightgbm_bundle,
 )
+from .mlp import (
+    FittedIndependentMLP,
+    INDEPENDENT_MLP_ESTIMATOR_VERSION,
+    IndependentMLPQuantileEstimator,
+    IndependentMLPSession,
+    MLPArchitecture,
+    MLPFitReport,
+)
+from .neural_bundle import (
+    NEURAL_BUNDLE_SCHEMA_VERSION,
+    NeuralBundleError,
+    load_neural_bundle,
+    neural_bundle_files,
+    save_neural_bundle,
+)
+from .neural_encoder import (
+    NEURAL_ENCODER_SCHEMA_VERSION,
+    EncodedNeuralBatch,
+    NeuralEncoderSchema,
+    NeuralFeatureEncoder,
+    OptionalNeuralDependencyError,
+)
 from .registry import EstimatorRegistry, builtin_registry
 from .tabular_encoder import (
     ENCODER_SCHEMA_VERSION,
@@ -49,6 +78,9 @@ __all__ = [
     "DeductOnlyEstimator",
     "DeductOnlySession",
     "DirectFeatureEstimator",
+    "CROSS_POSITION_INPUT_CONTRACT_HASH",
+    "CrossPositionDeductEstimator",
+    "CrossPositionDeductSession",
     "EstimatorFactory",
     "EstimatorRegistry",
     "ENCODER_SCHEMA_VERSION",
@@ -60,27 +92,45 @@ __all__ = [
     "FitContext",
     "FittedEstimator",
     "FittedDeductOnly",
+    "FittedCrossPositionDeduct",
+    "FittedIndependentMLP",
     "FittedLightGBMQuantiles",
     "FoldTabularEncoder",
     "LengthOnlyEstimator",
+    "INDEPENDENT_MLP_ESTIMATOR_VERSION",
+    "IndependentMLPQuantileEstimator",
+    "IndependentMLPSession",
     "LightGBMFitReport",
     "LightGBMBundleError",
     "LightGBMQuantileEstimator",
     "LightGBMQuantileSession",
     "ObservedTransition",
     "OptionalEstimatorDependencyError",
+    "OptionalNeuralDependencyError",
     "PredictionSession",
     "QuantileFitReport",
     "RawQuantileDiagnostics",
     "RunContext",
+    "SessionSeed",
     "SourceFeatureImportanceRecord",
     "TokenEstimator",
     "TokenForecast",
     "TrainingExample",
     "TrainingView",
     "VectorDimension",
+    "EncodedNeuralBatch",
+    "MLPArchitecture",
+    "MLPFitReport",
+    "NEURAL_BUNDLE_SCHEMA_VERSION",
+    "NEURAL_ENCODER_SCHEMA_VERSION",
+    "NeuralBundleError",
+    "NeuralEncoderSchema",
+    "NeuralFeatureEncoder",
     "builtin_registry",
     "lightgbm_bundle_files",
     "load_lightgbm_bundle",
+    "load_neural_bundle",
+    "neural_bundle_files",
     "save_lightgbm_bundle",
+    "save_neural_bundle",
 ]

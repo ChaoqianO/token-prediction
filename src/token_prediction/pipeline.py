@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
+import platform
 import re
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
 from token_prediction.config import ProjectConfig
@@ -17,14 +19,26 @@ from token_prediction.contracts import (
     resolve_canonical_input_file,
 )
 from token_prediction.dataset import (
-    assign_task_folds,
+    SupervisedDataset,
     build_capability_supervised_dataset,
     build_prediction_labels,
 )
-from token_prediction.estimators import builtin_registry
-from token_prediction.experiment import ExperimentRunner, ExperimentSpec, FoldArtifact
+from token_prediction.development import (
+    OUTER_FOLDS,
+    STAGE_SPLIT_SEEDS,
+    DevelopmentProtocol,
+    build_development_protocol,
+)
+from token_prediction.estimators import EstimatorRegistry, builtin_registry
+from token_prediction.experiment import (
+    CandidateResult,
+    ExperimentRunner,
+    ExperimentSpec,
+    FoldArtifact,
+)
 from token_prediction.features import FEATURE_SCHEMA_VERSION, replay_feature_snapshots
 from token_prediction.lineage import publish_artifact, verify_artifact
+from token_prediction.lifecycle_bundle import validate_source_provenance
 from token_prediction.trajectory import Trajectory
 
 
@@ -37,6 +51,36 @@ class ExperimentRunSummary:
     artifact_id: str
     experiment_count: int
     candidate_run_count: int
+
+
+@dataclass(frozen=True)
+class SeedDevelopmentResults:
+    split_seed: int
+    split_plan_id: str
+    result_groups: tuple[tuple[CandidateResult, ...], ...]
+
+    def __post_init__(self) -> None:
+        if self.split_seed not in STAGE_SPLIT_SEEDS:
+            raise ValueError("development result uses an unapproved split seed")
+        if not self.split_plan_id:
+            raise ValueError("development result must bind a split plan")
+
+
+@dataclass(frozen=True)
+class DevelopmentExperimentResults:
+    protocol: DevelopmentProtocol
+    seed_results: tuple[SeedDevelopmentResults, ...]
+
+    def __post_init__(self) -> None:
+        if tuple(result.split_seed for result in self.seed_results) != STAGE_SPLIT_SEEDS:
+            raise ValueError("development execution requires all three frozen split seeds")
+        expected = tuple(plan.split_plan_id for plan in self.protocol.outer_plans)
+        if tuple(result.split_plan_id for result in self.seed_results) != expected:
+            raise ValueError("development results differ from the protocol split plans")
+
+    @property
+    def audit_document(self) -> dict[str, object]:
+        return self.protocol.to_audit_document()
 
 
 _SAFE_ARTIFACT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -78,13 +122,9 @@ def _effective_experiment_semantics(
                     "role": candidate.role.value,
                     "ablation": (
                         {
-                            "reference_candidate_id": (
-                                candidate.ablation.reference_candidate_id
-                            ),
+                            "reference_candidate_id": (candidate.ablation.reference_candidate_id),
                             "axis": candidate.ablation.axis.value,
-                            "allowed_config_paths": sorted(
-                                candidate.ablation.allowed_config_paths
-                            ),
+                            "allowed_config_paths": sorted(candidate.ablation.allowed_config_paths),
                         }
                         if candidate.ablation is not None
                         else None
@@ -104,6 +144,19 @@ def _installed_version(distribution: str) -> str:
         return "not-installed"
 
 
+def _module_version(distribution: str, module_name: str) -> str:
+    """Return the version of the module that will actually execute."""
+
+    try:
+        module = importlib.import_module(module_name)
+    except (ImportError, OSError):
+        return "not-installed"
+    value = getattr(module, "__version__", None)
+    if not isinstance(value, str) or not value.strip():
+        return _installed_version(distribution)
+    return value.strip()
+
+
 def _lightgbm_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str]:
     if not any(
         candidate.estimator_id == "lightgbm_quantile"
@@ -112,9 +165,103 @@ def _lightgbm_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str
     ):
         return {}
     return {
-        "lightgbm_version": _installed_version("lightgbm"),
-        "numpy_version": _installed_version("numpy"),
+        "lightgbm_version": _module_version("lightgbm", "lightgbm"),
+        "numpy_version": _module_version("numpy", "numpy"),
     }
+
+
+def _neural_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str]:
+    uses_independent_mlp = any(
+        "independent_mlp"
+        in {
+            candidate.estimator_id,
+            candidate.graph.initializer_estimator_id,
+            candidate.graph.updater_estimator_id,
+        }
+        for spec in specs
+        for candidate in spec.candidates
+    )
+    if not uses_independent_mlp:
+        return {}
+    versions = {
+        "numpy_version": _module_version("numpy", "numpy"),
+        "torch_version": _module_version("torch", "torch"),
+        "safetensors_version": _module_version("safetensors", "safetensors"),
+    }
+    missing = sorted(name for name, value in versions.items() if value == "not-installed")
+    if missing:
+        raise RuntimeError(
+            "Independent MLP runtime identity is incomplete; missing distributions: "
+            + ", ".join(missing)
+        )
+    return versions
+
+
+def _experiment_runtime_versions(
+    specs: Sequence[ExperimentSpec],
+) -> dict[str, str]:
+    return {
+        "python_version": platform.python_version(),
+        "token_prediction_version": _installed_version("token-prediction"),
+        **_lightgbm_runtime_versions(specs),
+        **_neural_runtime_versions(specs),
+    }
+
+
+def run_development_experiments(
+    dataset: SupervisedDataset,
+    specs: Sequence[ExperimentSpec],
+    *,
+    source_provenance: Mapping[str, object],
+    protocol: DevelopmentProtocol | None = None,
+    registry: EstimatorRegistry | None = None,
+) -> DevelopmentExperimentResults:
+    """Run the frozen three-seed protocol for an already constructed dataset."""
+
+    resolved_protocol = protocol or build_development_protocol(dataset)
+    if (
+        resolved_protocol.parent_dataset_id != dataset.dataset_id
+        or resolved_protocol.parent_schema_version != dataset.schema_version
+        or resolved_protocol.parent_source_descriptor_hash != dataset.source_descriptor_hash
+        or resolved_protocol.parent_capability_contract_hash != dataset.capability_contract_hash
+        or resolved_protocol.parent_input_contract_hash != dataset.input_contract_hash
+    ):
+        raise ValueError("development protocol belongs to another parent dataset")
+    if (
+        resolved_protocol.development_dataset.source_descriptor_hash is None
+        or resolved_protocol.development_dataset.capability_contract_hash is None
+    ):
+        raise ValueError("development execution requires source/capability provenance")
+    validated_source_provenance = validate_source_provenance(
+        source_provenance,
+        source_descriptor_hash=(resolved_protocol.development_dataset.source_descriptor_hash),
+        capability_contract_hash=(resolved_protocol.development_dataset.capability_contract_hash),
+    )
+    runner = ExperimentRunner(registry or builtin_registry())
+    seed_results: list[SeedDevelopmentResults] = []
+    for nested_plan in resolved_protocol.outer_inner_plans:
+        result_groups = tuple(
+            runner.run(
+                resolved_protocol.development_dataset,
+                nested_plan.outer_plan,
+                spec,
+                seed=nested_plan.split_seed,
+                development_protocol=resolved_protocol,
+                source_provenance=validated_source_provenance,
+            )
+            for spec in specs
+        )
+        seed_results.append(
+            SeedDevelopmentResults(
+                split_seed=nested_plan.split_seed,
+                split_plan_id=nested_plan.outer_plan.split_plan_id,
+                result_groups=result_groups,
+            )
+        )
+    return DevelopmentExperimentResults(
+        protocol=resolved_protocol,
+        seed_results=tuple(seed_results),
+    )
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -129,11 +276,10 @@ def _write_fold_artifacts(
     *,
     experiment_id: str,
     candidate_id: str,
+    split_seed: int,
     artifacts: Sequence[FoldArtifact],
 ) -> None:
-    experiment_component = _safe_artifact_component(
-        experiment_id, label="experiment_id"
-    )
+    experiment_component = _safe_artifact_component(experiment_id, label="experiment_id")
     candidate_component = _safe_artifact_component(candidate_id, label="candidate_id")
     for artifact in artifacts:
         if not artifact.has_payload:
@@ -143,6 +289,7 @@ def _write_fold_artifacts(
             / "fold_artifacts"
             / experiment_component
             / candidate_component
+            / f"seed_{split_seed}"
             / f"fold_{artifact.fold}"
         )
         fold_dir.mkdir(parents=True, exist_ok=False)
@@ -150,6 +297,10 @@ def _write_fold_artifacts(
             _write_json(fold_dir / "encoder.json", artifact.encoder)
         if artifact.fit_report is not None:
             _write_json(fold_dir / "fit_report.json", artifact.fit_report)
+        if artifact.calibrator is not None:
+            _write_json(fold_dir / "calibrator.json", artifact.calibrator)
+        if artifact.provenance is not None:
+            _write_json(fold_dir / "provenance.json", artifact.provenance)
         if artifact.feature_importance is not None:
             lines = [
                 json.dumps(dict(record), ensure_ascii=False, sort_keys=True)
@@ -161,20 +312,20 @@ def _write_fold_artifacts(
             )
         if artifact.model_strings is not None:
             for model_name, model_text in sorted(artifact.model_strings.items()):
-                component = _safe_artifact_component(
-                    model_name, label="model_strings() key"
-                )
-                (fold_dir / f"{component}.model.txt").write_text(
-                    model_text, encoding="utf-8"
-                )
+                component = _safe_artifact_component(model_name, label="model_strings() key")
+                (fold_dir / f"{component}.model.txt").write_text(model_text, encoding="utf-8")
         if artifact.bundle_files is not None:
             bundle_dir = fold_dir / "bundle"
             bundle_dir.mkdir()
             for filename, payload in sorted(artifact.bundle_files.items()):
-                component = _safe_artifact_component(
-                    filename, label="bundle_files() key"
-                )
-                (bundle_dir / component).write_bytes(payload)
+                relative = PurePosixPath(filename)
+                destination = bundle_dir.joinpath(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    destination.resolve().relative_to(bundle_dir.resolve())
+                except ValueError as exc:  # defensive parity with FoldArtifact
+                    raise ValueError("bundle file escaped its fold artifact root") from exc
+                destination.write_bytes(payload)
 
 
 def _sha256_file(path: Path) -> str:
@@ -226,10 +377,7 @@ def _verify_v2_source_manifest(
     if descriptor is None:
         raise ValueError("config schema_version=2 requires a source descriptor")
     project_root = config.source_path.resolve().parent.parent
-    if (
-        config.source_descriptor_path is None
-        or config.source_descriptor_file_sha256 is None
-    ):
+    if config.source_descriptor_path is None or config.source_descriptor_file_sha256 is None:
         raise ValueError("config schema_version=2 requires a tracked source descriptor")
     descriptor_path = resolve_canonical_input_file(
         project_root,
@@ -354,9 +502,7 @@ def _load_jsonl_event_bytes(raw: bytes, *, description: str) -> list[CanonicalEv
     except UnicodeError as exc:
         raise ValueError(f"invalid UTF-8 in {description}: {exc}") from exc
     events: list[CanonicalEvent] = []
-    for line_number, line in enumerate(
-        text.splitlines(), start=1
-    ):
+    for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -397,13 +543,19 @@ def inspect_replay(path: str | Path) -> dict[str, object]:
     }
 
 
-def _prediction_dict(result: object, record: object) -> dict[str, object]:
+def _prediction_dict(
+    result: object,
+    record: object,
+    *,
+    split_seed: int,
+) -> dict[str, object]:
     forecast = getattr(record, "forecast")
     return {
         "candidate_id": getattr(result, "candidate_id"),
         "candidate_hash": getattr(result, "candidate_hash"),
         "dataset_id": getattr(result, "dataset_id"),
         "split_plan_id": getattr(result, "split_plan_id"),
+        "split_seed": split_seed,
         "eligibility_hash": getattr(result, "eligibility_hash"),
         "point_id": getattr(record, "point_id"),
         "task_id": getattr(record, "task_id"),
@@ -418,10 +570,7 @@ def _prediction_dict(result: object, record: object) -> dict[str, object]:
         "raw_prediction": forecast.raw_point,
         "raw_upper": forecast.raw_upper,
         "quantiles_crossed_before_repair": (
-            bool(
-                forecast.raw_lower > forecast.raw_point
-                or forecast.raw_point > forecast.raw_upper
-            )
+            bool(forecast.raw_lower > forecast.raw_point or forecast.raw_point > forecast.raw_upper)
             if forecast.raw_lower is not None
             and forecast.raw_point is not None
             and forecast.raw_upper is not None
@@ -444,6 +593,10 @@ def run_configured_experiments(
         raise ValueError(
             "config schema_version=1 is verification-only; new experiment runs require v2"
         )
+    if config.folds != OUTER_FOLDS:
+        raise ValueError("schema v2 production runs require exactly five outer folds")
+    if config.seed != STAGE_SPLIT_SEEDS[0]:
+        raise ValueError("schema v2 seed must declare the frozen development protocol anchor")
     if config.collection_source != "canonical_jsonl":
         raise ValueError(
             "configured experiments currently require collection.source='canonical_jsonl'"
@@ -462,44 +615,52 @@ def run_configured_experiments(
         if len(raw) != expected_bytes or observed_hash != expected_hash:
             raise ValueError("canonical source changed while it was being loaded")
         trajectories_list.append(
-            Trajectory.from_events(
-                _load_jsonl_event_bytes(raw, description=relative)
-            )
+            Trajectory.from_events(_load_jsonl_event_bytes(raw, description=relative))
         )
-        source_facts.append(
-            {"path": relative, "bytes": len(raw), "sha256": observed_hash}
-        )
+        source_facts.append({"path": relative, "bytes": len(raw), "sha256": observed_hash})
     trajectories = tuple(trajectories_list)
     if not trajectories:
         raise ValueError("at least one trajectory is required")
-    task_assignment = assign_task_folds(
-        (trajectory.task_id for trajectory in trajectories),
-        folds=config.folds,
-        seed=config.seed,
-    )
     if config.source_descriptor is None:
         raise ValueError("config schema_version=2 requires a source descriptor")
-    dataset = build_capability_supervised_dataset(
+    parent_dataset = build_capability_supervised_dataset(
         trajectories,
         config.source_descriptor,
     )
-    split_plan = task_assignment.bind(dataset.dataset_id)
+    protocol = build_development_protocol(parent_dataset)
+    dataset = protocol.development_dataset
+    runtime_versions = _experiment_runtime_versions(specs)
+    code_hash = _source_tree_hash()
+    source_provenance: dict[str, object] = {
+        "source_descriptor": config.source_descriptor.to_dict(),
+        "source_descriptor_hash": config.source_descriptor.descriptor_hash,
+        "code_hash": code_hash,
+        "runtime_versions": runtime_versions,
+    }
     run_semantic = {
         "config_hash": config.source_hash,
-        "code_hash": _source_tree_hash(),
+        "code_hash": code_hash,
         "sources": sorted(source_facts, key=lambda item: str(item["path"])),
         "source_hashes": sorted(str(item["sha256"]) for item in source_facts),
         "source_descriptor_file_sha256": config.source_descriptor_file_sha256,
         "canonical_manifest_sha256": config.canonical_manifest_sha256,
         "dataset_id": dataset.dataset_id,
-        "split_plan_id": split_plan.split_plan_id,
+        "parent_dataset_id": parent_dataset.dataset_id,
+        "development_protocol_id": protocol.protocol_id,
+        "split_plan_id": protocol.protocol_id,
+        "split_plan_ids": [plan.split_plan_id for plan in protocol.outer_plans],
+        "split_seeds": list(STAGE_SPLIT_SEEDS),
+        "permanent_holdout_plan_id": protocol.holdout_plan.holdout_plan_id,
+        "permanent_holdout_assignment_id": protocol.holdout_plan.assignment_id,
+        "final_holdout_task_count": len(protocol.final_holdout_tasks),
         "config_schema_version": config.schema_version,
         "dataset_schema_version": dataset.schema_version,
         "source_descriptor_hash": dataset.source_descriptor_hash,
         "capability_contract_hash": dataset.capability_contract_hash,
+        "input_contract_hash": dataset.input_contract_hash,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "experiments": _effective_experiment_semantics(specs),
-        **_lightgbm_runtime_versions(specs),
+        **runtime_versions,
     }
     run_id = hashlib.sha256(
         json.dumps(run_semantic, sort_keys=True, separators=(",", ":")).encode()
@@ -514,23 +675,26 @@ def run_configured_experiments(
         existing_run_id = manifest.metadata.get("run_id")
         if existing_run_id != run_id:
             raise ValueError(
-                f"existing experiment artifact has run_id {existing_run_id!r}, "
-                f"expected {run_id!r}"
+                f"existing experiment artifact has run_id {existing_run_id!r}, expected {run_id!r}"
             )
         return ExperimentRunSummary(
             run_id=run_id,
             output_dir=directory,
             dataset_id=dataset.dataset_id,
-            split_plan_id=split_plan.split_plan_id,
+            split_plan_id=protocol.protocol_id,
             artifact_id=manifest.artifact_id,
             experiment_count=len(specs),
-            candidate_run_count=sum(len(spec.candidates) for spec in specs),
+            candidate_run_count=(
+                len(STAGE_SPLIT_SEEDS) * sum(len(spec.candidates) for spec in specs)
+            ),
         )
     if directory.exists() and any(directory.iterdir()):
         raise FileExistsError(f"experiment output is not empty: {directory}")
-    runner = ExperimentRunner(builtin_registry())
-    result_groups = tuple(
-        runner.run(dataset, split_plan, spec, seed=config.seed) for spec in specs
+    execution = run_development_experiments(
+        parent_dataset,
+        specs,
+        source_provenance=source_provenance,
+        protocol=protocol,
     )
     try:
         current_declared_sources = _verify_v2_source_manifest(config, source_paths)
@@ -540,9 +704,7 @@ def run_configured_experiments(
             "refusing to publish a mixed-input artifact"
         ) from exc
     if current_declared_sources != declared_sources:
-        raise RuntimeError(
-            "source manifest membership changed while the experiment was running"
-        )
+        raise RuntimeError("source manifest membership changed while the experiment was running")
     for path, (relative, expected_bytes, expected_hash) in declared_sources.items():
         try:
             current_path = resolve_canonical_input_file(
@@ -574,10 +736,13 @@ def run_configured_experiments(
         json.dumps(
             {
                 "dataset_id": dataset.dataset_id,
+                "parent_dataset_id": parent_dataset.dataset_id,
+                "development_protocol_id": protocol.protocol_id,
                 "schema_version": dataset.schema_version,
                 "rows": len(dataset.rows),
                 "eligible_rows": sum(row.eligible for row in dataset.rows),
                 "tasks": len(dataset.task_ids),
+                "final_holdout_tasks": len(protocol.final_holdout_tasks),
                 "status_counts": {
                     status: sum(row.status.value == status for row in dataset.rows)
                     for status in sorted({row.status.value for row in dataset.rows})
@@ -590,39 +755,59 @@ def run_configured_experiments(
         encoding="utf-8",
     )
     (directory / "split.json").write_text(
-        json.dumps(asdict(split_plan), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(
+            execution.audit_document,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     prediction_lines: list[str] = []
     metrics: dict[str, object] = {}
-    for spec, results in zip(specs, result_groups):
-        metrics[spec.experiment_id] = {
-            result.candidate_id: {
-                "candidate_hash": result.candidate_hash,
-                "comparability_key": result.comparability_key,
-                "metrics": dict(result.metrics),
-                "fold_metrics": {
-                    str(fold): dict(fold_values)
-                    for fold, fold_values in result.fold_metrics.items()
-                },
-            }
-            for result in results
-        }
-        for result in results:
-            _write_fold_artifacts(
-                directory,
-                experiment_id=spec.experiment_id,
-                candidate_id=result.candidate_id,
-                artifacts=result.fold_artifacts,
-            )
-            prediction_lines.extend(
-                json.dumps(
-                    _prediction_dict(result, record),
-                    ensure_ascii=False,
-                    sort_keys=True,
+    for spec_index, spec in enumerate(specs):
+        candidate_metrics: dict[str, object] = {}
+        for candidate in spec.candidates:
+            seed_metrics: dict[str, object] = {}
+            for seed_result in execution.seed_results:
+                results = seed_result.result_groups[spec_index]
+                result = next(
+                    item for item in results if item.candidate_id == candidate.candidate_id
                 )
-                for record in result.predictions
-            )
+                seed_metrics[str(seed_result.split_seed)] = {
+                    "split_plan_id": seed_result.split_plan_id,
+                    "comparability_key": result.comparability_key,
+                    "metrics": dict(result.metrics),
+                    "fold_metrics": {
+                        str(fold): dict(fold_values)
+                        for fold, fold_values in result.fold_metrics.items()
+                    },
+                }
+                _write_fold_artifacts(
+                    directory,
+                    experiment_id=spec.experiment_id,
+                    candidate_id=result.candidate_id,
+                    split_seed=seed_result.split_seed,
+                    artifacts=result.fold_artifacts,
+                )
+                prediction_lines.extend(
+                    json.dumps(
+                        _prediction_dict(
+                            result,
+                            record,
+                            split_seed=seed_result.split_seed,
+                        ),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    for record in result.predictions
+                )
+            candidate_metrics[candidate.candidate_id] = {
+                "candidate_hash": candidate.content_hash,
+                "split_seed_results": seed_metrics,
+            }
+        metrics[spec.experiment_id] = candidate_metrics
     (directory / "predictions.jsonl").write_text(
         "\n".join(prediction_lines) + "\n", encoding="utf-8"
     )
@@ -642,8 +827,8 @@ def run_configured_experiments(
         run_id=run_id,
         output_dir=directory,
         dataset_id=dataset.dataset_id,
-        split_plan_id=split_plan.split_plan_id,
+        split_plan_id=protocol.protocol_id,
         artifact_id=manifest.artifact_id,
-        experiment_count=len(result_groups),
-        candidate_run_count=sum(len(group) for group in result_groups),
+        experiment_count=len(specs),
+        candidate_run_count=(len(STAGE_SPLIT_SEEDS) * sum(len(spec.candidates) for spec in specs)),
     )

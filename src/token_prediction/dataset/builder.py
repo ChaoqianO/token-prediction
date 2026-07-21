@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
-from typing import Iterable, Mapping
+from typing import Iterable
 
 from token_prediction.contracts import EventType, Observable, SourceDescriptor
 from token_prediction.dataset.capabilities import decide_target_capability
 from token_prediction.dataset.labels import (
+    LabelValue,
     build_generation_labels,
     build_prediction_labels,
     build_task_aggregate_label,
+)
+from token_prediction.dataset.points import (
+    EXCLUDED_LOCAL_FEATURES,
+    build_prediction_points,
 )
 from token_prediction.dataset.schema import (
     CAPABILITY_DATASET_SCHEMA_VERSION,
@@ -22,17 +26,10 @@ from token_prediction.dataset.schema import (
     SupervisedDataset,
 )
 from token_prediction.features import FEATURE_SCHEMA_VERSION, replay_feature_snapshots
-from token_prediction.features.reducer import FeatureValue
 from token_prediction.trajectory import Trajectory
 
 
-V2_EXCLUDED_LOCAL_FEATURES = frozenset(
-    {
-        "current_request_tokens_local",
-        "request_delta_tokens",
-        "context_utilization",
-    }
-)
+V2_EXCLUDED_LOCAL_FEATURES = EXCLUDED_LOCAL_FEATURES
 
 _V2_CAPABILITY_CELLS = (
     (PredictionPosition.TASK_LAUNCH, PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS),
@@ -363,44 +360,6 @@ def build_supervised_dataset(trajectories: Iterable[Trajectory]) -> SupervisedDa
     )
 
 
-def _v2_features(
-    features: Mapping[str, FeatureValue],
-    source_descriptor: SourceDescriptor,
-) -> dict[str, FeatureValue]:
-    resolved = dict(features)
-    if Observable.REQUEST_LOCAL_COUNT in source_descriptor.capabilities.observables:
-        return resolved
-    return {
-        name: value
-        for name, value in resolved.items()
-        if name not in V2_EXCLUDED_LOCAL_FEATURES
-    }
-
-
-def _v2_point(
-    point: PredictionPoint,
-    source_descriptor: SourceDescriptor,
-) -> PredictionPoint:
-    has_local_count = (
-        Observable.REQUEST_LOCAL_COUNT
-        in source_descriptor.capabilities.observables
-    )
-    return replace(
-        point,
-        features=_v2_features(dict(point.features), source_descriptor),
-        known_offset_tokens=(
-            point.known_offset_tokens
-            if has_local_count
-            and point.target
-            in {
-                PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS,
-                PredictionTarget.CALL_UNKNOWN_BILLABLE_TOKENS,
-            }
-            else 0
-        ),
-    )
-
-
 def _row_semantic(row: DatasetRow) -> dict[str, object]:
     return {
         "point": {
@@ -425,111 +384,82 @@ def _row_semantic(row: DatasetRow) -> dict[str, object]:
     }
 
 
-def _provider_accounted_request_rows(
-    trajectory: Trajectory,
-    descriptor: SourceDescriptor,
-) -> list[DatasetRow]:
-    snapshots = {
-        snapshot.point_event_id: snapshot
-        for snapshot in replay_feature_snapshots(trajectory.events)
-        if snapshot.boundary_type == EventType.REQUEST_BUILT
-    }
-    labels = {
-        label.point_event_id: label
-        for label in build_prediction_labels(trajectory.events)
-    }
-    request_events = [
-        event
-        for event in trajectory.events
-        if event.event_type == EventType.REQUEST_BUILT
-    ]
-    request_ids = {event.event_id for event in request_events}
-    if set(snapshots) != set(labels) or set(labels) != request_ids:
-        raise ValueError("request snapshots and labels do not form a one-to-one point-id join")
+def _capability_label_values(
+    trajectories: Iterable[Trajectory],
+) -> dict[str, LabelValue]:
+    """Build the label side of the schema-v2 point/label join.
 
-    rows: list[DatasetRow] = []
-    for request_index, event in enumerate(request_events):
-        snapshot = snapshots[event.event_id]
-        label = labels[event.event_id]
-        task_position = (
-            PredictionPosition.TASK_PRE
-            if request_index == 0
-            else PredictionPosition.TASK_UPDATE
+    Point construction lives in :mod:`token_prediction.dataset.points` and is
+    intentionally independent of this suffix-looking operation.
+    """
+
+    values: dict[str, LabelValue] = {}
+
+    def add(point_id: str, value: LabelValue) -> None:
+        if point_id in values:
+            raise ValueError(f"duplicate capability label point_id: {point_id}")
+        values[point_id] = value
+
+    for trajectory in trajectories:
+        task_label = build_task_aggregate_label(trajectory.events)
+        add(
+            _point_id(
+                task_label.point_event_id,
+                PredictionPosition.TASK_LAUNCH,
+                PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS,
+            ),
+            task_label.total_accounted_tokens,
         )
-        task_target = PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
-        if decide_target_capability(
-            descriptor.capabilities, task_position, task_target
-        ).available:
-            point = PredictionPoint(
-                point_id=_point_id(event.event_id, task_position, task_target),
-                source_event_id=event.event_id,
-                task_id=trajectory.task_id,
-                trajectory_id=trajectory.trajectory_id,
-                run_id=trajectory.run_id,
-                prediction_context_id=(
-                    trajectory.prediction_context_id
-                    if request_index == 0
-                    else _context_id(
-                        trajectory, event.payload, str(event.logical_call_id)
-                    )
+        request_labels = build_prediction_labels(trajectory.events)
+        for request_index, label in enumerate(request_labels):
+            task_position = (
+                PredictionPosition.TASK_PRE
+                if request_index == 0
+                else PredictionPosition.TASK_UPDATE
+            )
+            for position, target, value in (
+                (
+                    task_position,
+                    PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS,
+                    label.task_provider_accounted_remaining,
                 ),
-                condition_id=trajectory.condition_id,
-                logical_call_id=str(event.logical_call_id),
-                attempt_id=None,
-                cutoff_event_seq=event.event_seq,
-                position=task_position,
-                target=task_target,
-                features=_v2_features(snapshot.values, descriptor),
-                known_offset_tokens=0,
-            )
-            task_value = label.task_provider_accounted_remaining
-            rows.append(
-                DatasetRow(
-                    point=point,
-                    label=task_value.value,
-                    status=task_value.status,
-                    invalid_reason=task_value.reason,
-                )
-            )
-
-        call_target = PredictionTarget.CALL_BILLABLE_TOTAL_TOKENS
-        if decide_target_capability(
-            descriptor.capabilities,
-            PredictionPosition.CALL_PRE,
-            call_target,
-        ).available:
-            call_point = PredictionPoint(
-                point_id=_point_id(
-                    event.event_id,
+                (
+                    task_position,
+                    PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS,
+                    label.task_unknown_remaining,
+                ),
+                (
                     PredictionPosition.CALL_PRE,
-                    call_target,
+                    PredictionTarget.CALL_BILLABLE_TOTAL_TOKENS,
+                    label.call_billable_total,
                 ),
-                source_event_id=event.event_id,
-                task_id=trajectory.task_id,
-                trajectory_id=trajectory.trajectory_id,
-                run_id=trajectory.run_id,
-                prediction_context_id=_context_id(
-                    trajectory, event.payload, str(event.logical_call_id)
+                (
+                    PredictionPosition.CALL_PRE,
+                    PredictionTarget.CALL_UNKNOWN_BILLABLE_TOKENS,
+                    label.call_unknown_billable,
                 ),
-                condition_id=trajectory.condition_id,
-                logical_call_id=str(event.logical_call_id),
-                attempt_id=None,
-                cutoff_event_seq=event.event_seq,
-                position=PredictionPosition.CALL_PRE,
-                target=call_target,
-                features=_v2_features(snapshot.values, descriptor),
-                known_offset_tokens=0,
+                (
+                    PredictionPosition.CALL_PRE,
+                    PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS,
+                    label.call_billable_output,
+                ),
+                (
+                    PredictionPosition.CALL_PRE,
+                    PredictionTarget.CALL_FINAL_RESPONSE_OUTPUT_TOKENS,
+                    label.final_response_output,
+                ),
+            ):
+                add(_point_id(label.point_event_id, position, target), value)
+        for label in build_generation_labels(trajectory.events):
+            add(
+                _point_id(
+                    label.point_event_id,
+                    PredictionPosition.CALL_UPDATE,
+                    PredictionTarget.CALL_REMAINING_OUTPUT_TOKENS,
+                ),
+                label.remaining_output,
             )
-            call_value = label.call_billable_total
-            rows.append(
-                DatasetRow(
-                    point=call_point,
-                    label=call_value.value,
-                    status=call_value.status,
-                    invalid_reason=call_value.reason,
-                )
-            )
-    return rows
+    return values
 
 
 def build_capability_supervised_dataset(
@@ -545,21 +475,24 @@ def build_capability_supervised_dataset(
     """
 
     resolved_trajectories = tuple(trajectories)
-    legacy = build_supervised_dataset(resolved_trajectories)
-    rows = [
-        replace(row, point=_v2_point(row.point, source_descriptor))
-        for row in legacy.rows
-        if decide_target_capability(
-            source_descriptor.capabilities,
-            row.point.position,
-            row.point.target,
-        ).available
-    ]
-    for trajectory in resolved_trajectories:
-        rows.extend(_provider_accounted_request_rows(trajectory, source_descriptor))
-    rows.sort(key=lambda row: row.point.point_id)
-    if len({row.point.point_id for row in rows}) != len(rows):
-        raise ValueError("dataset point_id values must be unique")
+    point_set = build_prediction_points(resolved_trajectories, source_descriptor)
+    label_values = _capability_label_values(resolved_trajectories)
+    rows: list[DatasetRow] = []
+    for point in point_set.points:
+        try:
+            label = label_values[point.point_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"capability point has no matching label: {point.point_id}"
+            ) from exc
+        rows.append(
+            DatasetRow(
+                point=point,
+                label=label.value,
+                status=label.status,
+                invalid_reason=label.reason,
+            )
+        )
 
     decisions = [
         decide_target_capability(
@@ -595,4 +528,5 @@ def build_capability_supervised_dataset(
         schema_version=CAPABILITY_DATASET_SCHEMA_VERSION,
         source_descriptor_hash=source_descriptor.descriptor_hash,
         capability_contract_hash=source_descriptor.capabilities.contract_hash,
+        input_contract_hash=point_set.input_contract_hash,
     )

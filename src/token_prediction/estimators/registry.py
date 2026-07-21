@@ -6,6 +6,8 @@ from typing import Any
 from .base import EstimatorFactory, TokenEstimator
 from .baselines import DirectFeatureEstimator, EmpiricalQuantileEstimator, LengthOnlyEstimator
 from .deduct import DeductOnlyEstimator
+from .cross_position_deduct import CrossPositionDeductEstimator
+from .mlp import IndependentMLPQuantileEstimator
 
 
 def _lightgbm_quantile_factory(params: Mapping[str, Any]) -> TokenEstimator:
@@ -61,5 +63,13 @@ def builtin_registry() -> EstimatorRegistry:
         "deduct_only",
         lambda params: DeductOnlyEstimator(**params),
     )
+    registry.register(
+        "cross_position_deduct",
+        lambda params: CrossPositionDeductEstimator(**params),
+    )
     registry.register("lightgbm_quantile", _lightgbm_quantile_factory)
+    registry.register(
+        "independent_mlp",
+        lambda params: IndependentMLPQuantileEstimator(**params),
+    )
     return registry

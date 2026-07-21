@@ -6,14 +6,36 @@ from token_prediction.dataset import PredictionTarget
 from token_prediction.estimators import TokenForecast
 from token_prediction.evaluation import (
     CalibrationExample,
+    FittedExpansionCalibrator,
     IdentityCalibrator,
     ScoredForecast,
     TaskMaxConformalCalibrator,
     evaluate_forecasts,
+    evaluate_task_forecasts,
 )
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_identity_calibrator_rejects_nonzero_expansion(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly zero"):
+            FittedExpansionCalibrator("none", 0.1, 1.0)
+
+    def test_fitted_calibrator_round_trip_is_strict_and_replays(self) -> None:
+        target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
+        fitted = FittedExpansionCalibrator("task_max_conformal", 0.1, 3.5)
+        loaded = FittedExpansionCalibrator.from_dict(fitted.to_dict())
+        forecast = TokenForecast("p", target, 5, 10, 12)
+        self.assertEqual(loaded, fitted)
+        self.assertEqual(loaded.transform(forecast), fitted.transform(forecast))
+        for tampered in (
+            {**fitted.to_dict(), "extra": True},
+            {**fitted.to_dict(), "expansion": -1.0},
+            {**fitted.to_dict(), "interval_alpha": float("nan")},
+            {**fitted.to_dict(), "calibrator_id": "unknown"},
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                FittedExpansionCalibrator.from_dict(tampered)
+
     def test_metric_suite_matches_hand_calculation(self) -> None:
         target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
         rows = (
@@ -37,6 +59,22 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertEqual(metrics["wape"], 0.0)
         self.assertEqual(metrics["normalized_interval_width"], 1.0)
+
+    def test_task_metrics_are_label_free_weighted_aggregates(self) -> None:
+        target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
+        rows = (
+            ScoredForecast("t0", "r0", TokenForecast("p0", target, 5, 8, 12), 10, 1),
+            ScoredForecast("t0", "r1", TokenForecast("p1", target, 15, 18, 25), 20, 3),
+            ScoredForecast("t1", "r2", TokenForecast("p2", target, 0, 2, 4), 3, 2),
+        )
+        metrics = evaluate_task_forecasts(rows, alpha=0.1)
+        self.assertEqual(tuple(metrics), ("t0", "t1"))
+        self.assertEqual(metrics["t0"].n_points, 2)
+        self.assertEqual(metrics["t0"].n_trajectories, 2)
+        self.assertEqual(metrics["t0"].weight_sum, 4)
+        self.assertEqual(metrics["t0"].weighted_mae, 2)
+        self.assertEqual(metrics["t0"].weighted_coverage, 1)
+        self.assertNotIn("target_value", metrics["t0"].to_dict())
 
     def test_task_max_calibration_uses_one_conservative_score_per_task(self) -> None:
         target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS

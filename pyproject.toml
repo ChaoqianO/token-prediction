@@ -20,6 +20,11 @@ estimators = [
   "numpy>=1.26",
   "scikit-learn>=1.5",
 ]
+neural = [
+  "numpy>=1.26",
+  "safetensors>=0.4",
+  "torch>=2.2",
+]
 dev = [
   "build>=1.2",
   "pytest>=8",

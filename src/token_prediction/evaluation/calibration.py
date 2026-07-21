@@ -3,9 +3,12 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from token_prediction.estimators import TokenForecast
+
+
+CALIBRATOR_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -28,9 +31,55 @@ class IntervalCalibrator(Protocol):
 
 
 @dataclass(frozen=True)
-class _ExpansionCalibrator:
+class FittedExpansionCalibrator:
     calibrator_id: str
+    interval_alpha: float
     expansion: float
+
+    def __post_init__(self) -> None:
+        if self.calibrator_id not in {"task_max_conformal", "none"}:
+            raise ValueError("unsupported fitted calibrator id")
+        if not math.isfinite(self.interval_alpha) or not 0 < self.interval_alpha < 1:
+            raise ValueError("calibrator alpha must be finite and in (0, 1)")
+        if not math.isfinite(self.expansion) or self.expansion < 0:
+            raise ValueError("calibrator expansion must be finite and non-negative")
+        if self.calibrator_id == "none" and self.expansion != 0.0:
+            raise ValueError("identity calibrator expansion must be exactly zero")
+
+    def to_dict(self) -> dict[str, float | int | str]:
+        return {
+            "calibrator_schema_version": CALIBRATOR_SCHEMA_VERSION,
+            "calibrator_id": self.calibrator_id,
+            "interval_alpha": self.interval_alpha,
+            "expansion": self.expansion,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "FittedExpansionCalibrator":
+        expected = {
+            "calibrator_schema_version",
+            "calibrator_id",
+            "interval_alpha",
+            "expansion",
+        }
+        if set(value) != expected:
+            raise ValueError("fitted calibrator has missing or extra fields")
+        version = value.get("calibrator_schema_version")
+        if isinstance(version, bool) or version != CALIBRATOR_SCHEMA_VERSION:
+            raise ValueError("unsupported fitted calibrator schema version")
+        calibrator_id = value.get("calibrator_id")
+        if not isinstance(calibrator_id, str):
+            raise TypeError("fitted calibrator id must be a string")
+        alpha = value.get("interval_alpha")
+        expansion = value.get("expansion")
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or isinstance(expansion, bool)
+            or not isinstance(expansion, (int, float))
+        ):
+            raise TypeError("fitted calibrator numeric fields must be JSON numbers")
+        return cls(calibrator_id, float(alpha), float(expansion))
 
     def transform(self, forecast: TokenForecast) -> TokenForecast:
         raw_lower = (
@@ -67,7 +116,7 @@ class TaskMaxConformalCalibrator:
             raise ValueError("alpha must be in (0, 1)")
         self.alpha = alpha
 
-    def fit(self, examples: Sequence[CalibrationExample]) -> _ExpansionCalibrator:
+    def fit(self, examples: Sequence[CalibrationExample]) -> FittedExpansionCalibrator:
         if not examples:
             raise ValueError("calibration examples are empty")
         by_task: dict[str, list[float]] = defaultdict(list)
@@ -81,13 +130,24 @@ class TaskMaxConformalCalibrator:
             len(task_scores),
             max(1, math.ceil((len(task_scores) + 1) * (1 - self.alpha))),
         )
-        return _ExpansionCalibrator(self.calibrator_id, task_scores[rank - 1])
+        return FittedExpansionCalibrator(
+            self.calibrator_id,
+            self.alpha,
+            task_scores[rank - 1],
+        )
 
 
 @dataclass(frozen=True)
 class IdentityCalibrator:
     calibrator_id: str = "none"
+    alpha: float = 0.10
 
-    def fit(self, examples: Sequence[CalibrationExample]) -> _ExpansionCalibrator:
+    def __post_init__(self) -> None:
+        if self.calibrator_id != "none":
+            raise ValueError("identity calibrator id must be 'none'")
+        if not math.isfinite(self.alpha) or not 0 < self.alpha < 1:
+            raise ValueError("identity calibrator alpha must be finite and in (0, 1)")
+
+    def fit(self, examples: Sequence[CalibrationExample]) -> FittedExpansionCalibrator:
         del examples
-        return _ExpansionCalibrator(self.calibrator_id, 0.0)
+        return FittedExpansionCalibrator(self.calibrator_id, self.alpha, 0.0)

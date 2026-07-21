@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Sequence
+from types import MappingProxyType
+from typing import Mapping, Sequence
 
 from token_prediction.estimators import TokenForecast
 
@@ -18,6 +19,29 @@ class ScoredForecast:
     forecast: TokenForecast
     target_value: float
     sample_weight: float
+
+
+@dataclass(frozen=True)
+class TaskForecastMetrics:
+    """Label-free aggregate sufficient for paired task-level comparisons."""
+
+    task_id: str
+    n_points: int
+    n_trajectories: int
+    weight_sum: float
+    weighted_mae: float
+    weighted_interval_score: float
+    weighted_coverage: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "n_points": self.n_points,
+            "n_trajectories": self.n_trajectories,
+            "weight_sum": self.weight_sum,
+            "weighted_mae": self.weighted_mae,
+            "weighted_interval_score": self.weighted_interval_score,
+            "weighted_coverage": self.weighted_coverage,
+        }
 
 
 def _weighted_mean(values: Sequence[float], weights: Sequence[float]) -> float:
@@ -200,3 +224,40 @@ def evaluate_forecasts(
             }
         )
     return metrics
+
+
+def evaluate_task_forecasts(
+    rows: Sequence[ScoredForecast],
+    *,
+    alpha: float = 0.10,
+) -> Mapping[str, TaskForecastMetrics]:
+    """Aggregate scored forecasts by task without retaining point labels.
+
+    The returned records preserve the weighted numerators through ``weight_sum``
+    and the weighted means.  They are therefore sufficient for deterministic
+    same-task comparisons and task-clustered resampling while keeping target
+    values out of serialized prediction records.
+    """
+
+    if not rows:
+        raise ValueError("cannot evaluate an empty prediction set")
+    by_task: dict[str, list[ScoredForecast]] = {}
+    for row in rows:
+        if not row.task_id:
+            raise ValueError("scored forecasts require a non-empty task_id")
+        by_task.setdefault(row.task_id, []).append(row)
+
+    resolved: dict[str, TaskForecastMetrics] = {}
+    for task_id in sorted(by_task):
+        task_rows = by_task[task_id]
+        metrics = evaluate_forecasts(task_rows, alpha=alpha)
+        resolved[task_id] = TaskForecastMetrics(
+            task_id=task_id,
+            n_points=int(metrics["n_points"]),
+            n_trajectories=int(metrics["n_trajectories"]),
+            weight_sum=float(metrics["weight_sum"]),
+            weighted_mae=float(metrics["mae"]),
+            weighted_interval_score=float(metrics["interval_score"]),
+            weighted_coverage=float(metrics["coverage"]),
+        )
+    return MappingProxyType(resolved)

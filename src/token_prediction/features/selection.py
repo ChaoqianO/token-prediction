@@ -111,6 +111,8 @@ DEFAULT_FEATURE_CATALOG = FeatureCatalog(
         FeatureSpec(
             "current_request_tokens_local", FeatureGroup.G2, "request_context", "numeric"
         ),
+        FeatureSpec("request_message_count", FeatureGroup.G2, "request_context", "numeric"),
+        FeatureSpec("request_content_chars", FeatureGroup.G2, "request_context", "numeric"),
         FeatureSpec("request_delta_tokens", FeatureGroup.G2, "request_context", "numeric"),
         FeatureSpec("context_utilization", FeatureGroup.G2, "request_context", "numeric"),
         FeatureSpec("new_message_tokens", FeatureGroup.G2, "request_context", "numeric"),
@@ -198,4 +200,9 @@ REQUEST_LENGTH_ONLY = FeatureSet(
     "request_length_only",
     include_all=False,
     include_features=frozenset({"current_request_tokens_local"}),
+)
+REQUEST_CONTENT_CHARS_ONLY = FeatureSet(
+    "request_content_chars_only",
+    include_all=False,
+    include_features=frozenset({"request_content_chars"}),
 )

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import importlib.util
+import platform
 import unittest
 from dataclasses import dataclass, replace
 from types import MappingProxyType
+from unittest.mock import patch
 
+from token_prediction import __version__ as TOKEN_PREDICTION_VERSION
+from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
 from token_prediction.dataset import (
     PredictionPosition,
     PredictionTarget,
+    build_capability_supervised_dataset,
     build_supervised_dataset,
     make_task_split_plan,
 )
@@ -20,6 +26,7 @@ from token_prediction.estimators import (
 from token_prediction.experiment import (
     AblationAxis,
     AblationSpec,
+    CandidateGraph,
     CandidateRole,
     CandidateSpec,
     ExperimentRunner,
@@ -34,12 +41,78 @@ from token_prediction.features import FULL_FEATURE_SET, NO_FEATURES, FeatureGrou
 from tests.helpers import make_two_call_trajectory
 
 
+HAS_NEURAL = bool(
+    importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors")
+)
+
+
 class ExperimentContractTests(unittest.TestCase):
+    def test_candidate_graph_is_hash_bound_and_defaults_to_point_mode(self) -> None:
+        point = CandidateSpec("point", "empirical_quantile", FULL_FEATURE_SET)
+        self.assertFalse(point.graph.is_lifecycle)
+        self.assertEqual(point.graph.updater_estimator_id, "empirical_quantile")
+        lifecycle = CandidateSpec(
+            "lifecycle",
+            "cross_position_deduct",
+            FULL_FEATURE_SET,
+            graph=CandidateGraph(
+                initializer_estimator_id="empirical_quantile",
+                updater_estimator_id="cross_position_deduct",
+                lifecycle_schema_id="task_lifecycle_v1",
+                seed_policy_id="inner_oof_repaired_quantile_mean_v1",
+                inner_split_policy_id="five_fold_rotating_holdout_v1",
+            ),
+        )
+        self.assertTrue(lifecycle.graph.is_lifecycle)
+        self.assertNotEqual(point.content_hash, lifecycle.content_hash)
+        initialized = CandidateSpec(
+            "lifecycle-with-initializer-params",
+            "cross_position_deduct",
+            FULL_FEATURE_SET,
+            initializer_params={"alpha": 0.2, "minimum": 3},
+            graph=CandidateGraph(
+                initializer_estimator_id="empirical_quantile",
+                updater_estimator_id="cross_position_deduct",
+                lifecycle_schema_id="task_lifecycle_v1",
+                seed_policy_id="inner_oof_repaired_quantile_mean_v1",
+                inner_split_policy_id="five_fold_rotating_holdout_v1",
+            ),
+        )
+        self.assertEqual(
+            initialized.initializer_params,
+            {"alpha": 0.2, "minimum": 3},
+        )
+        self.assertNotEqual(initialized.content_hash, lifecycle.content_hash)
+        changed_initializer = replace(
+            initialized,
+            initializer_params={"alpha": 0.3, "minimum": 3},
+        )
+        self.assertNotEqual(initialized.content_hash, changed_initializer.content_hash)
+        with self.assertRaisesRegex(ValueError, "point candidates.*initializer_params"):
+            CandidateSpec(
+                "point-with-initializer-params",
+                "empirical_quantile",
+                FULL_FEATURE_SET,
+                initializer_params={"alpha": 0.2},
+            )
+        with self.assertRaisesRegex(ValueError, "updater"):
+            CandidateSpec(
+                "mismatch",
+                "empirical_quantile",
+                FULL_FEATURE_SET,
+                graph=CandidateGraph(updater_estimator_id="length_only"),
+            )
+        with self.assertRaisesRegex(ValueError, "finite canonical JSON"):
+            CandidateSpec(
+                "non-finite",
+                "empirical_quantile",
+                FULL_FEATURE_SET,
+                params={"bad": float("nan")},
+            )
+
     def setUp(self) -> None:
         self.dataset = build_supervised_dataset(
-            make_two_call_trajectory(task, run)
-            for task in range(5)
-            for run in range(2)
+            make_two_call_trajectory(task, run) for task in range(5) for run in range(2)
         )
         self.split = make_task_split_plan(
             self.dataset.task_ids,
@@ -92,6 +165,103 @@ class ExperimentContractTests(unittest.TestCase):
                 all(metrics["n_tasks"] == 1 for metrics in result.fold_metrics.values())
             )
             self.assertEqual(result.fold_artifacts, ())
+
+    @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
+    def test_independent_mlp_fold_bundle_is_reloaded_before_result(self) -> None:
+        import numpy as np
+        import safetensors
+        import torch
+
+        descriptor = SourceDescriptor(
+            source_id="experiment-neural-fixture",
+            revision="revision-1",
+            manifest_path="workspace/experiment-neural-fixture.json",
+            manifest_sha256="9" * 64,
+            capabilities=SourceCapabilities(
+                source_id="experiment-neural-fixture",
+                observables=frozenset(
+                    {
+                        Observable.ATTEMPT_USAGE,
+                        Observable.REQUEST_BOUNDARIES,
+                        Observable.REQUEST_LOCAL_COUNT,
+                        Observable.TASK_TERMINATION,
+                    }
+                ),
+            ),
+        )
+        dataset = build_capability_supervised_dataset(
+            (
+                make_two_call_trajectory(task, run)
+                for task in range(5)
+                for run in range(2)
+            ),
+            descriptor,
+        )
+        split = make_task_split_plan(
+            dataset.task_ids,
+            dataset_id=dataset.dataset_id,
+            folds=5,
+            seed=13,
+        )
+        source_provenance = {
+            "source_descriptor": descriptor.to_dict(),
+            "source_descriptor_hash": descriptor.descriptor_hash,
+            "code_hash": "d" * 64,
+            "runtime_versions": {
+                "python_version": platform.python_version(),
+                "token_prediction_version": TOKEN_PREDICTION_VERSION,
+                "numpy_version": str(np.__version__),
+                "torch_version": str(torch.__version__),
+                "safetensors_version": str(safetensors.__version__),
+            },
+        }
+        candidate = CandidateSpec(
+            "independent-mlp",
+            "independent_mlp",
+            FULL_FEATURE_SET,
+            params={
+                "hidden_dims": [8, 4],
+                "max_epochs": 1,
+                "patience": 1,
+            },
+        )
+        spec = ExperimentSpec(
+            "independent-mlp",
+            PredictionPosition.TASK_PRE,
+            PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS,
+            (candidate,),
+            calibrator_id="none",
+        )
+        from token_prediction.estimators.neural_bundle import (
+            load_neural_bundle as real_loader,
+        )
+
+        with patch(
+            "token_prediction.estimators.neural_bundle.load_neural_bundle",
+            wraps=real_loader,
+        ) as loader:
+            result = ExperimentRunner(builtin_registry()).run(
+                dataset,
+                split,
+                spec,
+                seed=13,
+                source_provenance=source_provenance,
+            )[0]
+        self.assertEqual(loader.call_count, split.folds)
+        self.assertEqual(len(result.fold_artifacts), split.folds)
+
+        with patch(
+            "token_prediction.estimators.neural_bundle.load_neural_bundle",
+            side_effect=RuntimeError("synthetic reload failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic reload failure"):
+                ExperimentRunner(builtin_registry()).run(
+                    dataset,
+                    split,
+                    spec,
+                    seed=13,
+                    source_provenance=source_provenance,
+                )
 
     def test_ablation_may_change_only_declared_axis(self) -> None:
         without_history = FeatureSet(
@@ -309,17 +479,28 @@ class ExperimentContractTests(unittest.TestCase):
             self.assertEqual(artifact.fold, fold)
             self.assertEqual(artifact.encoder["schema_version"], 1)
             self.assertEqual(artifact.fit_report["fold_name"], f"fold-{fold}")
-            self.assertEqual(
-                artifact.fit_report["parameters"], {"deterministic": True}
-            )
-            self.assertEqual(
-                artifact.feature_importance[0]["source_feature_name"], "task_tokens"
-            )
+            self.assertEqual(artifact.fit_report["parameters"], {"deterministic": True})
+            self.assertEqual(artifact.feature_importance[0]["source_feature_name"], "task_tokens")
             self.assertEqual(artifact.model_strings["q50"], "model text")
             self.assertEqual(artifact.bundle_files["manifest.json"], b"{}")
 
     def test_fold_artifact_rejects_unsafe_bundle_payloads(self) -> None:
-        for name in ("", ".", "..", "../manifest.json", "a/b", "a\\b"):
+        nested = FoldArtifact(
+            fold=0,
+            bundle_files={"components/" + "a" * 64 + "/weights.safetensors": b"safe"},
+        )
+        self.assertIn("components/", next(iter(nested.bundle_files)))
+        for name in (
+            "",
+            ".",
+            "..",
+            "../manifest.json",
+            "components/../manifest.json",
+            "/manifest.json",
+            "C:/manifest.json",
+            "a\\b",
+            " manifest.json",
+        ):
             with self.subTest(name=name):
                 with self.assertRaises(ValueError):
                     FoldArtifact(fold=0, bundle_files={name: b"payload"})
