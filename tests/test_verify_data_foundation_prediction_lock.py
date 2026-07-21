@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -201,6 +202,14 @@ class DataFoundationPredictionLockTests(unittest.TestCase):
             self.assertNotIn(str(root), rendered)
             self.assertNotIn("condition:", rendered)
 
+    def test_repository_production_lock_and_frozen_git_objects_close(self) -> None:
+        summary = verifier.verify_tracked_prediction_lock_only(verifier.REPO_ROOT)
+        self.assertEqual(summary["verification_scope"], "tracked_lock_and_git_objects")
+        self.assertEqual(summary["bundle_count"], 90)
+        self.assertEqual(summary["estimable_condition_count"], 6)
+        self.assertEqual(summary["gated_condition_count"], 4)
+        self.assertGreater(summary["prediction_count"], 0)
+
     def test_lock_extra_fields_and_all_explicit_digests_reject_tamper(self) -> None:
         cases = (
             ("extra", lambda lock: lock.update({"unexpected": True})),
@@ -259,6 +268,19 @@ class DataFoundationPredictionLockTests(unittest.TestCase):
                 path.write_bytes(path.read_bytes() + b"tamper")
                 with self.assertRaises(verifier.PredictionLockError):
                     self._verify(root)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO support is unavailable")
+    def test_artifact_special_nodes_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._copy_fixture(root)
+            fifo = root / ARTIFACT_RELATIVE / "unexpected.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(
+                verifier.PredictionLockError,
+                "only regular files and directories",
+            ):
+                self._verify(root)
 
     def test_unsafe_paths_symlinks_and_privacy_identity_keys_are_rejected(self) -> None:
         for value in (

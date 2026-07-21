@@ -52,6 +52,19 @@ class SecretScanTests(unittest.TestCase):
             )
             self.assertTrue(all(finding.path == "auth.json" for finding in findings))
 
+    def test_sensitive_config_toml_is_forbidden_even_without_token_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.toml"
+            path.write_text("model = 'local'\n", encoding="utf-8")
+
+            findings = scan_paths((path,), root=root)
+
+            self.assertEqual(
+                {finding.rule for finding in findings},
+                {"forbidden_secret_filename"},
+            )
+
     def test_binary_files_are_not_interpreted_as_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "image.bin"

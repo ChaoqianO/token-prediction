@@ -207,7 +207,11 @@ class DataFoundationBaselineTests(unittest.TestCase):
                 )
             else:
                 changed_rows.append(row)
-        perturbed = replace(self.dataset, rows=tuple(changed_rows))
+        perturbed = replace(
+            self.dataset,
+            dataset_id="f" * 64,
+            rows=tuple(changed_rows),
+        )
         second = baseline.make_holdout_plan(perturbed)
 
         self.assertEqual(second.development_tasks, self.holdout.development_tasks)
@@ -238,6 +242,26 @@ class DataFoundationBaselineTests(unittest.TestCase):
         )
         self.assertEqual(original_result, perturbed_result)
         self.assertEqual(original_bundles, perturbed_bundles)
+
+    def test_development_identity_changes_with_development_labels(self) -> None:
+        development_task = next(iter(self.holdout.development_tasks))
+        changed_rows = tuple(
+            replace(row, label=int(row.label or 0) + 1)
+            if row.point.task_id == development_task
+            else row
+            for row in self.dataset.rows
+        )
+        perturbed = replace(
+            self.dataset,
+            dataset_id="e" * 64,
+            rows=changed_rows,
+        )
+        second = baseline.make_holdout_plan(perturbed)
+        self.assertEqual(second.assignment_digest, self.holdout.assignment_digest)
+        self.assertNotEqual(
+            second.development_dataset_id,
+            self.holdout.development_dataset_id,
+        )
 
     def test_test_fold_label_does_not_change_its_prediction(self) -> None:
         condition = next(iter({row.point.condition_id for row in self.development.rows}))

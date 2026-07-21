@@ -25,6 +25,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -36,6 +37,8 @@ jobs:
           python -m pip install ".[dev,data,estimators]"
       - name: Scan repository-intended files for secrets
         run: python scripts/scan_secrets.py
+      - name: Verify tracked production baseline lock and frozen Git objects
+        run: python scripts/verify_data_foundation_prediction_lock.py --tracked-only
       - name: Ruff lint
         run: python -m ruff check src tests scripts
       - name: Target schema and prefix-causality contracts

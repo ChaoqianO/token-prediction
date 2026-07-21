@@ -51,6 +51,7 @@ from token_prediction.evaluation import (
 
 BASELINE_ARTIFACT_SCHEMA_VERSION = 1
 EMPIRICAL_BUNDLE_SCHEMA_VERSION = 1
+BASELINE_ID = "data_foundation_empirical_development_v2"
 FOLDS = 5
 SPLIT_SEEDS = (20260719, 20260720, 20260721)
 ALPHA = 0.10
@@ -83,7 +84,7 @@ FROZEN_SPEND_CONDITIONS = frozenset({"condition:b407e0d1ec34f386ebc4"})
 RUNNER_RELATIVE = "scripts/run_data_foundation_baseline.py"
 DEFAULT_BASELINE_LOCK = "configs/data_foundation_v2_baseline.json"
 DEFAULT_OUTPUT = (
-    "workspace/data_foundation/baselines/empirical-development-v1"
+    "workspace/data_foundation/baselines/empirical-development-v2"
 )
 OUTPUT_PREFIX = "workspace/data_foundation/baselines/"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1136,6 +1137,54 @@ def _holdout_task_digest(task_id: str) -> str:
     ).hexdigest()
 
 
+def _development_dataset_id(
+    dataset: SupervisedDataset,
+    development_tasks: frozenset[str],
+    assignment_digest: str,
+) -> str:
+    """Bind only the development cohort while retaining source provenance."""
+
+    rows = [
+        {
+            "point": {
+                "point_id": row.point.point_id,
+                "source_event_id": row.point.source_event_id,
+                "task_id": row.point.task_id,
+                "trajectory_id": row.point.trajectory_id,
+                "run_id": row.point.run_id,
+                "prediction_context_id": row.point.prediction_context_id,
+                "condition_id": row.point.condition_id,
+                "logical_call_id": row.point.logical_call_id,
+                "attempt_id": row.point.attempt_id,
+                "cutoff_event_seq": row.point.cutoff_event_seq,
+                "position": row.point.position.value,
+                "target": row.point.target.value,
+                "features": dict(row.point.features),
+                "known_offset_tokens": row.point.known_offset_tokens,
+            },
+            "label": row.label,
+            "status": row.status.value,
+            "invalid_reason": row.invalid_reason,
+        }
+        for row in sorted(dataset.rows, key=lambda item: item.point.point_id)
+        if row.point.task_id in development_tasks
+    ]
+    if not rows:
+        raise DataFoundationBaselineError("development identity has no rows")
+    return _semantic_sha256(
+        {
+            "development_dataset_identity_schema_version": 1,
+            "source_schema_version": dataset.schema_version,
+            "source_descriptor_hash": dataset.source_descriptor_hash,
+            "capability_contract_hash": dataset.capability_contract_hash,
+            "holdout_policy_id": FINAL_HOLDOUT_POLICY_ID,
+            "holdout_assignment_digest": assignment_digest,
+            "cohort": "development",
+            "rows": rows,
+        }
+    )
+
+
 def make_holdout_plan(dataset: SupervisedDataset) -> HoldoutPlan:
     tasks = sorted(dataset.task_ids)
     if len(tasks) < MIN_DEVELOPMENT_TASKS_PER_CONDITION + 1:
@@ -1162,19 +1211,17 @@ def make_holdout_plan(dataset: SupervisedDataset) -> HoldoutPlan:
     if not holdout or len(development) < MIN_DEVELOPMENT_TASKS_PER_CONDITION:
         raise DataFoundationBaselineError("stable task-hash holdout produced an empty/small cohort")
     assignment_digest = _semantic_sha256(assignments)
-    development_dataset_id = _semantic_sha256(
-        {
-            "source_dataset_id": dataset.dataset_id,
-            "holdout_policy_id": FINAL_HOLDOUT_POLICY_ID,
-            "holdout_assignment_digest": assignment_digest,
-            "cohort": "development",
-        }
+    development_tasks = frozenset(development)
+    development_dataset_id = _development_dataset_id(
+        dataset,
+        development_tasks,
+        assignment_digest,
     )
     return HoldoutPlan(
         source_dataset_id=dataset.dataset_id,
         development_dataset_id=development_dataset_id,
         assignment_digest=assignment_digest,
-        development_tasks=frozenset(development),
+        development_tasks=development_tasks,
         final_holdout_tasks=frozenset(holdout),
     )
 
@@ -1829,7 +1876,7 @@ def build_results(
     }
     results: dict[str, Any] = {
         "baseline_results_schema_version": BASELINE_ARTIFACT_SCHEMA_VERSION,
-        "baseline_id": "data_foundation_empirical_development_v1",
+        "baseline_id": BASELINE_ID,
         "evaluation_scope": "development_cross_validation_only",
         "final_holdout_evaluated": False,
         "final_holdout_prediction_count": 0,
@@ -2039,7 +2086,7 @@ def verify_artifact(path: Path) -> dict[str, Any]:
         raise DataFoundationBaselineError("artifact manifest has missing or extra fields")
     if (
         manifest.get("artifact_schema_version") != BASELINE_ARTIFACT_SCHEMA_VERSION
-        or manifest.get("baseline_id") != "data_foundation_empirical_development_v1"
+        or manifest.get("baseline_id") != BASELINE_ID
     ):
         raise DataFoundationBaselineError("artifact manifest identity is unsupported")
     manifest_commit = _require_commit(manifest.get("git_commit"), label="artifact Git commit")

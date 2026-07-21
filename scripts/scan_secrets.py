@@ -18,6 +18,7 @@ FORBIDDEN_BASENAMES = frozenset(
         ".env",
         "auth.json",
         "auth-profiles.json",
+        "config.toml",
         "credentials.json",
         "secrets.json",
     }

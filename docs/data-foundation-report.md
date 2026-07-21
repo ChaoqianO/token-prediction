@@ -220,8 +220,9 @@ python scripts/verify_data_foundation_prediction_lock.py `
 
 The verifier rejects a dirty or mismatched tracked runner/control tree,
 absolute or traversal paths, reparse points, symlinks, missing or extra bundle
-files, modified hashes, split/weight inconsistencies, and any mismatch between
-the tracked lock and the complete calibrated artifact trajectory.
+files, non-regular filesystem nodes, modified hashes, split/weight
+inconsistencies, and any mismatch between the tracked lock and the complete
+calibrated artifact trajectory.
 
 ## Historical Stage 1 artifact
 
