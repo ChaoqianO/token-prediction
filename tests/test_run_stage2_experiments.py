@@ -68,6 +68,7 @@ def _results_document() -> dict[str, object]:
         "results_schema_version": stage2.STAGE2_RESULTS_SCHEMA_VERSION,
         "stage_name": stage2.STAGE2_STAGE_NAME,
         "run_policy_id": stage2.STAGE2_RUN_POLICY_ID,
+        "artifact_layout_id": stage2.STAGE2_ARTIFACT_LAYOUT_ID,
         "run_id": "run",
         "source": {},
         "data_foundation": {},
@@ -155,6 +156,30 @@ class Stage2RunnerTests(unittest.TestCase):
             with self.subTest(path=unsafe):
                 with self.assertRaises((ValueError, stage2.Stage2ExperimentError)):
                     stage2._safe_output_root(root, unsafe)
+
+    def test_compact_artifact_keys_fit_the_windows_legacy_path_budget(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        experiment_key = stage2._artifact_key("e", "x" * 200)
+        candidate_key = stage2._artifact_key("c", "y" * 200)
+        self.assertEqual(len(experiment_key), 18)
+        self.assertEqual(len(candidate_key), 18)
+        deepest = (
+            root
+            / "workspace"
+            / "stage2"
+            / "experiments"
+            / stage2._output_key("f" * 24)
+            / "fold_artifacts"
+            / experiment_key
+            / candidate_key
+            / "seed_20260719"
+            / "fold_0"
+            / "bundle"
+            / "components"
+            / ("f" * 64)
+            / "weights.safetensors"
+        )
+        self.assertLess(len(str(deepest)), 260)
 
     def test_candidate_result_task_metric_point_count_stays_bound(self) -> None:
         result = _result()

@@ -80,6 +80,8 @@ STAGE2_RUN_POLICY_ID = "stage2_source_three_seed_nested_cv_v1"
 STAGE2_PREDICTION_PROJECTION_ID = "stage2_calibrated_prediction_projection_v1"
 STAGE2_COHORT_PROJECTION_ID = "stage2_prediction_cohort_projection_v1"
 STAGE2_TASK_PSEUDONYM_POLICY_ID = "stage2_task_pseudonym_v1"
+STAGE2_ARTIFACT_LAYOUT_ID = "stage2_compact_fold_artifact_layout_v1"
+STAGE2_OUTPUT_KEY_HEX_LENGTH = 20
 STAGE2_RUNNER_RELATIVE = "scripts/run_stage2_experiments.py"
 DEFAULT_OUTPUT_ROOT = "workspace/stage2/experiments"
 ALLOWED_OUTPUT_PREFIX = "workspace/stage2/experiments/"
@@ -400,6 +402,23 @@ def _task_pseudonym(task_id: str, *, split_plan_id: str) -> str:
     ).hexdigest()
 
 
+def _artifact_key(kind: str, identity: str) -> str:
+    if kind not in {"e", "c"} or not str(identity).strip():
+        raise Stage2ExperimentError("invalid compact artifact identity")
+    digest = hashlib.sha256(
+        f"{STAGE2_ARTIFACT_LAYOUT_ID}\0{kind}\0{identity}".encode("utf-8")
+    ).hexdigest()
+    return f"{kind}_{digest[:16]}"
+
+
+def _output_key(run_id: str) -> str:
+    if len(run_id) < STAGE2_OUTPUT_KEY_HEX_LENGTH or any(
+        character not in "0123456789abcdef" for character in run_id
+    ):
+        raise Stage2ExperimentError("Stage 2 run id is not hexadecimal")
+    return f"s2-{run_id[:STAGE2_OUTPUT_KEY_HEX_LENGTH]}"
+
+
 def _prediction_document(result: CandidateResult, record: Any) -> dict[str, object]:
     forecast = record.forecast
     return {
@@ -610,6 +629,7 @@ def build_stage2_results(
                 {
                     "candidate_id": candidate.candidate_id,
                     "candidate_hash": candidate.content_hash,
+                    "artifact_key": _artifact_key("c", candidate.content_hash),
                     "estimator_id": candidate.estimator_id,
                     "feature_set_id": candidate.feature_set.feature_set_id,
                     "feature_set_hash": candidate.feature_set.content_hash,
@@ -621,6 +641,7 @@ def build_stage2_results(
         experiments.append(
             {
                 "experiment_id": spec.experiment_id,
+                "artifact_key": _artifact_key("e", spec.experiment_id),
                 "position": spec.position.value,
                 "target": spec.target.value,
                 "condition_id": spec.condition_id,
@@ -634,6 +655,7 @@ def build_stage2_results(
         "results_schema_version": STAGE2_RESULTS_SCHEMA_VERSION,
         "stage_name": STAGE2_STAGE_NAME,
         "run_policy_id": STAGE2_RUN_POLICY_ID,
+        "artifact_layout_id": STAGE2_ARTIFACT_LAYOUT_ID,
         "run_id": run_id,
         "source": {
             "source_name": source_name,
@@ -694,6 +716,7 @@ def verify_stage2_results_document(value: Mapping[str, object]) -> str:
         "results_schema_version",
         "stage_name",
         "run_policy_id",
+        "artifact_layout_id",
         "run_id",
         "source",
         "data_foundation",
@@ -713,6 +736,8 @@ def verify_stage2_results_document(value: Mapping[str, object]) -> str:
         raise Stage2ExperimentError("unsupported Stage 2 results schema")
     if value["stage_name"] != STAGE2_STAGE_NAME or value["run_policy_id"] != STAGE2_RUN_POLICY_ID:
         raise Stage2ExperimentError("Stage 2 results policy identity is invalid")
+    if value["artifact_layout_id"] != STAGE2_ARTIFACT_LAYOUT_ID:
+        raise Stage2ExperimentError("Stage 2 artifact layout identity is invalid")
     _assert_aggregate_safe(value)
     holdout = value["final_holdout"]
     if not isinstance(holdout, Mapping) or holdout != {
@@ -750,8 +775,18 @@ def _write_execution_artifacts(
     execution: DevelopmentExperimentResults,
     matrix: Stage2Matrix,
 ) -> None:
+    experiment_keys: set[str] = set()
     for spec_index, spec in enumerate(matrix.experiments):
+        experiment_key = _artifact_key("e", spec.experiment_id)
+        if experiment_key in experiment_keys:
+            raise Stage2ExperimentError("compact Stage 2 experiment artifact key collided")
+        experiment_keys.add(experiment_key)
+        candidate_keys: set[str] = set()
         for candidate in spec.candidates:
+            candidate_key = _artifact_key("c", candidate.content_hash)
+            if candidate_key in candidate_keys:
+                raise Stage2ExperimentError("compact Stage 2 candidate artifact key collided")
+            candidate_keys.add(candidate_key)
             for seed_result in execution.seed_results:
                 result = next(
                     item
@@ -760,8 +795,8 @@ def _write_execution_artifacts(
                 )
                 _write_fold_artifacts(
                     root,
-                    experiment_id=spec.experiment_id,
-                    candidate_id=result.candidate_id,
+                    experiment_id=experiment_key,
+                    candidate_id=candidate_key,
                     split_seed=seed_result.split_seed,
                     artifacts=result.fold_artifacts,
                 )
@@ -889,7 +924,7 @@ def run_stage2_source(
         matrix=matrix,
     )
     run_id = _semantic_sha256(run_semantic)[:24]
-    output = output_parent / f"{source_name}-{run_id}"
+    output = output_parent / _output_key(run_id)
     if output.exists():
         return _existing_summary(
             output,
@@ -926,7 +961,7 @@ def run_stage2_source(
     if _is_link_or_reparse(output_parent):
         raise Stage2ExperimentError("Stage 2 output parent is unsafe")
     temporary = Path(
-        tempfile.mkdtemp(prefix=f".{source_name}-{run_id}.tmp-", dir=output_parent)
+        tempfile.mkdtemp(prefix=".s2-", dir=output_parent)
     )
     try:
         _write_results(temporary / "results.json", results)
