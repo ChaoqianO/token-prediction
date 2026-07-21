@@ -4,11 +4,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 PERMANENT_HOLDOUT_POLICY_ID = "stable_task_sha256_bucket_v1"
-INNER_FOLD_POLICY_ID = "task_sha256_rank_round_robin_inner_oof_v1"
+INNER_FOLD_POLICY_ID = "task_multicohort_balanced_inner_oof_v2"
+OUTER_BALANCED_FOLD_POLICY_ID = "task_multicohort_balanced_outer_cv_v1"
 DEFAULT_FINAL_HOLDOUT_SALT = "token-prediction/final-holdout/2026-07-21/v1"
 DEFAULT_FINAL_HOLDOUT_BUCKET_COUNT = 10_000
 DEFAULT_FINAL_HOLDOUT_BUCKET_THRESHOLD = 2_000
@@ -47,15 +48,134 @@ def _holdout_evidence(
     return evidence, tuple(assignments)
 
 
-def _inner_assignments(tasks: Iterable[str], *, seed: int) -> tuple[tuple[str, int], ...]:
-    ranked = sorted(
-        tasks,
-        key=lambda task: hashlib.sha256(
-            f"{INNER_FOLD_POLICY_ID}\0{seed}\0{task}".encode("utf-8")
-        ).hexdigest(),
+BalanceGroups = tuple[tuple[str, tuple[str, ...]], ...]
+
+
+def _normalized_balance_groups(
+    tasks: Iterable[str],
+    groups: Mapping[str, Iterable[str]] | None,
+    *,
+    folds: int,
+) -> BalanceGroups:
+    task_set = frozenset(tasks)
+    if groups is None:
+        return ()
+    normalized: list[tuple[str, tuple[str, ...]]] = []
+    for raw_group_id, raw_members in groups.items():
+        group_id = str(raw_group_id).strip()
+        if not group_id:
+            raise ValueError("balance group ids must be non-empty")
+        members = tuple(
+            sorted(
+                {
+                    str(task_id).strip()
+                    for task_id in raw_members
+                    if str(task_id).strip()
+                }
+            )
+        )
+        if not frozenset(members) <= task_set:
+            raise ValueError(f"balance group {group_id!r} contains an unknown task")
+        if len(members) < folds:
+            raise ValueError(
+                f"balance group {group_id!r} cannot cover all {folds} folds"
+            )
+        normalized.append((group_id, members))
+    normalized.sort(key=lambda item: item[0])
+    if len({group_id for group_id, _members in normalized}) != len(normalized):
+        raise ValueError("balance group ids must be unique")
+    return tuple(normalized)
+
+
+def _balance_groups_sha256(groups: BalanceGroups) -> str:
+    return _canonical_sha256(
+        [
+            {"group_id": group_id, "tasks": list(members)}
+            for group_id, members in groups
+        ]
     )
-    return tuple(
-        sorted((task, index % INNER_FOLDS) for index, task in enumerate(ranked))
+
+
+def _balanced_assignments(
+    tasks: Iterable[str],
+    *,
+    folds: int,
+    seed: int,
+    policy_id: str,
+    balance_groups: BalanceGroups,
+) -> tuple[tuple[str, int], ...]:
+    """Greedily balance multiple task cohorts with deterministic hash tie-breaks."""
+
+    canonical_tasks = tuple(sorted(tasks))
+    group_members = {
+        group_id: frozenset(members) for group_id, members in balance_groups
+    }
+    memberships = {
+        task: tuple(
+            group_id
+            for group_id, members in balance_groups
+            if task in group_members[group_id]
+        )
+        for task in canonical_tasks
+    }
+    group_sizes = {group_id: len(members) for group_id, members in balance_groups}
+    ranked = sorted(
+        canonical_tasks,
+        key=lambda task: (
+            min((group_sizes[group_id] for group_id in memberships[task]), default=10**18),
+            -len(memberships[task]),
+            hashlib.sha256(
+                f"{policy_id}\0{seed}\0task\0{task}".encode("utf-8")
+            ).hexdigest(),
+        ),
+    )
+    fold_sizes = [0] * folds
+    group_fold_counts = {
+        group_id: [0] * folds for group_id, _members in balance_groups
+    }
+    assigned: dict[str, int] = {}
+    for task in ranked:
+        task_groups = memberships[task]
+
+        def score(fold: int) -> tuple[int, int, int, str]:
+            counts = [group_fold_counts[group_id][fold] for group_id in task_groups]
+            return (
+                max(counts, default=0),
+                sum(counts),
+                fold_sizes[fold],
+                hashlib.sha256(
+                    f"{policy_id}\0{seed}\0fold\0{task}\0{fold}".encode("utf-8")
+                ).hexdigest(),
+            )
+
+        selected = min(range(folds), key=score)
+        assigned[task] = selected
+        fold_sizes[selected] += 1
+        for group_id in task_groups:
+            group_fold_counts[group_id][selected] += 1
+
+    if any(count == 0 for count in fold_sizes):
+        raise ValueError("balanced task assignment produced an empty fold")
+    for group_id, counts in group_fold_counts.items():
+        if any(count == 0 for count in counts):
+            raise ValueError(
+                f"balanced task assignment left group {group_id!r} empty in a fold"
+            )
+    return tuple(sorted(assigned.items()))
+
+
+def _inner_assignments(
+    tasks: Iterable[str],
+    *,
+    seed: int,
+    balance_groups: BalanceGroups,
+) -> tuple[tuple[str, int], ...]:
+    return _balanced_assignments(
+        tasks,
+        folds=INNER_FOLDS,
+        seed=seed,
+        policy_id=INNER_FOLD_POLICY_ID,
+        balance_groups=balance_groups,
     )
 
 
@@ -313,6 +433,7 @@ class InnerTaskFoldAssignment:
     folds: int
     seed: int
     assignments: tuple[tuple[str, int], ...]
+    balance_groups: BalanceGroups = ()
 
     def __post_init__(self) -> None:
         if self.policy_id != INNER_FOLD_POLICY_ID:
@@ -325,12 +446,24 @@ class InnerTaskFoldAssignment:
         fold_values = {fold for _task, fold in self.assignments}
         if fold_values != set(range(INNER_FOLDS)):
             raise ValueError("every inner fold must be non-empty")
-        if self.assignments != _inner_assignments(tasks, seed=self.seed):
+        normalized_groups = _normalized_balance_groups(
+            tasks,
+            {group_id: members for group_id, members in self.balance_groups},
+            folds=self.folds,
+        )
+        if normalized_groups != self.balance_groups:
+            raise ValueError("inner balance groups must use canonical order")
+        if self.assignments != _inner_assignments(
+            tasks,
+            seed=self.seed,
+            balance_groups=normalized_groups,
+        ):
             raise ValueError("inner assignment violates task hash policy")
         semantic = {
             "policy_id": INNER_FOLD_POLICY_ID,
             "folds": self.folds,
             "seed": self.seed,
+            "balance_groups_sha256": _balance_groups_sha256(normalized_groups),
             "assignments": self.assignments,
         }
         if self.assignment_id != _canonical_sha256(semantic):
@@ -383,6 +516,7 @@ def assign_task_folds(
     *,
     folds: int,
     seed: int,
+    balance_groups: Mapping[str, Iterable[str]] | None = None,
 ) -> TaskFoldAssignment:
     tasks = sorted({str(task_id).strip() for task_id in task_ids if str(task_id).strip()})
     if folds < 4:
@@ -391,16 +525,39 @@ def assign_task_folds(
         )
     if len(tasks) < folds:
         raise ValueError("number of tasks must be at least the number of folds")
-    ranked = sorted(
+    normalized_groups = _normalized_balance_groups(
         tasks,
-        key=lambda task: hashlib.sha256(f"{seed}\0{task}".encode("utf-8")).hexdigest(),
+        balance_groups,
+        folds=folds,
     )
-    assignments = tuple(sorted((task, index % folds) for index, task in enumerate(ranked)))
-    semantic = {
-        "folds": folds,
-        "seed": seed,
-        "assignments": assignments,
-    }
+    if normalized_groups:
+        assignments = _balanced_assignments(
+            tasks,
+            folds=folds,
+            seed=seed,
+            policy_id=OUTER_BALANCED_FOLD_POLICY_ID,
+            balance_groups=normalized_groups,
+        )
+        semantic = {
+            "policy_id": OUTER_BALANCED_FOLD_POLICY_ID,
+            "folds": folds,
+            "seed": seed,
+            "balance_groups_sha256": _balance_groups_sha256(normalized_groups),
+            "assignments": assignments,
+        }
+    else:
+        ranked = sorted(
+            tasks,
+            key=lambda task: hashlib.sha256(f"{seed}\0{task}".encode("utf-8")).hexdigest(),
+        )
+        assignments = tuple(
+            sorted((task, index % folds) for index, task in enumerate(ranked))
+        )
+        semantic = {
+            "folds": folds,
+            "seed": seed,
+            "assignments": assignments,
+        }
     encoded = json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
     return TaskFoldAssignment(
         assignment_id=hashlib.sha256(encoded).hexdigest(),
@@ -472,6 +629,7 @@ def assign_inner_task_folds(
     *,
     seed: int,
     folds: int = INNER_FOLDS,
+    balance_groups: Mapping[str, Iterable[str]] | None = None,
 ) -> InnerTaskFoldAssignment:
     """Assign exactly five task folds for leakage-free initializer OOF seeds."""
 
@@ -482,11 +640,21 @@ def assign_inner_task_folds(
     )
     if len(tasks) < folds:
         raise ValueError("number of inner tasks must be at least five")
-    assignments = _inner_assignments(tasks, seed=seed)
+    normalized_groups = _normalized_balance_groups(
+        tasks,
+        balance_groups,
+        folds=folds,
+    )
+    assignments = _inner_assignments(
+        tasks,
+        seed=seed,
+        balance_groups=normalized_groups,
+    )
     semantic = {
         "policy_id": INNER_FOLD_POLICY_ID,
         "folds": folds,
         "seed": seed,
+        "balance_groups_sha256": _balance_groups_sha256(normalized_groups),
         "assignments": assignments,
     }
     return InnerTaskFoldAssignment(
@@ -495,6 +663,7 @@ def assign_inner_task_folds(
         folds=folds,
         seed=seed,
         assignments=assignments,
+        balance_groups=normalized_groups,
     )
 
 

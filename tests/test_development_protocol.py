@@ -117,6 +117,28 @@ class DevelopmentProtocolTests(unittest.TestCase):
         self.assertEqual(first.outer_plans, changed.outer_plans)
         self.assertEqual(first.inner_plans, changed.inner_plans)
 
+    def test_outer_test_label_change_cannot_change_split_or_protocol_identity(self) -> None:
+        dataset = _dataset()
+        first = build_development_protocol(dataset)
+        test_task = next(iter(first.outer_plans[0].partition(0).test_tasks))
+        changed_rows = tuple(
+            replace(row, label=int(row.label or 0) + 10_000)
+            if row.point.task_id == test_task
+            else row
+            for row in dataset.rows
+        )
+        changed = build_development_protocol(
+            replace(dataset, dataset_id="d" * 64, rows=changed_rows)
+        )
+
+        self.assertEqual(
+            first.development_dataset.dataset_id,
+            changed.development_dataset.dataset_id,
+        )
+        self.assertEqual(first.protocol_id, changed.protocol_id)
+        self.assertEqual(first.outer_plans, changed.outer_plans)
+        self.assertEqual(first.inner_plans, changed.inner_plans)
+
     def test_all_runs_and_families_for_a_task_stay_in_one_cohort(self) -> None:
         dataset = _dataset()
         protocol = build_development_protocol(dataset)

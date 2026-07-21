@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 from token_prediction.dataset.points import point_input_semantic
-from token_prediction.dataset.schema import SupervisedDataset
+from token_prediction.dataset.schema import LabelStatus, SupervisedDataset
 from token_prediction.dataset.splits import (
     DEFAULT_FINAL_HOLDOUT_BUCKET_COUNT,
     DEFAULT_FINAL_HOLDOUT_BUCKET_THRESHOLD,
@@ -23,9 +23,10 @@ from token_prediction.dataset.splits import (
 
 STAGE_SPLIT_SEEDS = (20260719, 20260720, 20260721)
 OUTER_FOLDS = 5
-DEVELOPMENT_PROTOCOL_SCHEMA_VERSION = 1
-DEVELOPMENT_PROTOCOL_POLICY_ID = "permanent_holdout_three_seed_nested_cv_v1"
+DEVELOPMENT_PROTOCOL_SCHEMA_VERSION = 2
+DEVELOPMENT_PROTOCOL_POLICY_ID = "permanent_holdout_three_seed_balanced_nested_cv_v2"
 TASK_PSEUDONYM_POLICY_ID = "sha256_development_task_pseudonym_v1"
+SPLIT_BALANCE_GROUP_POLICY_ID = "observed_condition_position_target_task_cohort_v1"
 
 
 def _canonical_json(value: object) -> str:
@@ -135,7 +136,6 @@ def _development_dataset_id(
         "rows": [
             {
                 "point": point_input_semantic(row.point),
-                "label": row.label,
                 "status": row.status.value,
                 "invalid_reason": row.invalid_reason,
             }
@@ -143,6 +143,48 @@ def _development_dataset_id(
         ],
     }
     return _canonical_sha256(semantic)
+
+
+def _development_balance_groups(
+    dataset: SupervisedDataset,
+) -> dict[str, frozenset[str]]:
+    """Return label-value-free task cohorts that every CV fold must represent."""
+
+    grouped: dict[tuple[str, str, str], set[str]] = {}
+    for row in dataset.rows:
+        if row.status != LabelStatus.OBSERVED:
+            continue
+        key = (
+            row.point.condition_id,
+            row.point.position.value,
+            row.point.target.value,
+        )
+        grouped.setdefault(key, set()).add(row.point.task_id)
+    result: dict[str, frozenset[str]] = {}
+    for (condition_id, position, target), tasks in sorted(grouped.items()):
+        if len(tasks) < OUTER_FOLDS:
+            continue
+        group_id = _canonical_sha256(
+            {
+                "policy_id": SPLIT_BALANCE_GROUP_POLICY_ID,
+                "condition_id": condition_id,
+                "position": position,
+                "target": target,
+            }
+        )
+        result[group_id] = frozenset(tasks)
+    return result
+
+
+def _restricted_balance_groups(
+    groups: Mapping[str, frozenset[str]],
+    tasks: frozenset[str],
+) -> dict[str, frozenset[str]]:
+    return {
+        group_id: members & tasks
+        for group_id, members in groups.items()
+        if len(members & tasks) >= INNER_FOLDS
+    }
 
 
 def _protocol_identity(
@@ -291,11 +333,13 @@ class DevelopmentProtocol:
 
         expected_inner_keys: set[tuple[int, int]] = set()
         outer_by_seed: dict[int, SplitPlan] = {}
+        balance_groups = _development_balance_groups(self.development_dataset)
         for plan in self.outer_plans:
             expected = assign_task_folds(
                 development_tasks,
                 folds=OUTER_FOLDS,
                 seed=plan.seed,
+                balance_groups=balance_groups,
             ).bind(self.development_dataset.dataset_id)
             if plan != expected:
                 raise ValueError("outer split plan violates the frozen task-only policy")
@@ -324,6 +368,10 @@ class DevelopmentProtocol:
             expected_assignment = assign_inner_task_folds(
                 outer_train,
                 seed=inner_plan.split_seed,
+                balance_groups=_restricted_balance_groups(
+                    balance_groups,
+                    outer_train,
+                ),
             )
             if inner_plan.assignment != expected_assignment:
                 raise ValueError("inner plan violates the frozen five-fold task policy")
@@ -572,16 +620,25 @@ def build_development_protocol(
 
     outer_plans: list[SplitPlan] = []
     inner_plans: list[OuterInnerPlan] = []
+    balance_groups = _development_balance_groups(development_dataset)
     for seed in STAGE_SPLIT_SEEDS:
         outer = assign_task_folds(
             development_tasks,
             folds=OUTER_FOLDS,
             seed=seed,
+            balance_groups=balance_groups,
         ).bind(development_dataset.dataset_id)
         outer_plans.append(outer)
         for outer_test_fold in range(OUTER_FOLDS):
             outer_train = outer.partition(outer_test_fold).train_tasks
-            inner_assignment = assign_inner_task_folds(outer_train, seed=seed)
+            inner_assignment = assign_inner_task_folds(
+                outer_train,
+                seed=seed,
+                balance_groups=_restricted_balance_groups(
+                    balance_groups,
+                    outer_train,
+                ),
+            )
             for inner_holdout_fold in range(INNER_FOLDS):
                 partition = inner_assignment.partition(inner_holdout_fold)
                 if not (

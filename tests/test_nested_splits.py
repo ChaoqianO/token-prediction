@@ -128,6 +128,36 @@ class NestedSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "task hash policy"):
             replace(first, assignments=tuple(tampered))
 
+    def test_inner_assignment_balances_each_declared_task_cohort(self) -> None:
+        tasks = [f"task-{index:02d}" for index in range(20)]
+        groups = {
+            "scarce-task-pre-labels": tasks[:7],
+            "overlapping-update-cohort": tasks[3:16],
+        }
+        first = assign_inner_task_folds(
+            tasks,
+            seed=20260719,
+            balance_groups=groups,
+        )
+        second = assign_inner_task_folds(
+            reversed(tasks),
+            seed=20260719,
+            balance_groups={
+                "overlapping-update-cohort": reversed(tasks[3:16]),
+                "scarce-task-pre-labels": reversed(tasks[:7]),
+            },
+        )
+        self.assertEqual(first, second)
+        mapping = first.task_to_fold
+        for members in groups.values():
+            self.assertEqual({mapping[task] for task in members}, set(range(5)))
+        with self.assertRaisesRegex(ValueError, "cannot cover all 5 folds"):
+            assign_inner_task_folds(
+                tasks,
+                seed=20260719,
+                balance_groups={"too-small": tasks[:4]},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
