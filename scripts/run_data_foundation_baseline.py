@@ -1638,7 +1638,14 @@ def run_development_cell(
                     "forecast": _forecast_dict(forecast),
                 }
             )
-        fold_metrics[str(fold)] = evaluate_forecasts(fold_scored, alpha=ALPHA)
+        # The artifact stores predictions in pseudonymous point-hash order.  Use
+        # that same order for floating-point reductions so an artifact replays
+        # exactly on Python versions whose ``sum`` implementations differ.
+        metric_fold_scored = sorted(
+            fold_scored,
+            key=lambda item: _public_identity("point", item.forecast.point_id),
+        )
+        fold_metrics[str(fold)] = evaluate_forecasts(metric_fold_scored, alpha=ALPHA)
 
     expected = {row.point.point_id for row in dataset_slice.rows}
     actual = [record["point_id_sha256"] for record in predictions]
@@ -1647,6 +1654,10 @@ def run_development_cell(
         raise DataFoundationBaselineError(
             "development CV must score every eligible point exactly once"
         )
+    metric_scored = sorted(
+        all_scored,
+        key=lambda item: _public_identity("point", item.forecast.point_id),
+    )
     result = {
         "candidate_id": CANDIDATE_ID,
         "source_name": source_name,
@@ -1673,7 +1684,7 @@ def run_development_cell(
         ],
         "partitions": _partition_evidence(split_plan),
         "fold_metrics": fold_metrics,
-        "metrics": evaluate_forecasts(all_scored, alpha=ALPHA),
+        "metrics": evaluate_forecasts(metric_scored, alpha=ALPHA),
         "prediction_count": len(predictions),
         "bundle_reload_parity": {
             "status": "exact",

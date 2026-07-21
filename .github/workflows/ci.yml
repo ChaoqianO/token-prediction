@@ -34,7 +34,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev,data,estimators]"
+          python -m pip install --editable ".[dev,data,estimators]"
       - name: Scan repository-intended files for secrets
         run: python scripts/scan_secrets.py
       - name: Verify tracked production baseline lock and frozen Git objects
