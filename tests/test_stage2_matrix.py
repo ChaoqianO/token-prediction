@@ -13,8 +13,10 @@ from token_prediction.dataset import (
 )
 from token_prediction.development import build_development_protocol
 from token_prediction.stage2_matrix import (
+    BAGEN_SOKOBAN_SOURCE_ID,
     BAGEN_SOURCE_ID,
     FROZEN_BAGEN_CONDITIONS,
+    SPEND_AGGREGATE_SOURCE_ID,
     Stage2Matrix,
     build_stage2_matrix,
 )
@@ -22,6 +24,7 @@ from token_prediction.stage2_matrix import (
 
 PRIMARY_CONDITION = "condition:54cb50fce273f0aa2d74"
 SPARSE_CONDITION = "condition:20f615a22697984db6cc"
+AGGREGATE_CONDITION = "condition:spend-your-money:f06cc0d037ed16ff12db"
 
 
 def _point(
@@ -115,6 +118,57 @@ def _dataset(*, request_chars: bool = True) -> SupervisedDataset:
 
 
 class Stage2MatrixTests(unittest.TestCase):
+    def test_spend_aggregate_is_launch_only_with_real_task_length(self) -> None:
+        rows = tuple(
+            DatasetRow(
+                replace(
+                    _point(
+                        index,
+                        position=PredictionPosition.TASK_LAUNCH,
+                        target=PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS,
+                        condition_id=AGGREGATE_CONDITION,
+                    ),
+                    features={
+                        "task_char_count": 100 + index,
+                        "task_word_count": 20,
+                        "task_line_count": 2,
+                        "task_code_fence_count": 0,
+                        "repo_id": "org/repo",
+                        "model_id": "gpt-5.2",
+                        "agent_id": "openhands",
+                    },
+                ),
+                1_000 + index,
+                LabelStatus.OBSERVED,
+            )
+            for index in range(100)
+        )
+        dataset = SupervisedDataset(
+            dataset_id="1" * 64,
+            rows=rows,
+            schema_version=2,
+            source_descriptor_hash="2" * 64,
+            capability_contract_hash="3" * 64,
+            input_contract_hash="4" * 64,
+        )
+        matrix = build_stage2_matrix(
+            build_development_protocol(dataset),
+            source_id=SPEND_AGGREGATE_SOURCE_ID,
+        )
+        self.assertEqual(len(matrix.experiments), 1)
+        self.assertFalse(matrix.gates)
+        spec = matrix.experiments[0]
+        self.assertEqual(spec.position, PredictionPosition.TASK_LAUNCH)
+        self.assertEqual(
+            {candidate.candidate_id for candidate in spec.candidates},
+            {
+                "empirical",
+                "task_chars_length",
+                "lightgbm_structured",
+                "mlp_structured",
+            },
+        )
+
     def test_matrix_routes_launch_and_lifecycle_candidates_on_one_cohort(self) -> None:
         protocol = build_development_protocol(_dataset())
         matrix = build_stage2_matrix(protocol, source_id=BAGEN_SOURCE_ID)
@@ -155,6 +209,36 @@ class Stage2MatrixTests(unittest.TestCase):
         self.assertTrue(lifecycle.graph.is_lifecycle)
         self.assertEqual(lifecycle.graph.initializer_estimator_id, "empirical_quantile")
         self.assertEqual(lifecycle.graph.updater_estimator_id, "cross_position_deduct")
+
+    def test_sokoban_routes_the_full_launch_and_lifecycle_matrix(self) -> None:
+        dataset = _dataset()
+        rows = tuple(
+            replace(
+                row,
+                point=replace(row.point, condition_id="condition:effa60eb1d4380d124bf"),
+            )
+            for row in dataset.rows
+            if row.point.condition_id == PRIMARY_CONDITION
+        )
+        sokoban = replace(dataset, dataset_id="5" * 64, rows=rows)
+        matrix = build_stage2_matrix(
+            build_development_protocol(sokoban),
+            source_id=BAGEN_SOKOBAN_SOURCE_ID,
+        )
+        self.assertEqual(len(matrix.experiments), 2)
+        self.assertEqual(
+            {spec.position for spec in matrix.experiments},
+            {PredictionPosition.TASK_LAUNCH, PredictionPosition.TASK_UPDATE},
+        )
+        update = next(
+            spec
+            for spec in matrix.experiments
+            if spec.position == PredictionPosition.TASK_UPDATE
+        )
+        self.assertIn(
+            "cross_position_deduct",
+            {candidate.candidate_id for candidate in update.candidates},
+        )
 
     def test_sparse_and_absent_frozen_conditions_fail_closed(self) -> None:
         matrix = build_stage2_matrix(

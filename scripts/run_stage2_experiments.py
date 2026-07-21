@@ -18,14 +18,19 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from token_prediction.collection import (
+    BagenSokobanMetadata,
+    BagenSokobanReader,
     BagenSwebenchReader,
     OpenHandsArchiveMetadata,
     OpenHandsArchiveReader,
 )
+from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
 from token_prediction.dataset import (
     SupervisedDataset,
     augment_request_shape_features,
     build_capability_supervised_dataset,
+    build_spend_your_money_dataset,
+    load_swebench_verified_metadata_json,
 )
 from token_prediction.development import STAGE_SPLIT_SEEDS, build_development_protocol
 from token_prediction.evaluation import paired_task_metric_bootstrap
@@ -37,7 +42,9 @@ from token_prediction.pipeline import (
     run_development_experiments,
 )
 from token_prediction.stage2_matrix import (
+    BAGEN_SOKOBAN_SOURCE_ID,
     BAGEN_SOURCE_ID,
+    SPEND_AGGREGATE_SOURCE_ID,
     SPEND_SOURCE_ID,
     Stage2Matrix,
     build_stage2_matrix,
@@ -83,11 +90,34 @@ STAGE2_TASK_PSEUDONYM_POLICY_ID = "stage2_task_pseudonym_v1"
 STAGE2_ARTIFACT_LAYOUT_ID = "stage2_compact_fold_artifact_layout_v1"
 STAGE2_OUTPUT_KEY_HEX_LENGTH = 20
 STAGE2_RUNNER_RELATIVE = "scripts/run_stage2_experiments.py"
+STAGE2_METADATA_EXTRACTOR_RELATIVE = "scripts/extract_swebench_metadata.mjs"
+STAGE2_SOKOBAN_AUDITOR_RELATIVE = "scripts/audit_stage2_sokoban.py"
+STAGE1_VERIFIER_RELATIVE = "scripts/verify_stage1_baseline.py"
+DATA_FOUNDATION_BASELINE_RELATIVE = "scripts/run_data_foundation_baseline.py"
+STAGE2_AUXILIARY_MANIFEST_RELATIVE = "configs/stage2_auxiliary_sources.json"
+STAGE2_METADATA_BUILD_COMMAND = (
+    "npm.cmd install --prefix workspace/stage2/parquet-reader --ignore-scripts "
+    "--no-audit --no-fund hyparquet@1.26.2 && node "
+    "scripts/extract_swebench_metadata.mjs "
+    "workspace/external/spend_your_money/swe_bench_verified_test.parquet "
+    "workspace/stage2/auxiliary/swebench_verified_metadata.json "
+    "workspace/stage2/parquet-reader/node_modules/hyparquet/src/node.js"
+)
+STAGE2_HYPARQUET_NPM_INTEGRITY = (
+    "sha512-6qjyK7R2tZ4vnYP1J8NpcCeDPK1UIYk3xh5XgtQUnUM1iwkYbvI6Mz3xtmpMd6Af"
+    "CCeoUoJVbEq29k5GReZRWA=="
+)
 DEFAULT_OUTPUT_ROOT = "workspace/stage2/experiments"
 ALLOWED_OUTPUT_PREFIX = "workspace/stage2/experiments/"
 SOURCE_NAMES = {
+    "bagen_sokoban": BAGEN_SOKOBAN_SOURCE_ID,
     "bagen_swebench": BAGEN_SOURCE_ID,
     "spend_openhands": SPEND_SOURCE_ID,
+    "spend_aggregate": SPEND_AGGREGATE_SOURCE_ID,
+}
+AUXILIARY_SOURCE_IDS = {
+    "bagen_sokoban": BAGEN_SOKOBAN_SOURCE_ID,
+    "spend_aggregate": SPEND_AGGREGATE_SOURCE_ID,
 }
 _FORBIDDEN_RESULT_KEYS = frozenset(
     {
@@ -118,11 +148,23 @@ class Stage2CodeBinding:
 @dataclass(frozen=True)
 class Stage2LoadedSource:
     source_name: str
-    source_lock: SourceLock
+    source_lock: SourceLock | Stage2AuxiliarySourceLock
     base_dataset_id: str
     base_row_count: int
     derived_dataset: SupervisedDataset
     raw_paths: tuple[Path, ...]
+    projection_id: str
+
+
+@dataclass(frozen=True)
+class Stage2AuxiliarySourceLock:
+    name: str
+    descriptor: SourceDescriptor
+    manifest_path: str
+    manifest_sha256: str
+    raw_artifact_sha256: str
+    raw_artifact_bytes: int
+    files: tuple[tuple[str, str, int, str], ...]
 
 
 @dataclass(frozen=True)
@@ -216,6 +258,11 @@ def _stage2_code_paths(root: Path) -> tuple[str, ...]:
         "--",
         "src/token_prediction",
         STAGE2_RUNNER_RELATIVE,
+        STAGE2_METADATA_EXTRACTOR_RELATIVE,
+        STAGE2_SOKOBAN_AUDITOR_RELATIVE,
+        STAGE1_VERIFIER_RELATIVE,
+        DATA_FOUNDATION_BASELINE_RELATIVE,
+        STAGE2_AUXILIARY_MANIFEST_RELATIVE,
     )
     paths: list[str] = []
     for item in raw.split(b"\0"):
@@ -226,12 +273,27 @@ def _stage2_code_paths(root: Path) -> tuple[str, ...]:
         except UnicodeDecodeError as exc:
             raise Stage2ExperimentError("Git returned a non-UTF-8 code path") from exc
         relative = _safe_relative(relative, label="Stage 2 code path")
-        if relative == STAGE2_RUNNER_RELATIVE or (
+        if relative in {
+            STAGE2_RUNNER_RELATIVE,
+            STAGE2_METADATA_EXTRACTOR_RELATIVE,
+            STAGE2_SOKOBAN_AUDITOR_RELATIVE,
+            STAGE1_VERIFIER_RELATIVE,
+            DATA_FOUNDATION_BASELINE_RELATIVE,
+            STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+        } or (
             relative.startswith("src/token_prediction/") and relative.endswith(".py")
         ):
             paths.append(relative)
     resolved = tuple(sorted(set(paths)))
-    if STAGE2_RUNNER_RELATIVE not in resolved or not any(
+    required = {
+        STAGE2_RUNNER_RELATIVE,
+        STAGE2_METADATA_EXTRACTOR_RELATIVE,
+        STAGE2_SOKOBAN_AUDITOR_RELATIVE,
+        STAGE1_VERIFIER_RELATIVE,
+        DATA_FOUNDATION_BASELINE_RELATIVE,
+        STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+    }
+    if not required <= set(resolved) or not any(
         path.startswith("src/token_prediction/") for path in resolved
     ):
         raise Stage2ExperimentError("HEAD does not contain the Stage 2 runner and package")
@@ -263,6 +325,11 @@ def capture_stage2_code_binding(root: Path) -> Stage2CodeBinding:
         "--",
         "src/token_prediction",
         STAGE2_RUNNER_RELATIVE,
+        STAGE2_METADATA_EXTRACTOR_RELATIVE,
+        STAGE2_SOKOBAN_AUDITOR_RELATIVE,
+        STAGE1_VERIFIER_RELATIVE,
+        DATA_FOUNDATION_BASELINE_RELATIVE,
+        STAGE2_AUXILIARY_MANIFEST_RELATIVE,
     )
     if status:
         raise Stage2ExperimentError("Stage 2 runner and package must be clean at HEAD")
@@ -329,6 +396,171 @@ def _verify_runner_origin(root: Path) -> None:
         raise Stage2ExperimentError("executing Stage 2 runner is outside repository_root")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_auxiliary_source_lock(
+    root: Path,
+    *,
+    source_name: str,
+) -> tuple[Stage2AuxiliarySourceLock, tuple[Path, ...]]:
+    manifest_path = _repo_path(
+        root,
+        STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+        label="Stage 2 auxiliary manifest",
+    )
+    if _is_link_or_reparse(manifest_path):
+        raise Stage2ExperimentError("Stage 2 auxiliary manifest is unsafe")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise Stage2ExperimentError("Stage 2 auxiliary manifest is invalid") from exc
+    if not isinstance(manifest, Mapping) or set(manifest) != {
+        "manifest_schema_version",
+        "policy_id",
+        "sources",
+    }:
+        raise Stage2ExperimentError("Stage 2 auxiliary manifest keys are invalid")
+    if (
+        manifest["manifest_schema_version"] != 1
+        or manifest["policy_id"] != "stage2_auxiliary_public_sidecars_v1"
+        or not isinstance(manifest["sources"], Mapping)
+        or set(manifest["sources"]) != set(AUXILIARY_SOURCE_IDS)
+    ):
+        raise Stage2ExperimentError("Stage 2 auxiliary manifest identity is invalid")
+    try:
+        entry = manifest["sources"][source_name]
+        expected_source_id = AUXILIARY_SOURCE_IDS[source_name]
+    except KeyError as exc:
+        raise Stage2ExperimentError("Stage 2 auxiliary source is not frozen") from exc
+    if not isinstance(entry, Mapping):
+        raise Stage2ExperimentError("Stage 2 auxiliary source entry is invalid")
+    expected_keys = {"source_id", "revision", "files"}
+    if source_name == "spend_aggregate":
+        expected_keys |= {
+            "model_key",
+            "model_id",
+            "target_definition",
+            "projection_build",
+        }
+    if set(entry) != expected_keys or entry["source_id"] != expected_source_id:
+        raise Stage2ExperimentError("Stage 2 auxiliary source schema is invalid")
+    revision = _required_sha256(entry["revision"], name="auxiliary source revision")
+    raw_files = entry["files"]
+    if not isinstance(raw_files, list) or not raw_files:
+        raise Stage2ExperimentError("Stage 2 auxiliary source files are invalid")
+    files: list[tuple[str, str, int, str]] = []
+    paths: list[Path] = []
+    for raw in raw_files:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "role",
+            "path",
+            "bytes",
+            "sha256",
+        }:
+            raise Stage2ExperimentError("Stage 2 auxiliary file entry is invalid")
+        role = str(raw["role"]).strip()
+        if not role or role in {item[0] for item in files}:
+            raise Stage2ExperimentError("Stage 2 auxiliary file roles are invalid")
+        relative = _safe_relative(raw["path"], label=f"auxiliary {role} path")
+        byte_count = raw["bytes"]
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count <= 0:
+            raise Stage2ExperimentError("Stage 2 auxiliary file byte count is invalid")
+        declared = _required_sha256(raw["sha256"], name=f"auxiliary {role} SHA-256")
+        path = _repo_path(root, relative, label=f"auxiliary {role}")
+        if _is_link_or_reparse(path) or not path.is_file():
+            raise Stage2ExperimentError("Stage 2 auxiliary source file is unsafe")
+        if path.stat().st_size != byte_count or _sha256_file(path) != declared:
+            raise Stage2ExperimentError("Stage 2 auxiliary source file identity changed")
+        files.append((role, relative, byte_count, declared))
+        paths.append(path)
+    expected_roles = (
+        ("aggregate_csv", "swebench_parquet", "canonical_metadata_projection")
+        if source_name == "spend_aggregate"
+        else ("raw_dialogues",)
+    )
+    if tuple(item[0] for item in files) != expected_roles:
+        raise Stage2ExperimentError("Stage 2 auxiliary file roles do not match")
+    if source_name == "spend_aggregate":
+        if (
+            entry["model_key"] != "gpt52"
+            or entry["model_id"] != "gpt-5.2"
+            or entry["target_definition"]
+            != "rounded_four_run_mean_input_plus_output_tokens"
+        ):
+            raise Stage2ExperimentError("Spend aggregate semantics are not frozen")
+        projection = entry["projection_build"]
+        if not isinstance(projection, Mapping) or set(projection) != {
+            "command",
+            "extractor_path",
+            "extractor_sha256",
+            "reader_package",
+            "reader_version",
+            "npm_integrity",
+            "deterministic_rerun_byte_identical",
+        }:
+            raise Stage2ExperimentError("Spend metadata projection provenance is invalid")
+        extractor_relative = _safe_relative(
+            projection["extractor_path"],
+            label="Spend metadata extractor path",
+        )
+        extractor = _repo_path(root, extractor_relative, label="Spend metadata extractor")
+        if (
+            extractor_relative != STAGE2_METADATA_EXTRACTOR_RELATIVE
+            or _is_link_or_reparse(extractor)
+            or _sha256_file(extractor)
+            != _required_sha256(
+                projection["extractor_sha256"],
+                name="Spend metadata extractor SHA-256",
+            )
+            or projection["reader_package"] != "hyparquet"
+            or projection["reader_version"] != "1.26.2"
+            or projection["npm_integrity"] != STAGE2_HYPARQUET_NPM_INTEGRITY
+            or projection["deterministic_rerun_byte_identical"] is not True
+            or projection["command"] != STAGE2_METADATA_BUILD_COMMAND
+        ):
+            raise Stage2ExperimentError("Spend metadata projection binding is invalid")
+        capabilities = SourceCapabilities(
+            source_id=expected_source_id,
+            observables=frozenset({Observable.TASK_USAGE}),
+            source="audited_aggregate_sidecar",
+        )
+    else:
+        capabilities = BagenSokobanReader.capabilities
+    descriptor = SourceDescriptor(
+        source_id=expected_source_id,
+        revision=revision,
+        manifest_path=STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+        manifest_sha256=manifest_sha256,
+        capabilities=capabilities,
+    )
+    normalized_files = tuple(files)
+    return (
+        Stage2AuxiliarySourceLock(
+            name=source_name,
+            descriptor=descriptor,
+            manifest_path=STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+            manifest_sha256=manifest_sha256,
+            raw_artifact_sha256=_semantic_sha256(
+                [
+                    {"role": role, "path": path, "bytes": size, "sha256": digest}
+                    for role, path, size, digest in normalized_files
+                ]
+            ),
+            raw_artifact_bytes=sum(item[2] for item in normalized_files),
+            files=normalized_files,
+        ),
+        tuple(paths),
+    )
+
+
 def load_stage2_source(
     root: Path,
     lock_context: LockContext,
@@ -337,9 +569,107 @@ def load_stage2_source(
 ) -> Stage2LoadedSource:
     try:
         expected_source_id = SOURCE_NAMES[source_name]
-        source = lock_context.sources[source_name]
     except KeyError as exc:
         raise Stage2ExperimentError(f"unsupported Stage 2 source {source_name!r}") from exc
+    if source_name == "bagen_sokoban":
+        source, raw_paths = _load_auxiliary_source_lock(
+            root,
+            source_name=source_name,
+        )
+        trajectories = BagenSokobanReader().read_all(
+            raw_paths[0],
+            BagenSokobanMetadata(reasoning_effort="low"),
+        )
+        if not trajectories:
+            raise Stage2ExperimentError("BAGEN Sokoban source contains no trajectories")
+        base_dataset = build_capability_supervised_dataset(
+            trajectories,
+            source.descriptor,
+        )
+        derived_dataset = augment_request_shape_features(base_dataset, trajectories)
+        if (
+            base_dataset.source_descriptor_hash != source.descriptor.descriptor_hash
+            or base_dataset.capability_contract_hash
+            != source.descriptor.capabilities.contract_hash
+            or derived_dataset.source_descriptor_hash
+            != base_dataset.source_descriptor_hash
+            or derived_dataset.capability_contract_hash
+            != base_dataset.capability_contract_hash
+            or derived_dataset.dataset_id == base_dataset.dataset_id
+        ):
+            raise Stage2ExperimentError(
+                "BAGEN Sokoban projection changed its frozen source identity"
+            )
+        return Stage2LoadedSource(
+            source_name=source_name,
+            source_lock=source,
+            base_dataset_id=base_dataset.dataset_id,
+            base_row_count=len(base_dataset.rows),
+            derived_dataset=derived_dataset,
+            raw_paths=raw_paths,
+            projection_id="request_boundary_shape_v1",
+        )
+
+    if source_name == "spend_aggregate":
+        source, raw_paths = _load_auxiliary_source_lock(
+            root,
+            source_name=source_name,
+        )
+        by_role = {
+            role: path
+            for (role, _relative, _bytes, _sha256), path in zip(source.files, raw_paths)
+        }
+        metadata = load_swebench_verified_metadata_json(
+            by_role["canonical_metadata_projection"],
+            expected_projection_sha256=dict(
+                (role, digest) for role, _path, _bytes, digest in source.files
+            )["canonical_metadata_projection"],
+            expected_source_sha256=dict(
+                (role, digest) for role, _path, _bytes, digest in source.files
+            )["swebench_parquet"],
+        )
+        input_contract_hash = _semantic_sha256(
+            {
+                "policy_id": "spend_aggregate_task_launch_input_contract_v1",
+                "capability_contract_hash": source.descriptor.capabilities.contract_hash,
+                "features": [
+                    "agent_id",
+                    "llm_self_estimated_total_tokens",
+                    "model_id",
+                    "repo_id",
+                    "task_char_count",
+                    "task_code_fence_count",
+                    "task_line_count",
+                    "task_word_count",
+                ],
+            }
+        )
+        imported = build_spend_your_money_dataset(
+            by_role["aggregate_csv"],
+            metadata,
+            model_key="gpt52",
+            model_id="gpt-5.2",
+            metadata_sha256=dict(
+                (role, digest) for role, _path, _bytes, digest in source.files
+            )["canonical_metadata_projection"],
+            source_descriptor_hash=source.descriptor.descriptor_hash,
+            capability_contract_hash=source.descriptor.capabilities.contract_hash,
+            input_contract_hash=input_contract_hash,
+        )
+        return Stage2LoadedSource(
+            source_name=source_name,
+            source_lock=source,
+            base_dataset_id=imported.dataset.dataset_id,
+            base_row_count=len(imported.dataset.rows),
+            derived_dataset=imported.dataset,
+            raw_paths=raw_paths,
+            projection_id="spend_aggregate_task_shape_v1",
+        )
+
+    try:
+        source = lock_context.sources[source_name]
+    except KeyError as exc:
+        raise Stage2ExperimentError(f"missing Data Foundation source {source_name!r}") from exc
     if source.descriptor.source_id != expected_source_id:
         raise Stage2ExperimentError("Stage 2 source id differs from its frozen contract")
 
@@ -377,6 +707,7 @@ def load_stage2_source(
         base_row_count=len(base_dataset.rows),
         derived_dataset=derived_dataset,
         raw_paths=raw_paths,
+        projection_id="request_boundary_shape_v1",
     )
 
 
@@ -391,9 +722,16 @@ def _verify_source_inputs(
     if loaded.source_name == "bagen_swebench":
         if _load_bagen_manifest(root, loaded.source_lock) != loaded.raw_paths:
             raise Stage2ExperimentError("BAGEN raw membership changed during Stage 2 execution")
-    else:
+    elif loaded.source_name == "spend_openhands":
         if (_verify_spend_archive(root, loaded.source_lock),) != loaded.raw_paths:
             raise Stage2ExperimentError("Spend archive identity changed during Stage 2 execution")
+    else:
+        current_lock, current_paths = _load_auxiliary_source_lock(
+            root,
+            source_name=loaded.source_name,
+        )
+        if current_lock != loaded.source_lock or current_paths != loaded.raw_paths:
+            raise Stage2ExperimentError("Stage 2 auxiliary source changed during execution")
 
 
 def _task_pseudonym(task_id: str, *, split_plan_id: str) -> str:
@@ -687,7 +1025,7 @@ def build_stage2_results(
             "base_row_count": loaded.base_row_count,
             "derived_row_count": len(loaded.derived_dataset.rows),
             "development_row_count": len(execution.protocol.development_dataset.rows),
-            "request_shape_projection": "request_boundary_shape_v1",
+            "input_projection": loaded.projection_id,
         },
         "development_protocol": execution.audit_document,
         "matrix": matrix.identity_document(),

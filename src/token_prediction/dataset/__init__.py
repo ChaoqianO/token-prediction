@@ -84,6 +84,7 @@ from .spend_your_money import (
     SweBenchTaskMetadata,
     build_spend_your_money_dataset,
     load_swebench_verified_metadata,
+    load_swebench_verified_metadata_json,
     spend_import_to_dict,
 )
 
@@ -148,6 +149,7 @@ __all__ = [
     "make_task_split_plan",
     "build_spend_your_money_dataset",
     "load_swebench_verified_metadata",
+    "load_swebench_verified_metadata_json",
     "spend_import_to_dict",
     "point_input_semantic",
     "prediction_input_contract_hash",

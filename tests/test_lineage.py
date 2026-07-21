@@ -35,6 +35,26 @@ class ArtifactContractTests(unittest.TestCase):
             with self.assertRaises(ArtifactVerificationError):
                 verify_artifact(root)
 
+    def test_legacy_crlf_success_marker_is_explicitly_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "data.json").write_text("{}", encoding="utf-8")
+            manifest = publish_artifact(root, stage_name="fixture")
+            (root / "_SUCCESS").write_bytes(
+                (manifest.artifact_id + "\r\n").encode("ascii")
+            )
+            with self.assertRaises(ArtifactVerificationError):
+                verify_artifact(root)
+            self.assertEqual(
+                verify_artifact(root, allow_legacy_crlf_success=True),
+                manifest,
+            )
+            (root / "_SUCCESS").write_bytes(
+                (manifest.artifact_id + "\r\nX").encode("ascii")
+            )
+            with self.assertRaises(ArtifactVerificationError):
+                verify_artifact(root, allow_legacy_crlf_success=True)
+
     def test_published_artifact_rejects_unlisted_extra_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

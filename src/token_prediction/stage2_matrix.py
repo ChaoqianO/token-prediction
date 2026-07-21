@@ -38,7 +38,9 @@ STAGE2_ALPHA = 0.10
 STAGE2_CALIBRATOR_ID = "task_max_conformal"
 
 BAGEN_SOURCE_ID = "bagen_swebench_traj_v2"
+BAGEN_SOKOBAN_SOURCE_ID = "bagen_sokoban_dialogues_v1"
 SPEND_SOURCE_ID = "openhands_archive_trajectory_v3"
+SPEND_AGGREGATE_SOURCE_ID = "spend_your_money_aggregate_v1"
 
 FROZEN_BAGEN_CONDITIONS = frozenset(
     {
@@ -54,10 +56,16 @@ FROZEN_BAGEN_CONDITIONS = frozenset(
     }
 )
 FROZEN_SPEND_CONDITIONS = frozenset({"condition:b407e0d1ec34f386ebc4"})
+FROZEN_BAGEN_SOKOBAN_CONDITIONS = frozenset({"condition:effa60eb1d4380d124bf"})
+FROZEN_SPEND_AGGREGATE_CONDITIONS = frozenset(
+    {"condition:spend-your-money:f06cc0d037ed16ff12db"}
+)
 FROZEN_SOURCE_CONDITIONS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         BAGEN_SOURCE_ID: FROZEN_BAGEN_CONDITIONS,
+        BAGEN_SOKOBAN_SOURCE_ID: FROZEN_BAGEN_SOKOBAN_CONDITIONS,
         SPEND_SOURCE_ID: FROZEN_SPEND_CONDITIONS,
+        SPEND_AGGREGATE_SOURCE_ID: FROZEN_SPEND_AGGREGATE_CONDITIONS,
     }
 )
 
@@ -102,6 +110,26 @@ STAGE2_HISTORY_FEATURES = FeatureSet(
     "stage2_structured_history",
     include_all=False,
     include_features=HISTORY_FEATURE_NAMES,
+)
+SPEND_AGGREGATE_STRUCTURED_FEATURES = FeatureSet(
+    "stage2_spend_aggregate_structured",
+    include_all=False,
+    include_features=frozenset(
+        {
+            "task_char_count",
+            "task_word_count",
+            "task_line_count",
+            "task_code_fence_count",
+            "repo_id",
+            "model_id",
+            "agent_id",
+        }
+    ),
+)
+SPEND_AGGREGATE_TASK_CHARS = FeatureSet(
+    "stage2_spend_aggregate_task_chars",
+    include_all=False,
+    include_features=frozenset({"task_char_count"}),
 )
 
 _CELL_TEMPLATES = (
@@ -352,6 +380,37 @@ def _update_candidates(
     return tuple(candidates)
 
 
+def _spend_aggregate_candidates() -> tuple[CandidateSpec, ...]:
+    return (
+        CandidateSpec(
+            "empirical",
+            "empirical_quantile",
+            NO_FEATURES,
+            params={"alpha": STAGE2_ALPHA},
+            role=CandidateRole.BASELINE,
+        ),
+        CandidateSpec(
+            "task_chars_length",
+            "length_only",
+            SPEND_AGGREGATE_TASK_CHARS,
+            params={"feature_name": "task_char_count", "alpha": STAGE2_ALPHA},
+            role=CandidateRole.BASELINE,
+        ),
+        CandidateSpec(
+            "lightgbm_structured",
+            "lightgbm_quantile",
+            SPEND_AGGREGATE_STRUCTURED_FEATURES,
+            params=_lightgbm_params(),
+        ),
+        CandidateSpec(
+            "mlp_structured",
+            "independent_mlp",
+            SPEND_AGGREGATE_STRUCTURED_FEATURES,
+            params=_mlp_params(),
+        ),
+    )
+
+
 def _has_complete_request_chars(rows: Sequence[object]) -> bool:
     if not rows:
         return False
@@ -386,8 +445,18 @@ def build_stage2_matrix(
 
     experiments: list[ExperimentSpec] = []
     gates: list[Stage2Gate] = []
+    cell_templates = (
+        _CELL_TEMPLATES
+        if source_id != SPEND_AGGREGATE_SOURCE_ID
+        else (
+            (
+                PredictionPosition.TASK_LAUNCH,
+                PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS,
+            ),
+        )
+    )
     for condition_id in sorted(conditions):
-        for position, target in _CELL_TEMPLATES:
+        for position, target in cell_templates:
             cell = dataset.select(position, target, condition_id=condition_id)
             tasks = {row.point.task_id for row in cell.rows}
             task_count = len(tasks)
@@ -413,20 +482,23 @@ def build_stage2_matrix(
                 continue
 
             if position == PredictionPosition.TASK_LAUNCH:
-                candidates = _common_point_candidates()
-                gates.append(
-                    Stage2Gate(
-                        source_id=source_id,
-                        condition_id=condition_id,
-                        position=position,
-                        target=target,
-                        scope="candidate",
-                        candidate_id="request_chars_length",
-                        reason="no_prefix_causal_length_feature_at_task_launch",
-                        development_task_count=task_count,
-                        eligible_point_count=point_count,
+                if source_id == SPEND_AGGREGATE_SOURCE_ID:
+                    candidates = _spend_aggregate_candidates()
+                else:
+                    candidates = _common_point_candidates()
+                    gates.append(
+                        Stage2Gate(
+                            source_id=source_id,
+                            condition_id=condition_id,
+                            position=position,
+                            target=target,
+                            scope="candidate",
+                            candidate_id="request_chars_length",
+                            reason="no_prefix_causal_length_feature_at_task_launch",
+                            development_task_count=task_count,
+                            eligible_point_count=point_count,
+                        )
                     )
-                )
             else:
                 complete_request_chars = _has_complete_request_chars(cell.rows)
                 candidates = _update_candidates(
@@ -498,10 +570,14 @@ def build_stage2_matrix(
 
 __all__ = [
     "BAGEN_SOURCE_ID",
+    "BAGEN_SOKOBAN_SOURCE_ID",
+    "FROZEN_BAGEN_SOKOBAN_CONDITIONS",
     "FROZEN_BAGEN_CONDITIONS",
     "FROZEN_SOURCE_CONDITIONS",
     "FROZEN_SPEND_CONDITIONS",
     "SPEND_SOURCE_ID",
+    "SPEND_AGGREGATE_SOURCE_ID",
+    "FROZEN_SPEND_AGGREGATE_CONDITIONS",
     "STAGE2_ALPHA",
     "STAGE2_CALIBRATOR_ID",
     "STAGE2_HISTORY_FEATURES",

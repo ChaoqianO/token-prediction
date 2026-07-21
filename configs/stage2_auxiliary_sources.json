@@ -1,0 +1,54 @@
+{
+  "manifest_schema_version": 1,
+  "policy_id": "stage2_auxiliary_public_sidecars_v1",
+  "sources": {
+    "bagen_sokoban": {
+      "source_id": "bagen_sokoban_dialogues_v1",
+      "revision": "d888b6b31a0dfdd89d69601da750cdb4337161b90f194f3125796ffbe87032c1",
+      "files": [
+        {
+          "role": "raw_dialogues",
+          "path": "workspace/external/bagen/sokoban_openai_5_2_codex_dialogues.json",
+          "bytes": 15557656,
+          "sha256": "c4f7c73c35b741b17093fd3136017baaa0069d2d5108d0792597801b162bad12"
+        }
+      ]
+    },
+    "spend_aggregate": {
+      "source_id": "spend_your_money_aggregate_v1",
+      "revision": "ef77f99f39997db878f7e1bf6489e625c018d58b0d18854fd134c4f434d21d6a",
+      "model_key": "gpt52",
+      "model_id": "gpt-5.2",
+      "target_definition": "rounded_four_run_mean_input_plus_output_tokens",
+      "files": [
+        {
+          "role": "aggregate_csv",
+          "path": "workspace/external/spend_your_money/all_models_averaged_predictions_new.csv",
+          "bytes": 305265,
+          "sha256": "01839b0be787eeb00aec7661c0f7f7515e6c26b6cded8526b272e460510cde4b"
+        },
+        {
+          "role": "swebench_parquet",
+          "path": "workspace/external/spend_your_money/swe_bench_verified_test.parquet",
+          "bytes": 2096679,
+          "sha256": "a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd"
+        },
+        {
+          "role": "canonical_metadata_projection",
+          "path": "workspace/stage2/auxiliary/swebench_verified_metadata.json",
+          "bytes": 952353,
+          "sha256": "ebc89242ed8c4bcf50c8bf37cecd02e0e3c2e7c8b96849279fad94b37dcdec9a"
+        }
+      ],
+      "projection_build": {
+        "command": "npm.cmd install --prefix workspace/stage2/parquet-reader --ignore-scripts --no-audit --no-fund hyparquet@1.26.2 && node scripts/extract_swebench_metadata.mjs workspace/external/spend_your_money/swe_bench_verified_test.parquet workspace/stage2/auxiliary/swebench_verified_metadata.json workspace/stage2/parquet-reader/node_modules/hyparquet/src/node.js",
+        "extractor_path": "scripts/extract_swebench_metadata.mjs",
+        "extractor_sha256": "bb3bd541bdcc7abc6b64db0ed3bfa0f71ba0dd9d19da15d1852af2f33317119c",
+        "reader_package": "hyparquet",
+        "reader_version": "1.26.2",
+        "npm_integrity": "sha512-6qjyK7R2tZ4vnYP1J8NpcCeDPK1UIYk3xh5XgtQUnUM1iwkYbvI6Mz3xtmpMd6AfCCeoUoJVbEq29k5GReZRWA==",
+        "deterministic_rerun_byte_identical": true
+      }
+    }
+  }
+}

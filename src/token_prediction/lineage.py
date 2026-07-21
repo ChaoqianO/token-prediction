@@ -678,7 +678,11 @@ class _VerifiedArtifactTree:
     file_digests: Mapping[str, str]
 
 
-def _verify_scanned_artifact(tree: _ArtifactTree) -> _VerifiedArtifactTree:
+def _verify_scanned_artifact(
+    tree: _ArtifactTree,
+    *,
+    allow_legacy_crlf_success: bool,
+) -> _VerifiedArtifactTree:
     manifest_entry = tree.files.get("manifest.json")
     success_entry = tree.files.get("_SUCCESS")
     if manifest_entry is None or success_entry is None:
@@ -694,14 +698,21 @@ def _verify_scanned_artifact(tree: _ArtifactTree) -> _VerifiedArtifactTree:
     manifest = _parse_manifest(manifest_payload)
     success_digest, _success_size, success_payload = _read_regular(
         success_entry.path,
-        maximum_bytes=_MAX_SUCCESS_BYTES,
+        maximum_bytes=(
+            _MAX_SUCCESS_BYTES + 1
+            if allow_legacy_crlf_success
+            else _MAX_SUCCESS_BYTES
+        ),
         description="artifact success marker",
         collect=True,
         expected_metadata=success_entry.metadata,
     )
     assert success_payload is not None
     expected_success = (manifest.artifact_id + "\n").encode("ascii")
-    if success_payload != expected_success:
+    legacy_success = (manifest.artifact_id + "\r\n").encode("ascii")
+    if success_payload != expected_success and not (
+        allow_legacy_crlf_success and success_payload == legacy_success
+    ):
         raise ArtifactVerificationError("_SUCCESS does not match manifest")
 
     actual_files = set(tree.files) - _ROOT_CONTROL_FILES
@@ -750,17 +761,29 @@ def _verify_scanned_artifact(tree: _ArtifactTree) -> _VerifiedArtifactTree:
     return _VerifiedArtifactTree(manifest, dict(observed_digests))
 
 
-def verify_artifact(root: str | Path) -> ArtifactManifest:
+def verify_artifact(
+    root: str | Path,
+    *,
+    allow_legacy_crlf_success: bool = False,
+) -> ArtifactManifest:
+    """Verify an immutable artifact, optionally accepting an exact legacy CRLF marker."""
+
     directory = _artifact_root(root)
     initial_tree = _scan_artifact(directory)
-    initial = _verify_scanned_artifact(initial_tree)
+    initial = _verify_scanned_artifact(
+        initial_tree,
+        allow_legacy_crlf_success=allow_legacy_crlf_success,
+    )
 
     # Re-scan and re-hash every byte.  This closes both the stale-path window
     # after the initial scan and the Windows zero-identity fallback without
     # accepting metadata-only equivalence.
     verification_tree = _scan_artifact(directory)
     _compare_artifact_trees(initial_tree, verification_tree)
-    verification = _verify_scanned_artifact(verification_tree)
+    verification = _verify_scanned_artifact(
+        verification_tree,
+        allow_legacy_crlf_success=allow_legacy_crlf_success,
+    )
     if (
         verification.manifest != initial.manifest
         or dict(verification.file_digests) != dict(initial.file_digests)
