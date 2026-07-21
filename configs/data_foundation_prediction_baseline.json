@@ -1,0 +1,117 @@
+{
+  "artifact": {
+    "artifact_id": "f2e8587551d3077768e248a85c634a3a1d429baf3f5f5a5256d12e4c23302393",
+    "artifact_schema_version": 1,
+    "baseline_id": "data_foundation_empirical_development_v3",
+    "manifest_bytes": 15956,
+    "manifest_sha256": "c614af79fa87b9c4731831a534eea4438f7742ef11095a9a065f6c317b416406",
+    "relative_path": "workspace/data_foundation/baselines/empirical-development-v3",
+    "results_bytes": 12902259,
+    "results_file_sha256": "a3422bb84b0f0c5cdb9601c423a937323dd0feb6e937834ff54b9c4f8d49eb64",
+    "results_payload_sha256": "eaa914ba0e76abab0f6caa9341bbae2a16b8a95d3a2482cd71258fbf8b950b40"
+  },
+  "conditions": {
+    "condition_gate_policy_id": "frozen_development_condition_minimum_cohort_gate_v2",
+    "condition_gate_policy_sha256": "a55524a01b668bc271b0650e9f2230d9e1fb7466a8ed8da11de8af265846bccc",
+    "condition_projection_sha256": "2ed2f951638054f2e334731fbbbffd9ba3dd9a242c0ed65fbdfa192090c95674",
+    "estimable_condition_count": 6,
+    "estimable_condition_counts_by_source": {
+      "bagen_swebench": 5,
+      "spend_openhands": 1
+    },
+    "gated_condition_count": 4,
+    "gated_condition_counts_by_source": {
+      "bagen_swebench": 4,
+      "spend_openhands": 0
+    }
+  },
+  "data_foundation": {
+    "audit_file_sha256": "d2b316caac39f9912556b4242c156cca3bee7a17fbccf27101b9b5bafc221a19",
+    "audit_git_commit": "3d3edf3fdbd870300260a690b48313ce225c33f0",
+    "audit_path": "workspace/data_foundation/data_foundation_v2_audit.json",
+    "audit_payload_sha256": "e58593a8edc6535a5838913eb25b125b7890be78f21a54d8a439babcfe308171",
+    "audit_source_tree_sha256": "ae5379cd0069069a69fa68fd0938f389628f210c82b5b8eae3863e612b3a99cf",
+    "baseline_lock_file_sha256": "fa654ed54e24993fe3b167238b8b1c43f34edcfb4298ff4edaae68da59c23872",
+    "baseline_lock_path": "configs/data_foundation_v2_baseline.json"
+  },
+  "holdout": {
+    "assignment_inputs": "task_id_only",
+    "bucket_count": 10000,
+    "final_holdout_bucket_threshold_exclusive": 2000,
+    "independent_of_split_seed_labels_and_suffixes": true,
+    "policy_id": "stable_task_sha256_bucket_v1",
+    "policy_payload_sha256": "7375b64f3de5442704d796fcd663117268a4e3be1d78be936d3fb8402f4e2733",
+    "salt": "token-prediction/final-holdout/2026-07-21/v1"
+  },
+  "lock_type": "data_foundation_prediction_baseline",
+  "metrics": {
+    "aggregate_metrics_sha256": "484391e623249466ded342cbf6be824a01a5aabe133b45ff1ca1eed61bfe4b5b",
+    "bundle_count": 90,
+    "cell_count": 6,
+    "prediction_count": 15846
+  },
+  "prediction_lock_schema_version": 1,
+  "protocol": {
+    "alpha": 0.1,
+    "calibrator_id": "task_max_conformal",
+    "candidate_id": "empirical_quantile",
+    "evaluation_scope": "development_cross_validation_only",
+    "final_holdout_evaluated": false,
+    "final_holdout_prediction_count": 0,
+    "final_holdout_target_values_used_for_fit_calibration_scoring": false,
+    "final_model_selection_claim": "none",
+    "fold_count": 5,
+    "metric_suite_id": "token_prediction_metrics_v2",
+    "split_assignment_policy_id": "pseudonymous_task_sha256_rank_round_robin_v1",
+    "split_seeds": [
+      20260719,
+      20260720,
+      20260721
+    ],
+    "weighting_id": "task_run_point_equal_v1"
+  },
+  "runner": {
+    "code_blob_count": 42,
+    "code_paths_sha256": "b62ee0c423cb6fba47af9a50ad802b69e4f91f4be55550f76cbd54d09c245ad5",
+    "code_tree_sha256": "e94318587baf51b2810c6b9496bc838fe3c0808e89cd37b8b9622594d282f492",
+    "git_commit": "8609d4b1592579b0b5e36a3ca3dbb3f79e005217",
+    "runner_path": "scripts/run_data_foundation_baseline.py",
+    "tracked_control_blob_count": 3,
+    "tracked_control_paths_sha256": "fc70c518c608f50478d59e81ad29783bb94fd0bf365c782d2b39f4b929f02c8e",
+    "tracked_control_tree_sha256": "5d7c859fc7ef750316732fa21ea4d486800d4219dff074d1fec45adde4e9324f"
+  },
+  "sources": {
+    "bagen_swebench": {
+      "capability_contract_hash": "4f2ed89b0b0d2e31a8f8aa84a14d32f8eccb30c8bb1348fdb7427054ca038fc9",
+      "dataset_id": "db2f5baf2f2139e25fb8479cd3b3c33c528961d04c930d93009755fcb889bd23",
+      "dataset_row_count": 45564,
+      "descriptor_file_sha256": "83cb0ada4514ea9892d25822bc5a93da15b8ac39c40b71b7e1f1e2f08b935206",
+      "descriptor_path": "configs/source_descriptors/bagen_swebench.json",
+      "manifest_path": "workspace/external/bagen/manifest.jsonl",
+      "manifest_sha256": "f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071",
+      "raw_artifact_bytes": 263785722,
+      "raw_artifact_path": "workspace/external/bagen/origin",
+      "raw_artifact_sha256": "50531dc997737f45e1397165bba50f370e8dd30147e5738070106c8f02d8e59a",
+      "raw_artifact_sha256_kind": "framed_file_index_v1",
+      "revision": "58189576e54b675fdd0e1d6c1c9f189c2992732f",
+      "source_descriptor_hash": "17c8f88de18bb4734923b331287648cb5ff92e368c85a2f0b1aeb103ef84f4cb",
+      "source_id": "bagen_swebench_traj_v2"
+    },
+    "spend_openhands": {
+      "capability_contract_hash": "44a63f678831715afbd1d106f657661ca8a47eb48c1dbd3f5331f4bb7ab12f2e",
+      "dataset_id": "c9548f8ed397953c1220efd2cfcee7f811cc9dd693e3c9ca363f20b8f4d4141c",
+      "dataset_row_count": 382456,
+      "descriptor_file_sha256": "7a0c2905ad286cd4d0131ca822960c082c74165f33a1ef9b1427b9eec3edc997",
+      "descriptor_path": "configs/source_descriptors/spend_openhands.json",
+      "manifest_path": "workspace/external/spend_your_money/gpt_5.2_inventory.json",
+      "manifest_sha256": "11735ca3ec625a21c57f72d8172cdc0e0e67fbc44ee99225366739e5dbfffc24",
+      "raw_artifact_bytes": 2908192516,
+      "raw_artifact_path": "workspace/external/spend_your_money/gpt_5.2_4runs.tar.gz",
+      "raw_artifact_sha256": "993abcb55aae423f9067d5e6c8e1aeaccf83b9ce31474a215982686527934214",
+      "raw_artifact_sha256_kind": "file_bytes",
+      "revision": "fa9cbb063f770df596da95af24f7af3b8f595778",
+      "source_descriptor_hash": "b9242d9a2f7ee8232eb273fa80b6135e87c62e891f1f2f7a78db1300d208011f",
+      "source_id": "openhands_archive_trajectory_v3"
+    }
+  }
+}

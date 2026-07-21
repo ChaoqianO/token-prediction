@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "token-prediction"
+version = "0.1.0"
+description = "Causal, replayable token-consumption prediction for agent trajectories."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "ChaoqianO" }]
+dependencies = []
+
+[project.optional-dependencies]
+data = [
+  "pyarrow>=16",
+]
+estimators = [
+  "lightgbm>=4",
+  "numpy>=1.26",
+  "scikit-learn>=1.5",
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+tp = "token_prediction.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/token_prediction"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
