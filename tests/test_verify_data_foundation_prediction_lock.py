@@ -197,6 +197,19 @@ class DataFoundationPredictionLockTests(unittest.TestCase):
             self.assertEqual(summary["cell_count"], 6)
             self.assertEqual(summary["gated_condition_count"], 4)
             self.assertGreater(summary["prediction_count"], 0)
+            self.assertEqual(
+                summary["numerical_prediction_projection_id"],
+                verifier.NUMERICAL_PREDICTION_PROJECTION_ID,
+            )
+            results = json.loads(
+                (root / ARTIFACT_RELATIVE / "results.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                summary["numerical_prediction_projection_sha256"],
+                verifier.numerical_prediction_projection_sha256(results),
+            )
             self.assertTrue(summary["workspace_source_matches_frozen"])
             rendered = json.dumps(summary, sort_keys=True)
             self.assertNotIn(str(root), rendered)

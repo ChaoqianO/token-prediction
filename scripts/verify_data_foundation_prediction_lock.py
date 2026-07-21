@@ -35,6 +35,17 @@ EXPECTED_BUNDLE_COUNT = 90
 EXPECTED_CELL_COUNT = 6
 EXPECTED_GATED_CONDITION_COUNT = 4
 EXPECTED_SOURCE_NAMES = {"bagen_swebench", "spend_openhands"}
+NUMERICAL_PREDICTION_PROJECTION_ID = "development_numeric_prediction_projection_v1"
+NUMERICAL_PREDICTION_FIELDS = (
+    "point_id_sha256",
+    "task_id_sha256",
+    "trajectory_id_sha256",
+    "run_id_sha256",
+    "fold",
+    "target_value",
+    "sample_weight",
+    "forecast",
+)
 
 _LOCK_KEYS = {
     "artifact",
@@ -315,6 +326,43 @@ def _prediction_count(results: Mapping[str, Any]) -> int:
         for cell in results["cells"]
         for seed in cell["seed_results"]
     )
+
+
+def numerical_prediction_projection(
+    results: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return the versioned, identity-safe numerical parity projection."""
+
+    records: list[dict[str, Any]] = []
+    for cell in results["cells"]:
+        for seed in cell["seed_results"]:
+            for prediction in seed["predictions"]:
+                records.append(
+                    {
+                        "source_name": cell["source_name"],
+                        "position": cell["position"],
+                        "target": cell["target"],
+                        "condition_id": cell["condition_id"],
+                        "split_seed": seed["split_seed"],
+                        **{
+                            name: prediction[name]
+                            for name in NUMERICAL_PREDICTION_FIELDS
+                        },
+                    }
+                )
+    return sorted(
+        records,
+        key=lambda record: (
+            record["source_name"],
+            record["condition_id"],
+            record["split_seed"],
+            record["point_id_sha256"],
+        ),
+    )
+
+
+def numerical_prediction_projection_sha256(results: Mapping[str, Any]) -> str:
+    return _semantic_sha256(numerical_prediction_projection(results))
 
 
 def build_lock_projection(
@@ -1086,6 +1134,12 @@ def verify_prediction_lock(
         "estimable_condition_count": len(results["cells"]),
         "gated_condition_count": len(results["not_estimable_conditions"]),
         "prediction_count": _prediction_count(results),
+        "numerical_prediction_projection_id": (
+            NUMERICAL_PREDICTION_PROJECTION_ID
+        ),
+        "numerical_prediction_projection_sha256": (
+            numerical_prediction_projection_sha256(results)
+        ),
         "results_payload_sha256": results["results_payload_sha256"],
         "workspace_source_matches_frozen": workspace_matches,
     }

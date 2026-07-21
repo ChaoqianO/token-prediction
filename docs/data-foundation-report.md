@@ -174,10 +174,16 @@ final-holdout labels, statuses, counts, and task hashes are absent from the
 gate and cell schemas. A regression test redacts every final-holdout label and
 status and proves that development cells, gates, and bundle bytes remain
 identical. The full source dataset ID remains separate audit provenance. The
-v1, v2, and v3 numerical prediction projections are byte-semantically equal across all
-15,846 evaluation records, with SHA256
-`2cfb8f5f2e4e71d4282a3afd69b62237bfd94af017a732254c1ec35b7ac57ca5`;
-their aggregate metrics are also exactly equal.
+v1, v2, and v3 numerical prediction projections are byte-semantically equal
+across all 15,846 evaluation records. The versioned projection
+`development_numeric_prediction_projection_v1` is implemented by
+`numerical_prediction_projection()` in the production lock verifier. It emits
+13 identity/numeric fields per record, sorts by source, condition, split seed,
+and point hash, then hashes canonical compact JSON without a trailing newline.
+All three artifacts produce SHA256
+`cafa0169057042215e431c532d34ebefb202546045105ee1020908740e547f38`;
+their aggregate metrics are also exactly equal. The full verifier emits both
+the projection ID and digest so this claim is directly reproducible.
 
 The ignored artifact is
 `workspace/data_foundation/baselines/empirical-development-v3`; the tracked,
@@ -197,8 +203,10 @@ The runner used the empirical-quantile candidate, five task-grouped folds,
 split seeds `20260719`, `20260720`, and `20260721`, task/run/point-equal
 weights, and task-max conformal calibration at alpha 0.1. The table reports
 the mean across the three split seeds; its prediction column is the three-seed
-total, not a count of unique points. Final-holdout tasks were not predicted,
-scored, or consulted by the condition gate.
+total, not a count of unique points. Final-holdout tasks were not predicted or
+scored, and their labels, statuses, per-condition counts, and task-set hashes
+did not influence estimability. Source-level position/target/condition metadata
+was still audited against the frozen structural condition set.
 
 | Source | Condition ID | Position / target | Development tasks | Scored predictions (3-seed total) | MAE | WAPE | Point coverage | Task-simultaneous coverage |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
