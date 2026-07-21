@@ -1,0 +1,64 @@
+schema_version = 1
+workspace = "workspace"
+seed = 20260719
+
+[collection]
+source = "canonical_jsonl"
+
+[split]
+unit = "task_id"
+folds = 5
+
+[interval]
+alpha = 0.10
+calibrator = "task_max_conformal"
+
+[feature_sets.none]
+include_all = false
+
+[feature_sets.request_length_only]
+include_all = false
+include_features = ["current_request_tokens_local"]
+
+[[candidates]]
+id = "empirical_quantile"
+estimator = "empirical_quantile"
+feature_set = "none"
+role = "baseline"
+
+[candidates.params]
+alpha = 0.10
+
+[[candidates]]
+id = "length_only"
+estimator = "length_only"
+feature_set = "request_length_only"
+role = "baseline"
+
+[candidates.params]
+feature_name = "current_request_tokens_local"
+alpha = 0.10
+
+[[experiments]]
+id = "task_pre_unknown_remaining"
+position = "task_pre"
+target = "task_unknown_remaining_tokens"
+candidates = ["empirical_quantile", "length_only"]
+required_features = ["current_request_tokens_local"]
+
+[[experiments]]
+id = "task_update_unknown_remaining"
+position = "task_update"
+target = "task_unknown_remaining_tokens"
+candidates = ["empirical_quantile", "length_only"]
+required_features = ["current_request_tokens_local"]
+
+[[experiments]]
+id = "call_pre_unknown_billable"
+position = "call_pre"
+target = "call_unknown_billable_tokens"
+candidates = ["empirical_quantile", "length_only"]
+required_features = ["current_request_tokens_local"]
+
+# CALL_UPDATE is supported by the schema and experiment path, but it is deliberately not
+# enabled until a source supplies real generation_checkpoint events.

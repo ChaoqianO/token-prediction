@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"turn.started"}
+{"type":"error","message":"fixture transient transport retry"}
+{"type":"item.completed","item":{"type":"agent_message","text":"AUTH_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":12405,"cached_input_tokens":9984,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0}}

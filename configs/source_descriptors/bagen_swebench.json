@@ -1,0 +1,23 @@
+{
+  "descriptor_schema_version": 1,
+  "source_id": "bagen_swebench_traj_v1",
+  "revision": "58189576e54b675fdd0e1d6c1c9f189c2992732f",
+  "manifest": {
+    "path": "workspace/external/bagen/manifest.jsonl",
+    "sha256": "f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071"
+  },
+  "capabilities": {
+    "source_id": "bagen_swebench_traj_v1",
+    "source": "declared",
+    "observables": [
+      "attempt_usage",
+      "call_usage",
+      "request_boundaries",
+      "request_messages",
+      "task_termination",
+      "task_usage",
+      "tool_events"
+    ]
+  },
+  "capability_contract_hash": "c874e805d47c3da064ce71e8327a0aebbd7481ade307e53f7bc4fd2a977c6488"
+}
