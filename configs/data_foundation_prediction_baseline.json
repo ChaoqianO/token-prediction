@@ -1,18 +1,18 @@
 {
   "artifact": {
-    "artifact_id": "e81a4bf777076c7bd7f00695f66053b91d2da620a4e326da168629750bb74fd5",
+    "artifact_id": "f2e8587551d3077768e248a85c634a3a1d429baf3f5f5a5256d12e4c23302393",
     "artifact_schema_version": 1,
-    "baseline_id": "data_foundation_empirical_development_v2",
+    "baseline_id": "data_foundation_empirical_development_v3",
     "manifest_bytes": 15956,
-    "manifest_sha256": "28777b478215f3cefb57978fbaef273a641128f51febd0be6ea7049a15b7d95f",
-    "relative_path": "workspace/data_foundation/baselines/empirical-development-v2",
-    "results_bytes": 12904216,
-    "results_file_sha256": "df908c4496f7dca3ab0347be62789b0fcc3bc2384329b9796cdf5264cc5d55e6",
-    "results_payload_sha256": "d6193be10a1398d7b5ab87743522b98aab12c9013459e3ba9df3aa39abad0626"
+    "manifest_sha256": "c614af79fa87b9c4731831a534eea4438f7742ef11095a9a065f6c317b416406",
+    "relative_path": "workspace/data_foundation/baselines/empirical-development-v3",
+    "results_bytes": 12902259,
+    "results_file_sha256": "a3422bb84b0f0c5cdb9601c423a937323dd0feb6e937834ff54b9c4f8d49eb64",
+    "results_payload_sha256": "eaa914ba0e76abab0f6caa9341bbae2a16b8a95d3a2482cd71258fbf8b950b40"
   },
   "conditions": {
-    "condition_gate_policy_id": "frozen_condition_minimum_cohort_gate_v1",
-    "condition_gate_policy_sha256": "bc50d02129f2c512b15ed4d3d810542d860d34cfc7f8f3f039c5600a466f891b",
+    "condition_gate_policy_id": "frozen_development_condition_minimum_cohort_gate_v2",
+    "condition_gate_policy_sha256": "a55524a01b668bc271b0650e9f2230d9e1fb7466a8ed8da11de8af265846bccc",
     "condition_projection_sha256": "2ed2f951638054f2e334731fbbbffd9ba3dd9a242c0ed65fbdfa192090c95674",
     "estimable_condition_count": 6,
     "estimable_condition_counts_by_source": {
@@ -73,8 +73,8 @@
   "runner": {
     "code_blob_count": 42,
     "code_paths_sha256": "b62ee0c423cb6fba47af9a50ad802b69e4f91f4be55550f76cbd54d09c245ad5",
-    "code_tree_sha256": "8373e5041509a1b04f23bf416d2c1274f40876e6b11a767b4ed536ce756e81cf",
-    "git_commit": "23955dcd815144a5aee1c3c088be172fcfe27cca",
+    "code_tree_sha256": "e94318587baf51b2810c6b9496bc838fe3c0808e89cd37b8b9622594d282f492",
+    "git_commit": "8609d4b1592579b0b5e36a3ca3dbb3f79e005217",
     "runner_path": "scripts/run_data_foundation_baseline.py",
     "tracked_control_blob_count": 3,
     "tracked_control_paths_sha256": "fc70c518c608f50478d59e81ad29783bb94fd0bf365c782d2b39f4b929f02c8e",

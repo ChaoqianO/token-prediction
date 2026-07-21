@@ -154,36 +154,42 @@ statistics because they are not fields in the pinned aggregate audit.
 
 The current source-reproducible post-handoff prediction baseline was produced
 from clean commit
-`23955dcd815144a5aee1c3c088be172fcfe27cca`. Its complete runner-and-package
+`8609d4b1592579b0b5e36a3ca3dbb3f79e005217`. Its complete runner-and-package
 code tree contains 42 Git blobs and has SHA256
-`8373e5041509a1b04f23bf416d2c1274f40876e6b11a767b4ed536ce756e81cf`.
-Its operator-observed wall-clock time was 820.2 seconds after verifying both
+`e94318587baf51b2810c6b9496bc838fe3c0808e89cd37b8b9622594d282f492`.
+Its operator-observed wall-clock time was 821.1 seconds after verifying both
 raw sources before and after model construction. Wall-clock timings are run
 notes, not fields authenticated by the artifact lock.
 
-This v2 run supersedes, but does not overwrite, the immutable v1 artifact at
+This v3 run supersedes, but does not overwrite, the immutable v1 artifact at
 `workspace/data_foundation/baselines/empirical-development-v1` (artifact ID
-`c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f`). The
-v2 development dataset identity hashes only development-cohort rows plus the
-source descriptor/capability and task-only holdout assignment. The full source
-dataset ID remains separate provenance; final-holdout labels/status therefore
-cannot alter a development split, bundle, forecast, or model identity. The v1
-and v2 numerical prediction projections are byte-semantically equal across all
+`c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f`) or the
+v2 artifact at `workspace/data_foundation/baselines/empirical-development-v2`
+(artifact ID
+`e81a4bf777076c7bd7f00695f66053b91d2da620a4e326da168629750bb74fd5`). The
+v3 development dataset identity hashes only development-cohort rows plus the
+source descriptor/capability and task-only holdout assignment. Condition
+estimability is decided only from development eligible tasks; per-condition
+final-holdout labels, statuses, counts, and task hashes are absent from the
+gate and cell schemas. A regression test redacts every final-holdout label and
+status and proves that development cells, gates, and bundle bytes remain
+identical. The full source dataset ID remains separate audit provenance. The
+v1, v2, and v3 numerical prediction projections are byte-semantically equal across all
 15,846 evaluation records, with SHA256
 `2cfb8f5f2e4e71d4282a3afd69b62237bfd94af017a732254c1ec35b7ac57ca5`;
 their aggregate metrics are also exactly equal.
 
 The ignored artifact is
-`workspace/data_foundation/baselines/empirical-development-v2`; the tracked,
+`workspace/data_foundation/baselines/empirical-development-v3`; the tracked,
 aggregate-only identity lock is
 `configs/data_foundation_prediction_baseline.json`. The frozen identities are:
 
 | Identity | Value |
 | --- | --- |
-| Artifact ID | `e81a4bf777076c7bd7f00695f66053b91d2da620a4e326da168629750bb74fd5` |
-| Manifest SHA256 | `28777b478215f3cefb57978fbaef273a641128f51febd0be6ea7049a15b7d95f` |
-| Results file SHA256 | `df908c4496f7dca3ab0347be62789b0fcc3bc2384329b9796cdf5264cc5d55e6` |
-| Results payload SHA256 | `d6193be10a1398d7b5ab87743522b98aab12c9013459e3ba9df3aa39abad0626` |
+| Artifact ID | `f2e8587551d3077768e248a85c634a3a1d429baf3f5f5a5256d12e4c23302393` |
+| Manifest SHA256 | `c614af79fa87b9c4731831a534eea4438f7742ef11095a9a065f6c317b416406` |
+| Results file SHA256 | `a3422bb84b0f0c5cdb9601c423a937323dd0feb6e937834ff54b9c4f8d49eb64` |
+| Results payload SHA256 | `eaa914ba0e76abab0f6caa9341bbae2a16b8a95d3a2482cd71258fbf8b950b40` |
 | Aggregate metrics SHA256 | `484391e623249466ded342cbf6be824a01a5aabe133b45ff1ca1eed61bfe4b5b` |
 | Verified contents | 90 bundles; 6 estimable cells; 4 gated conditions; 5,282 scored development points per seed and 15,846 three-seed evaluation records |
 
@@ -191,38 +197,39 @@ The runner used the empirical-quantile candidate, five task-grouped folds,
 split seeds `20260719`, `20260720`, and `20260721`, task/run/point-equal
 weights, and task-max conformal calibration at alpha 0.1. The table reports
 the mean across the three split seeds; its prediction column is the three-seed
-total, not a count of unique points. The `final tasks` column records only the
-permanent task-hash partition size; those tasks were not predicted or scored.
+total, not a count of unique points. Final-holdout tasks were not predicted,
+scored, or consulted by the condition gate.
 
-| Source | Condition ID | Position / target | Development / final tasks | Scored predictions (3-seed total) | MAE | WAPE | Point coverage | Task-simultaneous coverage |
+| Source | Condition ID | Position / target | Development tasks | Scored predictions (3-seed total) | MAE | WAPE | Point coverage | Task-simultaneous coverage |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| BAGEN SWE | `condition:54cb50fce273f0aa2d74` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 / 12 | 3,258 | 211,622.79 | 0.872549 | 0.968018 | 0.909091 |
-| BAGEN SWE | `condition:949ac3b7a342718cd505` | `task_update` / `task_provider_accounted_remaining_tokens` | 45 / 14 | 2,580 | 54,221.44 | 0.673281 | 0.977173 | 0.918519 |
-| BAGEN SWE | `condition:d94078c05d91b0d58aee` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 / 14 | 957 | 27,533.92 | 0.727881 | 0.961125 | 0.906977 |
-| BAGEN SWE | `condition:dce86ced00dc11c77205` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 / 13 | 2,946 | 102,731.76 | 0.787336 | 0.970742 | 0.916667 |
-| BAGEN SWE | `condition:f95ae2a5e11682f6b7fc` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 / 13 | 1,593 | 40,295.63 | 0.753741 | 0.951446 | 0.899225 |
-| Spend OpenHands | `condition:b407e0d1ec34f386ebc4` | `task_launch` / `task_total_accounted_tokens` | 397 / 103 | 4,512 | 750,412.13 | 0.544315 | 0.959558 | 0.906801 |
+| BAGEN SWE | `condition:54cb50fce273f0aa2d74` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 | 3,258 | 211,622.79 | 0.872549 | 0.968018 | 0.909091 |
+| BAGEN SWE | `condition:949ac3b7a342718cd505` | `task_update` / `task_provider_accounted_remaining_tokens` | 45 | 2,580 | 54,221.44 | 0.673281 | 0.977173 | 0.918519 |
+| BAGEN SWE | `condition:d94078c05d91b0d58aee` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 | 957 | 27,533.92 | 0.727881 | 0.961125 | 0.906977 |
+| BAGEN SWE | `condition:dce86ced00dc11c77205` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 | 2,946 | 102,731.76 | 0.787336 | 0.970742 | 0.916667 |
+| BAGEN SWE | `condition:f95ae2a5e11682f6b7fc` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 | 1,593 | 40,295.63 | 0.753741 | 0.951446 | 0.899225 |
+| Spend OpenHands | `condition:b407e0d1ec34f386ebc4` | `task_launch` / `task_total_accounted_tokens` | 397 | 4,512 | 750,412.13 | 0.544315 | 0.959558 | 0.906801 |
 
 Four sparse BAGEN configuration variants failed closed instead of pooling or
-reducing the fold count. Their eligible-task counts were 5, 5, 5, and 3; each
-had zero permanent-holdout tasks under the frozen task-hash policy, so all four
-were recorded as `not_estimable` with zero predictions and zero bundles.
+reducing the fold count. Their development-task counts were 5, 5, 5, and 3,
+below the frozen minimum of 10, so all four were recorded as `not_estimable`
+with zero predictions and zero bundles.
 
-| Gated condition ID | Eligible / development / final tasks | Eligible points | Reason | Predictions / bundles | Target values used |
+| Gated condition ID | Development tasks | Development eligible points | Reason | Predictions / bundles | Target values used |
 | --- | ---: | ---: | --- | ---: | --- |
-| `condition:20f615a22697984db6cc` | 5 / 5 / 0 | 95 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
-| `condition:562b4f6934238e459db9` | 5 / 5 / 0 | 181 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
-| `condition:686d78e7865f5e646e0b` | 5 / 5 / 0 | 103 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
-| `condition:8fe0be8b5f924006a166` | 3 / 3 / 0 | 49 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
+| `condition:20f615a22697984db6cc` | 5 | 95 | `insufficient_development_tasks_for_five_fold_cv` | 0 / 0 | false |
+| `condition:562b4f6934238e459db9` | 5 | 181 | `insufficient_development_tasks_for_five_fold_cv` | 0 / 0 | false |
+| `condition:686d78e7865f5e646e0b` | 5 | 103 | `insufficient_development_tasks_for_five_fold_cv` | 0 / 0 | false |
+| `condition:8fe0be8b5f924006a166` | 3 | 49 | `insufficient_development_tasks_for_five_fold_cv` | 0 / 0 | false |
 
 The permanent final holdout remains sealed for fitting, calibration,
 prediction, scoring, and model selection:
 `final_holdout_evaluated=false`, `final_holdout_prediction_count=0`, and
 `final_holdout_target_values_used_for_fit_calibration_scoring=false`. This
 artifact is a reproducible development baseline, not final model selection or
-a final-holdout result. Cohort membership and task counts were inspected to
-enforce partition disjointness and the condition gate. Build and reload
-verification use:
+a final-holdout result. Source-level task-hash membership is used only to form
+the sealed partition and prove overlap exclusion; final-holdout row
+labels/statuses and per-condition counts are not read by the development gate.
+Build and reload verification use:
 
 ```powershell
 python scripts/run_data_foundation_baseline.py
