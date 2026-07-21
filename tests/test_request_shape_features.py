@@ -6,9 +6,11 @@ from token_prediction.contracts import EventType, Observable, SourceCapabilities
 from token_prediction.dataset import (
     PredictionPosition,
     PredictionTarget,
+    aggregate_task_shape_input_contract_hash,
     augment_request_shape_features,
     build_capability_supervised_dataset,
     build_lifecycle_slice,
+    supported_input_contract_hashes_from_capability,
 )
 from token_prediction.trajectory import Trajectory
 
@@ -54,6 +56,25 @@ def _with_request_shape(trajectory: Trajectory) -> Trajectory:
 
 
 class RequestShapeFeatureTests(unittest.TestCase):
+    def test_aggregate_input_contract_requires_explicit_aggregate_capability(self) -> None:
+        capabilities = SourceCapabilities(
+            source_id="aggregate-fixture",
+            observables=frozenset({Observable.TASK_AGGREGATE_USAGE}),
+        )
+        contract_hash = capabilities.contract_hash
+        aggregate_hash = aggregate_task_shape_input_contract_hash(contract_hash)
+        self.assertNotIn(
+            aggregate_hash,
+            supported_input_contract_hashes_from_capability(contract_hash),
+        )
+        self.assertIn(
+            aggregate_hash,
+            supported_input_contract_hashes_from_capability(
+                contract_hash,
+                capabilities=capabilities,
+            ),
+        )
+
     def setUp(self) -> None:
         self.trajectories = tuple(
             _with_request_shape(make_two_call_trajectory(task, run))

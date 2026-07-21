@@ -13,8 +13,12 @@ from .capabilities import (
     target_requirements,
 )
 from .derived_features import (
+    AGGREGATE_TASK_SHAPE_FEATURES,
+    AGGREGATE_TASK_SHAPE_INPUT_POLICY_ID,
+    AGGREGATE_TASK_SHAPE_PROJECTION_ID,
     REQUEST_SHAPE_FEATURES,
     REQUEST_SHAPE_PROJECTION_ID,
+    aggregate_task_shape_input_contract_hash,
     augment_request_shape_features,
     request_shape_input_contract_hash,
     request_shape_projection_document,
@@ -89,6 +93,10 @@ from .spend_your_money import (
 )
 
 __all__ = [
+    "AGGREGATE_TASK_SHAPE_FEATURES",
+    "AGGREGATE_TASK_SHAPE_INPUT_POLICY_ID",
+    "AGGREGATE_TASK_SHAPE_PROJECTION_ID",
+    "aggregate_task_shape_input_contract_hash",
     "CAPABILITY_DATASET_SCHEMA_VERSION",
     "CapabilityDecision",
     "DATASET_SCHEMA_VERSION",

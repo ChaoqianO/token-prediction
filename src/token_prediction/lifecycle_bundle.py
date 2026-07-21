@@ -1114,7 +1114,8 @@ def load_lifecycle_bundle(
         raise LifecycleBundleError("manifest capability contract hash does not match")
     _validate_lifecycle_capabilities(descriptor)
     allowed_input_contract_hashes = supported_input_contract_hashes_from_capability(
-        str(manifest["capability_contract_hash"])
+        str(manifest["capability_contract_hash"]),
+        capabilities=descriptor.capabilities,
     )
     if manifest["input_contract_hash"] not in allowed_input_contract_hashes:
         raise LifecycleBundleError(

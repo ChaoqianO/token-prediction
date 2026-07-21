@@ -414,7 +414,8 @@ def _validated_point_provenance(
                 "source capability contract cannot produce the neural bundle target"
             )
         allowed_input_contracts = supported_input_contract_hashes_from_capability(
-            capability_contract_hash
+            capability_contract_hash,
+            capabilities=descriptor.capabilities,
         )
         if declared_input_contract not in allowed_input_contracts:
             raise NeuralBundleError(

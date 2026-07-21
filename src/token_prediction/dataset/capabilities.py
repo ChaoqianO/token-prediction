@@ -12,15 +12,22 @@ from token_prediction.dataset.schema import PredictionPosition, PredictionTarget
 class TargetCapabilityRequirement:
     positions: frozenset[PredictionPosition]
     requirements: SourceRequirements
+    alternative_requirements: tuple[SourceRequirements, ...] = ()
 
 
 def _requirement(
     positions: set[PredictionPosition],
     observables: set[Observable],
+    *,
+    alternatives: tuple[set[Observable], ...] = (),
 ) -> TargetCapabilityRequirement:
     return TargetCapabilityRequirement(
         positions=frozenset(positions),
         requirements=SourceRequirements(observables=frozenset(observables)),
+        alternative_requirements=tuple(
+            SourceRequirements(observables=frozenset(values))
+            for values in alternatives
+        ),
     )
 
 
@@ -31,6 +38,7 @@ TARGET_CAPABILITY_REQUIREMENTS: Mapping[
         PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS: _requirement(
             {PredictionPosition.TASK_LAUNCH},
             {Observable.TASK_USAGE, Observable.TASK_TERMINATION},
+            alternatives=({Observable.TASK_AGGREGATE_USAGE},),
         ),
         PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS: _requirement(
             {PredictionPosition.TASK_PRE, PredictionPosition.TASK_UPDATE},
@@ -124,9 +132,12 @@ def decide_target_capability(
     resolved_position = PredictionPosition(position)
     resolved_target = PredictionTarget(target)
     requirement = target_requirements(resolved_target)
-    required = tuple(
-        sorted(value.value for value in requirement.requirements.observables)
-    )
+    selected_requirement = requirement.requirements
+    for alternative in requirement.alternative_requirements:
+        if not capabilities.missing(alternative):
+            selected_requirement = alternative
+            break
+    required = tuple(sorted(value.value for value in selected_requirement.observables))
     if resolved_position not in requirement.positions:
         return CapabilityDecision(
             source_id=capabilities.source_id,
@@ -138,7 +149,7 @@ def decide_target_capability(
             available=False,
             reason="unsupported_position_target",
         )
-    missing = capabilities.missing(requirement.requirements)
+    missing = capabilities.missing(selected_requirement)
     return CapabilityDecision(
         source_id=capabilities.source_id,
         position=resolved_position,

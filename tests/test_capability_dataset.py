@@ -109,6 +109,25 @@ class CapabilityDatasetTests(unittest.TestCase):
         self.assertTrue(unsupported.gated)
         self.assertEqual(unsupported.reason, "unsupported_position_target")
 
+    def test_aggregate_usage_enables_only_the_task_launch_total(self) -> None:
+        capabilities = SourceCapabilities(
+            source_id="aggregate-fixture",
+            observables=frozenset({Observable.TASK_AGGREGATE_USAGE}),
+        )
+        launch = decide_target_capability(
+            capabilities,
+            PredictionPosition.TASK_LAUNCH,
+            PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS,
+        )
+        remaining = decide_target_capability(
+            capabilities,
+            PredictionPosition.TASK_PRE,
+            PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS,
+        )
+        self.assertTrue(launch.available)
+        self.assertEqual(launch.required_observables, ("task_aggregate_usage",))
+        self.assertTrue(remaining.gated)
+
     def test_provider_accounted_target_algebra_and_proxy_exclusion(self) -> None:
         dataset = build_capability_supervised_dataset(
             (make_two_call_trajectory(0),),

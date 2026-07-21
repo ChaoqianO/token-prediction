@@ -7,7 +7,12 @@ import json
 from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
-from token_prediction.contracts import CanonicalEvent, EventType
+from token_prediction.contracts import (
+    CanonicalEvent,
+    EventType,
+    Observable,
+    SourceCapabilities,
+)
 from token_prediction.trajectory import Trajectory
 
 from .schema import (
@@ -20,6 +25,20 @@ from .points import prediction_input_contract_hash_from_capability
 
 REQUEST_SHAPE_PROJECTION_ID = "request_boundary_shape_v1"
 REQUEST_SHAPE_FEATURES = ("request_message_count", "request_content_chars")
+AGGREGATE_TASK_SHAPE_PROJECTION_ID = "spend_aggregate_task_shape_v1"
+AGGREGATE_TASK_SHAPE_INPUT_POLICY_ID = (
+    "spend_aggregate_task_launch_input_contract_v1"
+)
+AGGREGATE_TASK_SHAPE_FEATURES = (
+    "agent_id",
+    "llm_self_estimated_total_tokens",
+    "model_id",
+    "repo_id",
+    "task_char_count",
+    "task_code_fence_count",
+    "task_line_count",
+    "task_word_count",
+)
 _REQUEST_SHAPE_CONTRACT = {
     "projection_id": REQUEST_SHAPE_PROJECTION_ID,
     "visibility": "same_request_built_boundary",
@@ -59,15 +78,48 @@ def request_shape_input_contract_hash(base_input_contract_hash: str) -> str:
     )
 
 
+def aggregate_task_shape_input_contract_hash(
+    capability_contract_hash: str,
+) -> str:
+    """Bind the audited aggregate-only Task-launch feature contract."""
+
+    if (
+        not isinstance(capability_contract_hash, str)
+        or len(capability_contract_hash) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in capability_contract_hash
+        )
+    ):
+        raise ValueError("capability_contract_hash must be a lowercase SHA-256 digest")
+    return _canonical_sha256(
+        {
+            "policy_id": AGGREGATE_TASK_SHAPE_INPUT_POLICY_ID,
+            "capability_contract_hash": capability_contract_hash,
+            "features": list(AGGREGATE_TASK_SHAPE_FEATURES),
+        }
+    )
+
+
 def supported_input_contract_hashes_from_capability(
     capability_contract_hash: str,
+    *,
+    capabilities: SourceCapabilities | None = None,
 ) -> frozenset[str]:
     """Return the explicitly reviewed raw and derived point-contract hashes."""
 
     base = prediction_input_contract_hash_from_capability(
         capability_contract_hash=capability_contract_hash,
     )
-    return frozenset({base, request_shape_input_contract_hash(base)})
+    supported = {base, request_shape_input_contract_hash(base)}
+    if capabilities is not None:
+        if capabilities.contract_hash != capability_contract_hash:
+            raise ValueError("capabilities do not match the declared contract hash")
+        if Observable.TASK_AGGREGATE_USAGE in capabilities.observables:
+            supported.add(
+                aggregate_task_shape_input_contract_hash(capability_contract_hash)
+            )
+    return frozenset(supported)
 
 
 def request_shape_projection_document() -> Mapping[str, Any]:
@@ -177,8 +229,12 @@ def augment_request_shape_features(
 
 
 __all__ = [
+    "AGGREGATE_TASK_SHAPE_FEATURES",
+    "AGGREGATE_TASK_SHAPE_INPUT_POLICY_ID",
+    "AGGREGATE_TASK_SHAPE_PROJECTION_ID",
     "REQUEST_SHAPE_FEATURES",
     "REQUEST_SHAPE_PROJECTION_ID",
+    "aggregate_task_shape_input_contract_hash",
     "augment_request_shape_features",
     "request_shape_input_contract_hash",
     "request_shape_projection_document",

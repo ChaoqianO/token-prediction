@@ -26,7 +26,9 @@ from token_prediction.collection import (
 )
 from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
 from token_prediction.dataset import (
+    AGGREGATE_TASK_SHAPE_PROJECTION_ID,
     SupervisedDataset,
+    aggregate_task_shape_input_contract_hash,
     augment_request_shape_features,
     build_capability_supervised_dataset,
     build_spend_your_money_dataset,
@@ -529,7 +531,7 @@ def _load_auxiliary_source_lock(
             raise Stage2ExperimentError("Spend metadata projection binding is invalid")
         capabilities = SourceCapabilities(
             source_id=expected_source_id,
-            observables=frozenset({Observable.TASK_USAGE}),
+            observables=frozenset({Observable.TASK_AGGREGATE_USAGE}),
             source="audited_aggregate_sidecar",
         )
     else:
@@ -628,21 +630,8 @@ def load_stage2_source(
                 (role, digest) for role, _path, _bytes, digest in source.files
             )["swebench_parquet"],
         )
-        input_contract_hash = _semantic_sha256(
-            {
-                "policy_id": "spend_aggregate_task_launch_input_contract_v1",
-                "capability_contract_hash": source.descriptor.capabilities.contract_hash,
-                "features": [
-                    "agent_id",
-                    "llm_self_estimated_total_tokens",
-                    "model_id",
-                    "repo_id",
-                    "task_char_count",
-                    "task_code_fence_count",
-                    "task_line_count",
-                    "task_word_count",
-                ],
-            }
+        input_contract_hash = aggregate_task_shape_input_contract_hash(
+            source.descriptor.capabilities.contract_hash
         )
         imported = build_spend_your_money_dataset(
             by_role["aggregate_csv"],
@@ -663,7 +652,7 @@ def load_stage2_source(
             base_row_count=len(imported.dataset.rows),
             derived_dataset=imported.dataset,
             raw_paths=raw_paths,
-            projection_id="spend_aggregate_task_shape_v1",
+            projection_id=AGGREGATE_TASK_SHAPE_PROJECTION_ID,
         )
 
     try:

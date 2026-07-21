@@ -109,6 +109,7 @@ class Observable(StrEnum):
     """
 
     TASK_USAGE = "task_usage"
+    TASK_AGGREGATE_USAGE = "task_aggregate_usage"
     CALL_USAGE = "call_usage"
     ATTEMPT_USAGE = "attempt_usage"
     REQUEST_BOUNDARIES = "request_boundaries"
