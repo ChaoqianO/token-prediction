@@ -51,7 +51,7 @@ from token_prediction.evaluation import (
 
 BASELINE_ARTIFACT_SCHEMA_VERSION = 1
 EMPIRICAL_BUNDLE_SCHEMA_VERSION = 1
-BASELINE_ID = "data_foundation_empirical_development_v2"
+BASELINE_ID = "data_foundation_empirical_development_v3"
 FOLDS = 5
 SPLIT_SEEDS = (20260719, 20260720, 20260721)
 ALPHA = 0.10
@@ -63,6 +63,7 @@ FINAL_HOLDOUT_SALT = "token-prediction/final-holdout/2026-07-21/v1"
 FINAL_HOLDOUT_BUCKET_COUNT = 10_000
 FINAL_HOLDOUT_BUCKET_THRESHOLD = 2_000
 MIN_DEVELOPMENT_TASKS_PER_CONDITION = 10
+CONDITION_GATE_POLICY_ID = "frozen_development_condition_minimum_cohort_gate_v2"
 FROZEN_BAGEN_ESTIMABLE_CONDITIONS = frozenset(
     {
         "condition:54cb50fce273f0aa2d74",
@@ -84,7 +85,7 @@ FROZEN_SPEND_CONDITIONS = frozenset({"condition:b407e0d1ec34f386ebc4"})
 RUNNER_RELATIVE = "scripts/run_data_foundation_baseline.py"
 DEFAULT_BASELINE_LOCK = "configs/data_foundation_v2_baseline.json"
 DEFAULT_OUTPUT = (
-    "workspace/data_foundation/baselines/empirical-development-v2"
+    "workspace/data_foundation/baselines/empirical-development-v3"
 )
 OUTPUT_PREFIX = "workspace/data_foundation/baselines/"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -349,15 +350,43 @@ def _is_link_or_reparse(path: Path) -> bool:
     return bool(is_junction is not None and is_junction())
 
 
-def _assert_tree_no_links(root: Path, *, label: str) -> None:
+def _assert_regular_tree(root: Path, *, label: str) -> None:
+    """Reject links, reparse points, and every non-regular filesystem node."""
+
     if _is_link_or_reparse(root):
         raise DataFoundationBaselineError(f"{label} root must not be linked or reparse-backed")
-    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
-        parent = Path(directory)
-        for name in [*names, *files]:
-            if _is_link_or_reparse(parent / name):
+    try:
+        root_status = root.lstat()
+    except OSError as exc:
+        raise DataFoundationBaselineError(f"cannot inspect {label} root") from exc
+    if not stat.S_ISDIR(root_status.st_mode):
+        raise DataFoundationBaselineError(f"{label} root must be one regular directory")
+
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                children = list(entries)
+        except OSError as exc:
+            raise DataFoundationBaselineError(f"cannot inspect {label} tree") from exc
+        for entry in children:
+            child = Path(entry.path)
+            if _is_link_or_reparse(child):
                 raise DataFoundationBaselineError(
                     f"{label} must not contain symlinks, junctions, or reparse points"
+                )
+            try:
+                status = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise DataFoundationBaselineError(
+                    f"cannot inspect a {label} member"
+                ) from exc
+            if stat.S_ISDIR(status.st_mode):
+                pending.append(child)
+            elif not stat.S_ISREG(status.st_mode):
+                raise DataFoundationBaselineError(
+                    f"{label} must contain only regular files and directories"
                 )
 
 
@@ -1658,21 +1687,23 @@ def run_development_cell(
     return result, bundles
 
 
-def _condition_ids(
+def _structural_condition_ids(
     dataset: SupervisedDataset,
     *,
     position: PredictionPosition,
     target: PredictionTarget,
 ) -> tuple[str, ...]:
+    """Enumerate audited point metadata without consulting target status or value."""
+
     conditions = sorted(
         {
             row.point.condition_id
             for row in dataset.rows
-            if row.eligible and row.point.position == position and row.point.target == target
+            if row.point.position == position and row.point.target == target
         }
     )
     if not conditions:
-        raise DataFoundationBaselineError("required baseline target has no eligible conditions")
+        raise DataFoundationBaselineError("required baseline target has no structural conditions")
     return tuple(conditions)
 
 
@@ -1719,7 +1750,9 @@ def build_results(
         plan = make_holdout_plan(source_dataset)
         dataset = development_dataset(source_dataset, plan)
         holdout_evidence[source_name] = plan.to_evidence()
-        conditions = _condition_ids(source_dataset, position=position, target=target)
+        conditions = _structural_condition_ids(
+            source_dataset, position=position, target=target
+        )
         frozen_estimable = (
             FROZEN_BAGEN_ESTIMABLE_CONDITIONS
             if source_name == "bagen_swebench"
@@ -1735,36 +1768,20 @@ def build_results(
                 f"{source_name} frozen condition identity set changed"
             )
         for condition_id in conditions:
-            eligible_rows = [
+            development_eligible_rows = [
                 row
-                for row in source_dataset.rows
-                if row.eligible
-                and row.point.position == position
-                and row.point.target == target
-                and row.point.condition_id == condition_id
-            ]
-            eligible_tasks = {row.point.task_id for row in eligible_rows}
-            development_tasks = {
-                row.point.task_id
                 for row in dataset.rows
                 if row.eligible
                 and row.point.position == position
                 and row.point.target == target
                 and row.point.condition_id == condition_id
-            }
-            holdout_tasks = {
-                row.point.task_id
-                for row in source_dataset.rows
-                if row.eligible
-                and row.point.position == position
-                and row.point.target == target
-                and row.point.condition_id == condition_id
-                and row.point.task_id in plan.final_holdout_tasks
+            ]
+            development_tasks = {
+                row.point.task_id for row in development_eligible_rows
             }
             is_estimable = (
-                len(development_tasks) < MIN_DEVELOPMENT_TASKS_PER_CONDITION
-                or not holdout_tasks
-            ) is False
+                len(development_tasks) >= MIN_DEVELOPMENT_TASKS_PER_CONDITION
+            )
             if condition_id in frozen_gated:
                 if is_estimable:
                     raise DataFoundationBaselineError(
@@ -1777,21 +1794,16 @@ def build_results(
                         "target": target.value,
                         "condition_id": condition_id,
                         "status": "not_estimable",
-                        "reason": (
-                            "insufficient_development_or_final_holdout_tasks_for_five_fold_cv"
+                        "reason": "insufficient_development_tasks_for_five_fold_cv",
+                        "development_eligible_point_count": len(
+                            development_eligible_rows
                         ),
-                        "eligible_point_count": len(eligible_rows),
-                        "eligible_task_count": len(eligible_tasks),
                         "development_task_count": len(development_tasks),
-                        "final_holdout_task_count": len(holdout_tasks),
-                        "eligible_task_set_sha256": _task_hash(eligible_tasks),
                         "development_task_set_sha256": _task_hash(development_tasks),
-                        "final_holdout_task_set_sha256": _task_hash(holdout_tasks),
                         "required_fold_count": FOLDS,
                         "required_development_task_count": (
                             MIN_DEVELOPMENT_TASKS_PER_CONDITION
                         ),
-                        "required_final_holdout_task_count": 1,
                         "holdout_policy_id": FINAL_HOLDOUT_POLICY_ID,
                         "target_values_used_for_fit_calibration_scoring": False,
                         "prediction_count": 0,
@@ -1847,9 +1859,7 @@ def build_results(
                     "condition_id": condition_id,
                     "candidate_id": CANDIDATE_ID,
                     "development_task_count": len(development_tasks),
-                    "final_holdout_task_count": len(holdout_tasks),
                     "development_task_set_sha256": _task_hash(development_tasks),
-                    "final_holdout_task_set_sha256": _task_hash(holdout_tasks),
                     "cohort_disjointness_verified": True,
                     "aggregate_metrics": _aggregate_metrics(seed_results),
                     "seed_results": seed_results,
@@ -1889,10 +1899,9 @@ def build_results(
         "calibrator_id": CALIBRATOR_ID,
         "metric_suite_id": METRIC_SUITE_ID,
         "condition_gate_policy": {
-            "policy_id": "frozen_condition_minimum_cohort_gate_v1",
+            "policy_id": CONDITION_GATE_POLICY_ID,
             "required_fold_count": FOLDS,
             "required_development_task_count": MIN_DEVELOPMENT_TASKS_PER_CONDITION,
-            "required_final_holdout_task_count": 1,
             "bagen_estimable_condition_count": len(
                 FROZEN_BAGEN_ESTIMABLE_CONDITIONS
             ),
@@ -2058,7 +2067,7 @@ def publish_artifact(
 def verify_artifact(path: Path) -> dict[str, Any]:
     if not path.is_dir() or _is_link_or_reparse(path):
         raise DataFoundationBaselineError("baseline artifact must be one regular directory")
-    _assert_tree_no_links(path, label="baseline artifact")
+    _assert_regular_tree(path, label="baseline artifact")
     manifest_path = path / "manifest.json"
     sidecar_path = path / "manifest.sha256"
     manifest = _load_json(manifest_path, label="baseline artifact manifest")
@@ -2391,15 +2400,13 @@ def verify_artifact(path: Path) -> dict[str, Any]:
         "policy_id",
         "required_fold_count",
         "required_development_task_count",
-        "required_final_holdout_task_count",
         "bagen_estimable_condition_count",
         "bagen_not_estimable_condition_count",
         "spend_estimable_condition_count",
     } or dict(gate_policy) != {
-        "policy_id": "frozen_condition_minimum_cohort_gate_v1",
+        "policy_id": CONDITION_GATE_POLICY_ID,
         "required_fold_count": FOLDS,
         "required_development_task_count": MIN_DEVELOPMENT_TASKS_PER_CONDITION,
-        "required_final_holdout_task_count": 1,
         "bagen_estimable_condition_count": len(FROZEN_BAGEN_ESTIMABLE_CONDITIONS),
         "bagen_not_estimable_condition_count": len(
             FROZEN_BAGEN_NOT_ESTIMABLE_CONDITIONS
@@ -2414,16 +2421,11 @@ def verify_artifact(path: Path) -> dict[str, Any]:
         "condition_id",
         "status",
         "reason",
-        "eligible_point_count",
-        "eligible_task_count",
+        "development_eligible_point_count",
         "development_task_count",
-        "final_holdout_task_count",
-        "eligible_task_set_sha256",
         "development_task_set_sha256",
-        "final_holdout_task_set_sha256",
         "required_fold_count",
         "required_development_task_count",
-        "required_final_holdout_task_count",
         "holdout_policy_id",
         "target_values_used_for_fit_calibration_scoring",
         "prediction_count",
@@ -2449,11 +2451,10 @@ def verify_artifact(path: Path) -> dict[str, Any]:
             or condition_id in gated_conditions
             or gate.get("status") != "not_estimable"
             or gate.get("reason")
-            != "insufficient_development_or_final_holdout_tasks_for_five_fold_cv"
+            != "insufficient_development_tasks_for_five_fold_cv"
             or gate.get("required_fold_count") != FOLDS
             or gate.get("required_development_task_count")
             != MIN_DEVELOPMENT_TASKS_PER_CONDITION
-            or gate.get("required_final_holdout_task_count") != 1
             or gate.get("holdout_policy_id") != FINAL_HOLDOUT_POLICY_ID
             or gate.get("target_values_used_for_fit_calibration_scoring") is not False
             or gate.get("prediction_count") != 0
@@ -2461,32 +2462,22 @@ def verify_artifact(path: Path) -> dict[str, Any]:
         ):
             raise DataFoundationBaselineError("not-estimable condition gate is invalid")
         gated_conditions.add(condition_id)
-        eligible_count = _require_non_negative_int(
-            gate.get("eligible_task_count"), label="gated eligible task count"
-        )
         development_count = _require_non_negative_int(
             gate.get("development_task_count"), label="gated development task count"
         )
-        holdout_count = _require_non_negative_int(
-            gate.get("final_holdout_task_count"), label="gated holdout task count"
-        )
-        _require_non_negative_int(
-            gate.get("eligible_point_count"), label="gated eligible point count"
+        development_point_count = _require_non_negative_int(
+            gate.get("development_eligible_point_count"),
+            label="gated development eligible point count",
         )
         if (
-            eligible_count != development_count + holdout_count
-            or (
-                development_count >= MIN_DEVELOPMENT_TASKS_PER_CONDITION
-                and holdout_count >= 1
-            )
+            development_count >= MIN_DEVELOPMENT_TASKS_PER_CONDITION
+            or development_point_count < development_count
         ):
             raise DataFoundationBaselineError("gated condition cohort counts are inconsistent")
-        for key in (
-            "eligible_task_set_sha256",
-            "development_task_set_sha256",
-            "final_holdout_task_set_sha256",
-        ):
-            _require_sha256(gate.get(key), label=f"gated condition {key}")
+        _require_sha256(
+            gate.get("development_task_set_sha256"),
+            label="gated condition development_task_set_sha256",
+        )
     if gated_conditions != FROZEN_BAGEN_NOT_ESTIMABLE_CONDITIONS:
         raise DataFoundationBaselineError("frozen not-estimable condition set changed")
 
@@ -2502,9 +2493,7 @@ def verify_artifact(path: Path) -> dict[str, Any]:
             "condition_id",
             "candidate_id",
             "development_task_count",
-            "final_holdout_task_count",
             "development_task_set_sha256",
-            "final_holdout_task_set_sha256",
             "cohort_disjointness_verified",
             "aggregate_metrics",
             "seed_results",
@@ -2530,22 +2519,14 @@ def verify_artifact(path: Path) -> dict[str, Any]:
         cell_development_count = _require_non_negative_int(
             cell.get("development_task_count"), label="cell development task count"
         )
-        cell_holdout_count = _require_non_negative_int(
-            cell.get("final_holdout_task_count"), label="cell holdout task count"
-        )
         if (
             cell_development_count < MIN_DEVELOPMENT_TASKS_PER_CONDITION
-            or cell_holdout_count < 1
             or cell.get("cohort_disjointness_verified") is not True
         ):
             raise DataFoundationBaselineError("cell contains an empty/small or unverified cohort")
         cell_development_hash = _require_sha256(
             cell.get("development_task_set_sha256"),
             label="cell development task set SHA-256",
-        )
-        _require_sha256(
-            cell.get("final_holdout_task_set_sha256"),
-            label="cell final holdout task set SHA-256",
         )
         if (source_name, cell_position, cell_target) not in {
             (

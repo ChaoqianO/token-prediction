@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from tests.helpers import make_two_call_trajectory
 from token_prediction.collection import BagenSwebenchReader, OpenHandsArchiveReader
 from token_prediction.contracts import SourceDescriptor
 from token_prediction.dataset import (
+    LabelStatus,
     PredictionPosition,
     PredictionTarget,
     SupervisedDataset,
@@ -158,8 +160,10 @@ def _lock_context(
     )
 
 
-def _build_synthetic_results() -> tuple[dict[str, object], dict[str, bytes]]:
-    bagen_dataset, spend_dataset = _frozen_synthetic_datasets()
+def _build_results_for_datasets(
+    bagen_dataset: SupervisedDataset,
+    spend_dataset: SupervisedDataset,
+) -> tuple[dict[str, object], dict[str, bytes]]:
     lock = _lock_context(bagen_dataset, spend_dataset)
     code = baseline.CodeBinding(
         git_commit="4" * 40,
@@ -179,6 +183,10 @@ def _build_synthetic_results() -> tuple[dict[str, object], dict[str, bytes]]:
     )
 
 
+def _build_synthetic_results() -> tuple[dict[str, object], dict[str, bytes]]:
+    return _build_results_for_datasets(*_frozen_synthetic_datasets())
+
+
 def _rehash_results(results: dict[str, object]) -> None:
     results.pop("results_payload_sha256", None)
     results["results_payload_sha256"] = baseline._semantic_sha256(results)
@@ -190,6 +198,16 @@ class DataFoundationBaselineTests(unittest.TestCase):
         cls.dataset = _synthetic_dataset()
         cls.holdout = baseline.make_holdout_plan(cls.dataset)
         cls.development = baseline.development_dataset(cls.dataset, cls.holdout)
+
+    def test_v3_identity_and_output_path_are_paired(self) -> None:
+        self.assertEqual(
+            baseline.BASELINE_ID,
+            "data_foundation_empirical_development_v3",
+        )
+        self.assertEqual(
+            baseline.DEFAULT_OUTPUT,
+            "workspace/data_foundation/baselines/empirical-development-v3",
+        )
 
     def test_stable_holdout_depends_only_on_task_identity(self) -> None:
         holdout_task = next(iter(self.holdout.final_holdout_tasks))
@@ -262,6 +280,47 @@ class DataFoundationBaselineTests(unittest.TestCase):
             second.development_dataset_id,
             self.holdout.development_dataset_id,
         )
+
+    def test_build_results_ignores_final_holdout_labels_and_statuses(self) -> None:
+        bagen_dataset, spend_dataset = _frozen_synthetic_datasets()
+        original_results, original_bundles = _build_results_for_datasets(
+            bagen_dataset, spend_dataset
+        )
+        plan = baseline.make_holdout_plan(bagen_dataset)
+        perturbed = replace(
+            bagen_dataset,
+            dataset_id="9" * 64,
+            rows=tuple(
+                replace(
+                    row,
+                    label=None,
+                    status=LabelStatus.MISSING,
+                    invalid_reason="final_holdout_redacted_for_regression_test",
+                )
+                if row.point.task_id in plan.final_holdout_tasks
+                else row
+                for row in bagen_dataset.rows
+            ),
+        )
+        perturbed_plan = baseline.make_holdout_plan(perturbed)
+        perturbed_results, perturbed_bundles = _build_results_for_datasets(
+            perturbed, spend_dataset
+        )
+
+        self.assertEqual(
+            perturbed_plan.development_dataset_id,
+            plan.development_dataset_id,
+        )
+        self.assertEqual(perturbed_results["cells"], original_results["cells"])
+        self.assertEqual(
+            perturbed_results["not_estimable_conditions"],
+            original_results["not_estimable_conditions"],
+        )
+        self.assertEqual(
+            perturbed_results["condition_gate_policy"],
+            original_results["condition_gate_policy"],
+        )
+        self.assertEqual(perturbed_bundles, original_bundles)
 
     def test_test_fold_label_does_not_change_its_prediction(self) -> None:
         condition = next(iter({row.point.condition_id for row in self.development.rows}))
@@ -416,6 +475,38 @@ class DataFoundationBaselineTests(unittest.TestCase):
                 and any(parent.glob(f".{output.name}.tmp-*"))
             )
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX special nodes are unavailable")
+    def test_canonical_artifact_verifier_rejects_special_nodes(self) -> None:
+        results, bundles = _build_synthetic_results()
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = baseline.publish_artifact(
+                Path(temporary),
+                "workspace/data_foundation/baselines/special-nodes",
+                results=results,
+                bundles=bundles,
+                pre_publish_check=lambda: None,
+            )
+            fifo = artifact / "unexpected.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(
+                baseline.DataFoundationBaselineError,
+                "only regular files and directories",
+            ):
+                baseline.verify_artifact(artifact)
+            fifo.unlink()
+
+            if hasattr(socket, "AF_UNIX"):
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    unix_socket.bind(str(artifact / "unexpected.sock"))
+                    with self.assertRaisesRegex(
+                        baseline.DataFoundationBaselineError,
+                        "only regular files and directories",
+                    ):
+                        baseline.verify_artifact(artifact)
+                finally:
+                    unix_socket.close()
+
     def test_bundle_cross_link_with_identical_forecast_is_rejected(self) -> None:
         results, bundles = _build_synthetic_results()
         changed_results = json.loads(json.dumps(results))
@@ -523,6 +614,18 @@ class DataFoundationBaselineTests(unittest.TestCase):
                 and gate["target_values_used_for_fit_calibration_scoring"] is False
                 and "metrics" not in gate
                 and "predictions" not in gate
+                for gate in gates
+            )
+        )
+        self.assertNotIn(
+            "required_final_holdout_task_count",
+            results["condition_gate_policy"],
+        )
+        self.assertTrue(
+            all(
+                "final_holdout_task_count" not in gate
+                and "final_holdout_task_set_sha256" not in gate
+                and "required_final_holdout_task_count" not in gate
                 for gate in gates
             )
         )

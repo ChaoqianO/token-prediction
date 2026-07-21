@@ -222,34 +222,6 @@ def _regular_directory(root: Path, relative: Any, *, label: str) -> Path:
     return path
 
 
-def _assert_regular_tree(root: Path, *, label: str) -> None:
-    """Reject links, reparse points, and non-file/non-directory entries."""
-
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as exc:
-            raise PredictionLockError(f"cannot enumerate {label}") from exc
-        for entry in entries:
-            path = Path(entry.path)
-            if runner._is_link_or_reparse(path):
-                raise PredictionLockError(
-                    f"{label} must not contain symlinks, junctions, or reparse points"
-                )
-            try:
-                mode = entry.stat(follow_symlinks=False).st_mode
-            except OSError as exc:
-                raise PredictionLockError(f"cannot inspect {label} member") from exc
-            if stat.S_ISDIR(mode):
-                pending.append(path)
-            elif not stat.S_ISREG(mode):
-                raise PredictionLockError(
-                    f"{label} must contain only regular files and directories"
-                )
-
-
 def _file_sha256(path: Path) -> str:
     try:
         return runner._sha256_file(path)
@@ -577,7 +549,7 @@ def _validate_lock(value: Any) -> Mapping[str, Any]:
     )
     if (
         _text(conditions["condition_gate_policy_id"], label="condition gate policy id")
-        != "frozen_condition_minimum_cohort_gate_v1"
+        != runner.CONDITION_GATE_POLICY_ID
     ):
         raise PredictionLockError("prediction lock condition gate policy is not frozen")
     for key in ("condition_gate_policy_sha256", "condition_projection_sha256"):
@@ -1053,7 +1025,6 @@ def verify_prediction_lock(
     if artifact_relative != lock["artifact"]["relative_path"]:
         raise PredictionLockError("prediction artifact argument differs from tracked lock")
     artifact = _regular_directory(root, artifact_relative, label="prediction artifact")
-    _assert_regular_tree(artifact, label="prediction artifact")
     try:
         manifest = runner.verify_artifact(artifact)
     except runner.DataFoundationBaselineError as exc:
