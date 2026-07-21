@@ -54,6 +54,9 @@ jobs:
       - name: Target synthetic artifact and bundle parity
         run: |
           python -m pytest -q \
+            tests/test_verify_data_foundation_baseline.py \
+            tests/test_run_data_foundation_baseline.py \
+            tests/test_verify_data_foundation_prediction_lock.py \
             tests/test_lineage.py \
             tests/test_lightgbm_bundle.py::LightGBMBundleTests::test_round_trip_predictions_are_exact_and_scope_is_preserved \
             tests/test_pipeline_prediction.py::PredictionPipelineSmokeTests::test_lightgbm_fold_audit_artifacts_and_runtime_versions_are_published
