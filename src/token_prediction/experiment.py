@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import tempfile
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum, StrEnum
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +21,15 @@ from token_prediction.dataset import (
     PredictionTarget,
     SplitPlan,
     SupervisedDataset,
+    assign_inner_task_folds,
+    build_lifecycle_slice,
+)
+from token_prediction.dataset.lifecycle import lifecycle_condition_task_ids
+from token_prediction.development import (
+    OUTER_FOLDS,
+    DevelopmentProtocol,
+    NestedDevelopmentPlan,
+    OuterInnerPlan,
 )
 from token_prediction.estimators import (
     EstimatorRegistry,
@@ -35,8 +47,10 @@ from token_prediction.evaluation import (
     ScoredForecast,
     TaskMaxConformalCalibrator,
     evaluate_forecasts,
+    evaluate_task_forecasts,
 )
-from token_prediction.features import FeatureSet
+from token_prediction.features import FEATURE_SCHEMA_VERSION, FeatureSet
+from token_prediction.lifecycle import visible_spend_delta
 
 
 class CandidateRole(StrEnum):
@@ -50,6 +64,72 @@ class AblationAxis(StrEnum):
     STATE_UPDATE = "state_update"
     PROBE_INTERVAL = "probe_interval"
     CALIBRATION = "calibration"
+
+
+POINT_LIFECYCLE_SCHEMA_ID = "point_cell_v1"
+NO_INITIALIZER_ID = "none"
+NO_SEED_POLICY_ID = "none"
+NO_INNER_SPLIT_POLICY_ID = "none"
+
+
+@lru_cache(maxsize=1)
+def _source_tree_hash() -> str:
+    package_root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package_root.rglob("*.py")):
+        digest.update(path.relative_to(package_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class CandidateGraph:
+    """The initializer/updater DAG and lifecycle policies in candidate identity."""
+
+    updater_estimator_id: str
+    initializer_estimator_id: str = NO_INITIALIZER_ID
+    lifecycle_schema_id: str = POINT_LIFECYCLE_SCHEMA_ID
+    seed_policy_id: str = NO_SEED_POLICY_ID
+    inner_split_policy_id: str = NO_INNER_SPLIT_POLICY_ID
+
+    def __post_init__(self) -> None:
+        values = (
+            self.updater_estimator_id,
+            self.initializer_estimator_id,
+            self.lifecycle_schema_id,
+            self.seed_policy_id,
+            self.inner_split_policy_id,
+        )
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("candidate graph identities must be non-empty strings")
+        if self.initializer_estimator_id == NO_INITIALIZER_ID:
+            if (
+                self.lifecycle_schema_id != POINT_LIFECYCLE_SCHEMA_ID
+                or self.seed_policy_id != NO_SEED_POLICY_ID
+                or self.inner_split_policy_id != NO_INNER_SPLIT_POLICY_ID
+            ):
+                raise ValueError("point candidates cannot declare lifecycle seed policies")
+        elif (
+            self.lifecycle_schema_id == POINT_LIFECYCLE_SCHEMA_ID
+            or self.seed_policy_id == NO_SEED_POLICY_ID
+            or self.inner_split_policy_id == NO_INNER_SPLIT_POLICY_ID
+        ):
+            raise ValueError("lifecycle candidates require lifecycle, seed, and inner-split ids")
+
+    @property
+    def is_lifecycle(self) -> bool:
+        return self.initializer_estimator_id != NO_INITIALIZER_ID
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "initializer_estimator_id": self.initializer_estimator_id,
+            "updater_estimator_id": self.updater_estimator_id,
+            "lifecycle_schema_id": self.lifecycle_schema_id,
+            "seed_policy_id": self.seed_policy_id,
+            "inner_split_policy_id": self.inner_split_policy_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -69,6 +149,8 @@ class CandidateSpec:
     estimator_id: str
     feature_set: FeatureSet
     params: Mapping[str, Any] = field(default_factory=dict)
+    initializer_params: Mapping[str, Any] = field(default_factory=dict)
+    graph: CandidateGraph | None = None
     role: CandidateRole = CandidateRole.MODEL
     ablation: AblationSpec | None = None
 
@@ -76,6 +158,25 @@ class CandidateSpec:
         if not self.candidate_id or not self.estimator_id:
             raise ValueError("candidate_id and estimator_id are required")
         object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "initializer_params", dict(self.initializer_params))
+        try:
+            json.dumps(
+                {
+                    "updater": self.params,
+                    "initializer": self.initializer_params,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate params must be finite canonical JSON") from exc
+        graph = self.graph or CandidateGraph(updater_estimator_id=self.estimator_id)
+        if graph.updater_estimator_id != self.estimator_id:
+            raise ValueError("candidate graph updater must match estimator_id")
+        if not graph.is_lifecycle and self.initializer_params:
+            raise ValueError("point candidates cannot declare initializer_params")
+        object.__setattr__(self, "graph", graph)
         if self.role == CandidateRole.ABLATION and self.ablation is None:
             raise ValueError("ablation candidates require an AblationSpec")
         if self.role != CandidateRole.ABLATION and self.ablation is not None:
@@ -87,8 +188,15 @@ class CandidateSpec:
             "estimator_id": self.estimator_id,
             "feature_set_hash": self.feature_set.content_hash,
             "params": self.params,
+            "initializer_params": self.initializer_params,
+            "graph": self.graph.to_dict(),
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
         return hashlib.sha256(encoded).hexdigest()
 
 
@@ -106,9 +214,7 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         if not self.experiment_id or not self.candidates:
             raise ValueError("experiment id and candidates are required")
-        if len({candidate.candidate_id for candidate in self.candidates}) != len(
-            self.candidates
-        ):
+        if len({candidate.candidate_id for candidate in self.candidates}) != len(self.candidates):
             raise ValueError("candidate ids must be unique")
         if not 0 < self.alpha < 1:
             raise ValueError("alpha must be in (0, 1)")
@@ -137,6 +243,8 @@ class FoldArtifact:
     feature_importance: tuple[Mapping[str, Any], ...] | None = None
     model_strings: Mapping[str, str] | None = None
     bundle_files: Mapping[str, bytes] | None = None
+    calibrator: Mapping[str, Any] | None = None
+    provenance: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.fold < 0:
@@ -158,6 +266,18 @@ class FoldArtifact:
             if any(not isinstance(value, str) for value in models.values()):
                 raise TypeError("model_strings() values must be strings")
             object.__setattr__(self, "model_strings", MappingProxyType(models))
+        if self.calibrator is not None:
+            object.__setattr__(
+                self,
+                "calibrator",
+                MappingProxyType(dict(self.calibrator)),
+            )
+        if self.provenance is not None:
+            object.__setattr__(
+                self,
+                "provenance",
+                MappingProxyType(dict(self.provenance)),
+            )
         if self.bundle_files is not None:
             bundle = dict(self.bundle_files)
             for name, payload in bundle.items():
@@ -165,10 +285,20 @@ class FoldArtifact:
                     not isinstance(name, str)
                     or not name
                     or name in {".", ".."}
-                    or "/" in name
                     or "\\" in name
+                    or name != name.strip()
                 ):
-                    raise ValueError("bundle file names must be safe basenames")
+                    raise ValueError("bundle file names must be safe relative POSIX paths")
+                relative = PurePosixPath(name)
+                windows = PureWindowsPath(name)
+                if (
+                    relative.is_absolute()
+                    or windows.is_absolute()
+                    or windows.drive
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or relative.as_posix() != name
+                ):
+                    raise ValueError("bundle file names must be safe relative POSIX paths")
                 if not isinstance(payload, bytes):
                     raise TypeError("bundle_files() values must be bytes")
             object.__setattr__(self, "bundle_files", MappingProxyType(bundle))
@@ -202,16 +332,13 @@ class CandidateResult:
     metric_suite_id: str
     predictions: tuple[PredictionRecord, ...]
     metrics: Mapping[str, float | int | str]
-    fold_metrics: Mapping[int, Mapping[str, float | int | str]] = field(
-        default_factory=dict
-    )
+    fold_metrics: Mapping[int, Mapping[str, float | int | str]] = field(default_factory=dict)
+    task_metrics: Mapping[str, Mapping[str, float | int]] = field(default_factory=dict)
     fold_artifacts: tuple[FoldArtifact, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
-        normalized_fold_metrics: dict[
-            int, Mapping[str, float | int | str]
-        ] = {}
+        normalized_fold_metrics: dict[int, Mapping[str, float | int | str]] = {}
         for fold, metrics in self.fold_metrics.items():
             fold_number = int(fold)
             if fold_number < 0:
@@ -221,6 +348,24 @@ class CandidateResult:
             self,
             "fold_metrics",
             MappingProxyType(dict(sorted(normalized_fold_metrics.items()))),
+        )
+        normalized_task_metrics: dict[str, Mapping[str, float | int]] = {}
+        for task_id, metrics in self.task_metrics.items():
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("task metric keys must be non-empty task ids")
+            normalized_task_metrics[task_id] = MappingProxyType(dict(metrics))
+        if normalized_task_metrics:
+            predicted_tasks = {record.task_id for record in self.predictions}
+            if set(normalized_task_metrics) != predicted_tasks:
+                raise ValueError("task metrics must exactly cover predicted tasks")
+            if sum(int(item["n_points"]) for item in normalized_task_metrics.values()) != len(
+                self.predictions
+            ):
+                raise ValueError("task metric point counts do not close")
+        object.__setattr__(
+            self,
+            "task_metrics",
+            MappingProxyType(dict(sorted(normalized_task_metrics.items()))),
         )
         artifacts = tuple(self.fold_artifacts)
         if len({artifact.fold for artifact in artifacts}) != len(artifacts):
@@ -282,21 +427,23 @@ def _mapping_artifact(value: Any, *, context: str) -> Mapping[str, Any]:
     return converted
 
 
-def _collect_fold_artifact(fitted: Any, *, fold: int) -> FoldArtifact | None:
+def _collect_fold_artifact(
+    fitted: Any,
+    *,
+    fold: int,
+    calibrator: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
+) -> FoldArtifact | None:
     encoder_payload: Mapping[str, Any] | None = None
     encoder = getattr(fitted, "encoder", None)
     encoder_to_dict = getattr(encoder, "to_dict", None)
     if callable(encoder_to_dict):
-        encoder_payload = _mapping_artifact(
-            encoder_to_dict(), context="fitted encoder.to_dict()"
-        )
+        encoder_payload = _mapping_artifact(encoder_to_dict(), context="fitted encoder.to_dict()")
 
     fit_report_payload: Mapping[str, Any] | None = None
     fit_report = getattr(fitted, "fit_report", None)
     if fit_report is not None:
-        fit_report_payload = _mapping_artifact(
-            fit_report, context="fitted fit_report"
-        )
+        fit_report_payload = _mapping_artifact(fit_report, context="fitted fit_report")
 
     importance_payload: tuple[Mapping[str, Any], ...] | None = None
     importance_method = getattr(fitted, "source_feature_importance", None)
@@ -307,17 +454,13 @@ def _collect_fold_artifact(fitted: Any, *, fold: int) -> FoldArtifact | None:
         if not isinstance(converted, list) or any(
             not isinstance(record, dict) for record in converted
         ):
-            raise TypeError(
-                "fitted source_feature_importance() must serialize to JSON objects"
-            )
+            raise TypeError("fitted source_feature_importance() must serialize to JSON objects")
         importance_payload = tuple(converted)
 
     model_payload: Mapping[str, str] | None = None
     model_method = getattr(fitted, "model_strings", None)
     if callable(model_method):
-        converted = _mapping_artifact(
-            model_method(), context="fitted model_strings()"
-        )
+        converted = _mapping_artifact(model_method(), context="fitted model_strings()")
         if any(not isinstance(value, str) for value in converted.values()):
             raise TypeError("fitted model_strings() values must be strings")
         model_payload = converted
@@ -325,7 +468,20 @@ def _collect_fold_artifact(fitted: Any, *, fold: int) -> FoldArtifact | None:
     bundle_payload: Mapping[str, bytes] | None = None
     bundle_method = getattr(fitted, "bundle_files", None)
     if callable(bundle_method):
-        raw_bundle = bundle_method()
+        parameters = inspect.signature(bundle_method).parameters.values()
+        supports_keywords = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        )
+        names = {parameter.name for parameter in parameters}
+        if supports_keywords or {"calibrator", "provenance"} <= names:
+            if calibrator is None or provenance is None:
+                raise ValueError("composite bundle creation requires calibrator and provenance")
+            raw_bundle = bundle_method(
+                calibrator=dict(calibrator),
+                provenance=dict(provenance),
+            )
+        else:
+            raw_bundle = bundle_method()
         if not isinstance(raw_bundle, Mapping):
             raise TypeError("fitted bundle_files() must return a mapping")
         bundle_payload = dict(raw_bundle)
@@ -337,16 +493,24 @@ def _collect_fold_artifact(fitted: Any, *, fold: int) -> FoldArtifact | None:
         feature_importance=importance_payload,
         model_strings=model_payload,
         bundle_files=bundle_payload,
+        calibrator=calibrator,
+        provenance=provenance,
     )
     return artifact if artifact.has_payload else None
 
 
 def _resolved_candidate(candidate: CandidateSpec) -> dict[str, Any]:
-    return {
+    resolved = {
         "estimator_id": candidate.estimator_id,
         "feature_set": candidate.feature_set.content_hash,
         **{f"params.{key}": value for key, value in sorted(candidate.params.items())},
+        **{
+            f"initializer_params.{key}": value
+            for key, value in sorted(candidate.initializer_params.items())
+        },
     }
+    resolved.update({f"graph.{key}": value for key, value in candidate.graph.to_dict().items()})
+    return resolved
 
 
 def validate_ablation_specs(candidates: Sequence[CandidateSpec]) -> None:
@@ -379,43 +543,16 @@ def _transition_spend(
     previous: PredictionPoint,
     current: PredictionPoint,
 ) -> int | None:
-    """Return newly observed billable spend, recovering after an earlier gap.
+    """Compatibility wrapper for the shared offline/shadow lifecycle driver."""
 
-    Cumulative known usage remains usable after a missing attempt because the
-    unknown historical amount cancels when the missing-attempt counter is equal
-    at both endpoints.  A counter increase inside this transition makes only
-    this transition unknown; it must not poison every later transition.
-    """
-
-    previous_missing = previous.features.get("missing_usage_attempts")
-    current_missing = current.features.get("missing_usage_attempts")
-    if not isinstance(previous_missing, int) or not isinstance(current_missing, int):
-        return None
-    if current_missing < previous_missing:
-        raise ValueError("missing usage attempt count decreased within a trajectory")
-    if current_missing != previous_missing:
-        return None
-
-    names = (
-        "cumulative_provider_input_tokens",
-        "cumulative_provider_output_tokens",
-    )
-    previous_values = tuple(previous.features.get(name) for name in names)
-    current_values = tuple(current.features.get(name) for name in names)
-    if not all(isinstance(value, int) for value in (*previous_values, *current_values)):
-        return None
-    spend = sum(int(value) for value in current_values) - sum(
-        int(value) for value in previous_values
-    )
-    if spend < 0:
-        raise ValueError("cumulative spend decreased within a trajectory")
-    return spend
+    return visible_spend_delta(previous, current)
 
 
 def _predict_rows(
     fitted: Any,
     rows: Sequence[DatasetRow],
     *,
+    dataset_slice: DatasetSlice,
     feature_set: FeatureSet,
 ) -> dict[str, TokenForecast]:
     by_trajectory: dict[str, list[DatasetRow]] = defaultdict(list)
@@ -429,16 +566,22 @@ def _predict_rows(
         )
         first = sequence[0].point
         session = fitted.start(
-            RunContext(first.task_id, trajectory_id, first.run_id)
+            RunContext(
+                first.task_id,
+                trajectory_id,
+                first.run_id,
+                dataset_id=dataset_slice.dataset_id,
+                condition_id=dataset_slice.condition_id,
+                target=dataset_slice.target,
+                input_contract_hash=dataset_slice.input_contract_hash,
+            )
         )
         previous: PredictionPoint | None = None
         for row in sequence:
             selected = _select_point(row.point, feature_set)
             if previous is not None:
                 spend = _transition_spend(previous, row.point)
-                session.observe(
-                    ObservedTransition(previous.point_id, selected.point_id, spend)
-                )
+                session.observe(ObservedTransition(previous.point_id, selected.point_id, spend))
             started = time.perf_counter_ns()
             forecast = session.predict(selected)
             elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
@@ -454,6 +597,90 @@ def _predict_rows(
     return predictions
 
 
+def _verify_point_fold_reload(
+    artifact: FoldArtifact | None,
+    *,
+    fitted: Any,
+    dataset_slice: DatasetSlice,
+    feature_set: FeatureSet,
+    test_rows: Sequence[DatasetRow],
+    raw_test_forecasts: Mapping[str, TokenForecast],
+    calibrator: Any,
+    expected_provenance: Mapping[str, Any],
+    expected_source_provenance: Mapping[str, Any],
+) -> None:
+    """Load a serialized learned point model and replay its calibrated test cell."""
+
+    estimator_id = getattr(fitted, "estimator_id", None)
+    if estimator_id not in {"independent_mlp", "lightgbm_quantile"}:
+        return
+    if artifact is None or artifact.bundle_files is None:
+        raise ValueError(f"{estimator_id} fold did not produce a reloadable bundle")
+    if artifact.calibrator is None or dict(artifact.calibrator) != calibrator.to_dict():
+        raise ValueError(f"{estimator_id} fold changed its calibrator document")
+    if artifact.provenance is None:
+        raise ValueError(f"{estimator_id} fold did not retain provenance")
+    actual_artifact_provenance = _json_compatible(
+        artifact.provenance,
+        context=f"{estimator_id} artifact provenance",
+    )
+    wanted_provenance = _json_compatible(
+        expected_provenance,
+        context=f"expected {estimator_id} provenance",
+    )
+    if actual_artifact_provenance != wanted_provenance:
+        raise ValueError(f"{estimator_id} fold changed provenance")
+
+    if estimator_id == "independent_mlp":
+        # Imported lazily so point baselines remain free of neural dependencies.
+        from token_prediction.estimators.neural_bundle import load_neural_bundle
+    else:
+        from token_prediction.estimators.lightgbm_bundle import load_lightgbm_bundle
+
+    with tempfile.TemporaryDirectory(prefix="token-prediction-point-reload-") as temporary:
+        root = Path(temporary)
+        for name, payload in sorted(artifact.bundle_files.items()):
+            destination = root.joinpath(*PurePosixPath(name).parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+        if estimator_id == "independent_mlp":
+            reloaded = load_neural_bundle(
+                root,
+                expected_source_provenance=expected_source_provenance,
+            )
+            actual_provenance = _json_compatible(
+                reloaded.provenance,
+                context="reloaded Independent MLP provenance",
+            )
+            if actual_provenance != wanted_provenance:
+                raise ValueError("Independent MLP bundle reload changed fold provenance")
+        else:
+            reloaded = load_lightgbm_bundle(root)
+
+    replayed = _predict_rows(
+        reloaded,
+        test_rows,
+        dataset_slice=dataset_slice,
+        feature_set=feature_set,
+    )
+    if set(replayed) != set(raw_test_forecasts):
+        raise ValueError(f"{estimator_id} bundle reload changed the test point cohort")
+    for point_id, raw_forecast in raw_test_forecasts.items():
+        expected = calibrator.transform(raw_forecast)
+        actual_raw = replayed[point_id]
+        actual = (
+            actual_raw
+            if estimator_id == "independent_mlp"
+            else calibrator.transform(actual_raw)
+        )
+        # Latency is measured around each invocation and is intentionally not a
+        # serialized model output.  Replacing only that measurement leaves every
+        # calibrated/raw quantile, scope field, and overhead counter under exact
+        # equality.
+        if replace(expected, latency_ms=actual.latency_ms) != actual:
+            raise ValueError(f"{estimator_id} bundle reload changed a calibrated test forecast")
+
+
 def _make_training_view(
     dataset_slice: DatasetSlice,
     rows: Sequence[DatasetRow],
@@ -464,6 +691,7 @@ def _make_training_view(
         dataset_id=dataset_slice.dataset_id,
         position=dataset_slice.position,
         target=dataset_slice.target,
+        input_contract_hash=dataset_slice.input_contract_hash,
         examples=tuple(
             TrainingExample(
                 point=_select_point(row.point, feature_set),
@@ -485,6 +713,7 @@ def run_candidate_cv(
     alpha: float,
     calibrator_id: str,
     seed: int,
+    source_provenance: Mapping[str, object] | None = None,
 ) -> CandidateResult:
     if split_plan.dataset_id != dataset_slice.dataset_id:
         raise ValueError("split plan belongs to another dataset")
@@ -493,6 +722,8 @@ def run_candidate_cv(
     )
     if not dataset_slice.rows:
         raise ValueError("experiment cell has no eligible points")
+    if candidate.estimator_id == "independent_mlp" and source_provenance is None:
+        raise ValueError("Independent MLP experiments require source provenance")
     weighted = dataset_slice.weighted_rows()
     weights = {item.row.point.point_id: item.sample_weight for item in weighted}
     all_records: list[PredictionRecord] = []
@@ -506,18 +737,12 @@ def run_candidate_cv(
             row for row in dataset_slice.rows if row.point.task_id in partition.train_tasks
         ]
         validation_rows = [
-            row
-            for row in dataset_slice.rows
-            if row.point.task_id in partition.validation_tasks
+            row for row in dataset_slice.rows if row.point.task_id in partition.validation_tasks
         ]
         calibration_rows = [
-            row
-            for row in dataset_slice.rows
-            if row.point.task_id in partition.calibration_tasks
+            row for row in dataset_slice.rows if row.point.task_id in partition.calibration_tasks
         ]
-        test_rows = [
-            row for row in dataset_slice.rows if row.point.task_id in partition.test_tasks
-        ]
+        test_rows = [row for row in dataset_slice.rows if row.point.task_id in partition.test_tasks]
         if not train_rows or not validation_rows or not calibration_rows or not test_rows:
             raise ValueError(
                 f"fold {fold} has an empty train/validation/calibration/test partition"
@@ -525,16 +750,14 @@ def run_candidate_cv(
         estimator = registry.create(candidate.estimator_id, candidate.params)
         fitted = estimator.fit(
             _make_training_view(dataset_slice, train_rows, weights, candidate.feature_set),
-            _make_training_view(
-                dataset_slice, validation_rows, weights, candidate.feature_set
-            ),
+            _make_training_view(dataset_slice, validation_rows, weights, candidate.feature_set),
             FitContext(seed=seed, fold=fold, interval_alpha=alpha),
         )
-        fold_artifact = _collect_fold_artifact(fitted, fold=fold)
-        if fold_artifact is not None:
-            fold_artifacts.append(fold_artifact)
         calibration_forecasts = _predict_rows(
-            fitted, calibration_rows, feature_set=candidate.feature_set
+            fitted,
+            calibration_rows,
+            dataset_slice=dataset_slice,
+            feature_set=candidate.feature_set,
         )
         calibration_examples = [
             CalibrationExample(
@@ -548,11 +771,67 @@ def run_candidate_cv(
         if calibrator_id == "task_max_conformal":
             calibrator = TaskMaxConformalCalibrator(alpha=alpha).fit(calibration_examples)
         elif calibrator_id == "none":
-            calibrator = IdentityCalibrator().fit(calibration_examples)
+            calibrator = IdentityCalibrator(alpha=alpha).fit(calibration_examples)
         else:
             raise ValueError(f"unknown calibrator {calibrator_id!r}")
+        calibrator_document = calibrator.to_dict()
+        fold_provenance = {
+            "bundle_role": "point_model",
+            "candidate_id": candidate.candidate_id,
+            "candidate_hash": candidate.content_hash,
+            "candidate_graph": candidate.graph.to_dict(),
+            "dataset_id": dataset_slice.dataset_id,
+            "dataset_schema_version": dataset_slice.dataset_schema_version,
+            "source_descriptor_hash": dataset_slice.source_descriptor_hash,
+            "capability_contract_hash": dataset_slice.capability_contract_hash,
+            "split_plan_id": split_plan.split_plan_id,
+            "eligibility_hash": dataset_slice.eligibility_hash,
+            "feature_set_hash": candidate.feature_set.content_hash,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "position": dataset_slice.position.value,
+            "target": dataset_slice.target.value,
+            "condition_id": dataset_slice.condition_id,
+            "input_contract_hash": dataset_slice.input_contract_hash,
+            "fold": fold,
+            "interval_alpha": alpha,
+            "calibrator_id": calibrator_id,
+            "code_hash": (
+                source_provenance["code_hash"]
+                if source_provenance is not None
+                else _source_tree_hash()
+            ),
+        }
+        if candidate.estimator_id == "independent_mlp":
+            assert source_provenance is not None
+            fold_provenance["source_descriptor"] = source_provenance[
+                "source_descriptor"
+            ]
+        fold_artifact = _collect_fold_artifact(
+            fitted,
+            fold=fold,
+            calibrator=calibrator_document,
+            provenance=fold_provenance,
+        )
+        if fold_artifact is not None:
+            fold_artifacts.append(fold_artifact)
         raw_test_forecasts = _predict_rows(
-            fitted, test_rows, feature_set=candidate.feature_set
+            fitted,
+            test_rows,
+            dataset_slice=dataset_slice,
+            feature_set=candidate.feature_set,
+        )
+        _verify_point_fold_reload(
+            fold_artifact,
+            fitted=fitted,
+            dataset_slice=dataset_slice,
+            feature_set=candidate.feature_set,
+            test_rows=test_rows,
+            raw_test_forecasts=raw_test_forecasts,
+            calibrator=calibrator,
+            expected_provenance=fold_provenance,
+            expected_source_provenance=(
+                source_provenance if source_provenance is not None else {}
+            ),
         )
         fold_scored: list[ScoredForecast] = []
         for row in test_rows:
@@ -602,6 +881,13 @@ def run_candidate_cv(
         predictions=tuple(sorted(all_records, key=lambda record: record.point_id)),
         metrics=metrics,
         fold_metrics=fold_metrics,
+        task_metrics={
+            task_id: task_metric.to_dict()
+            for task_id, task_metric in evaluate_task_forecasts(
+                all_scored,
+                alpha=alpha,
+            ).items()
+        },
         fold_artifacts=tuple(fold_artifacts),
     )
 
@@ -630,7 +916,18 @@ class ExperimentRunner:
         spec: ExperimentSpec,
         *,
         seed: int,
+        development_protocol: DevelopmentProtocol | None = None,
+        source_provenance: Mapping[str, object] | None = None,
     ) -> tuple[CandidateResult, ...]:
+        nested_plan: NestedDevelopmentPlan | None = None
+        if development_protocol is not None:
+            nested_plan = development_protocol.nested_plan_for(split_plan)
+            if dataset != development_protocol.development_dataset:
+                raise ValueError("production experiments require the sealed development dataset")
+            if seed != nested_plan.split_seed:
+                raise ValueError("production model seed must equal the frozen split seed")
+            if dataset.task_ids & development_protocol.final_holdout_tasks:
+                raise ValueError("final-holdout tasks leaked into production input")
         validate_ablation_specs(spec.candidates)
         dataset_slice = dataset.select(
             spec.position,
@@ -638,17 +935,80 @@ class ExperimentRunner:
             required_features=spec.required_features,
             condition_id=spec.condition_id,
         )
-        results = tuple(
-            run_candidate_cv(
-                dataset_slice,
-                split_plan,
-                candidate,
-                self.registry,
-                alpha=spec.alpha,
-                calibrator_id=spec.calibrator_id,
-                seed=seed,
+        lifecycle_slice = None
+        if any(candidate.graph.is_lifecycle for candidate in spec.candidates):
+            if spec.required_features:
+                raise ValueError(
+                    "lifecycle experiments keep missing features as masked context; "
+                    "required_features must be empty"
+                )
+            if spec.position != PredictionPosition.TASK_UPDATE:
+                raise ValueError("lifecycle candidates require the Task-update position")
+            condition_tasks = lifecycle_condition_task_ids(
+                dataset,
+                target=spec.target,
+                condition_id=spec.condition_id,
             )
-            for candidate in spec.candidates
-        )
+            planned_tasks = frozenset(task for task, _fold in split_plan.assignments)
+            if not condition_tasks <= planned_tasks:
+                raise ValueError("lifecycle condition contains tasks outside the split plan")
+            lifecycle_slice = build_lifecycle_slice(
+                dataset,
+                target=spec.target,
+                condition_id=spec.condition_id,
+                task_ids=condition_tasks,
+            )
+            if source_provenance is None:
+                raise ValueError("lifecycle experiments require source provenance")
+            if nested_plan is None:
+                inner_plans = {
+                    outer_fold: OuterInnerPlan(
+                        split_seed=split_plan.seed,
+                        outer_test_fold=outer_fold,
+                        outer_split_plan_id=split_plan.split_plan_id,
+                        assignment=assign_inner_task_folds(
+                            split_plan.partition(outer_fold).train_tasks,
+                            seed=split_plan.seed,
+                        ),
+                    )
+                    for outer_fold in range(OUTER_FOLDS)
+                }
+            else:
+                inner_plans = {plan.outer_test_fold: plan for plan in nested_plan.inner_plans}
+        resolved: list[CandidateResult] = []
+        for candidate in spec.candidates:
+            if candidate.graph.is_lifecycle:
+                if lifecycle_slice is None:
+                    raise AssertionError("lifecycle slice was not constructed")
+                # Imported lazily to avoid the result-contract module cycle.
+                from token_prediction.lifecycle_experiment import (
+                    run_lifecycle_candidate_cv,
+                )
+
+                result = run_lifecycle_candidate_cv(
+                    dataset,
+                    lifecycle_slice,
+                    split_plan,
+                    candidate,
+                    self.registry,
+                    alpha=spec.alpha,
+                    calibrator_id=spec.calibrator_id,
+                    seed=seed,
+                    inner_plans=inner_plans,
+                    source_provenance=source_provenance,
+                )
+            else:
+                result = run_candidate_cv(
+                    dataset_slice,
+                    split_plan,
+                    candidate,
+                    self.registry,
+                    alpha=spec.alpha,
+                    calibrator_id=spec.calibrator_id,
+                    seed=seed,
+                    source_provenance=source_provenance,
+                )
+            resolved.append(result)
+        results = tuple(resolved)
         compare_candidate_results(results)
         return results

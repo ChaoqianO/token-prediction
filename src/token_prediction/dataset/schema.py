@@ -119,6 +119,26 @@ class DatasetSlice:
     rows: tuple[DatasetRow, ...]
     eligibility_hash: str
     weighting_id: str = "task_run_point_equal_v1"
+    input_contract_hash: str | None = None
+    dataset_schema_version: int = DATASET_SCHEMA_VERSION
+    source_descriptor_hash: str | None = None
+    capability_contract_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.input_contract_hash is not None and (
+            len(self.input_contract_hash) != 64
+            or any(character not in "0123456789abcdef" for character in self.input_contract_hash)
+        ):
+            raise ValueError("input_contract_hash must be a lowercase SHA-256 digest or None")
+        if self.dataset_schema_version <= 0:
+            raise ValueError("dataset_schema_version must be positive")
+        for name in ("source_descriptor_hash", "capability_contract_hash"):
+            value = getattr(self, name)
+            if value is not None and (
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest or None")
 
     def weighted_rows(self) -> tuple[WeightedRow, ...]:
         by_task_trajectory: dict[str, dict[str, list[DatasetRow]]] = defaultdict(
@@ -144,6 +164,23 @@ class SupervisedDataset:
     schema_version: int = DATASET_SCHEMA_VERSION
     source_descriptor_hash: str | None = None
     capability_contract_hash: str | None = None
+    input_contract_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.dataset_id.strip():
+            raise ValueError("dataset_id is required")
+        for name in (
+            "source_descriptor_hash",
+            "capability_contract_hash",
+            "input_contract_hash",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                len(value) != 64
+                or value != value.lower()
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest or None")
 
     def select(
         self,
@@ -183,6 +220,10 @@ class SupervisedDataset:
             condition_id=resolved_condition,
             rows=rows,
             eligibility_hash=hashlib.sha256(encoded).hexdigest(),
+            input_contract_hash=self.input_contract_hash,
+            dataset_schema_version=self.schema_version,
+            source_descriptor_hash=self.source_descriptor_hash,
+            capability_contract_hash=self.capability_contract_hash,
         )
 
     @property

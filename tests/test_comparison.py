@@ -4,7 +4,7 @@ import unittest
 
 from token_prediction.dataset import PredictionPosition, PredictionTarget
 from token_prediction.estimators import TokenForecast
-from token_prediction.evaluation import paired_task_bootstrap
+from token_prediction.evaluation import paired_task_bootstrap, paired_task_metric_bootstrap
 from token_prediction.experiment import CandidateResult, PredictionRecord
 
 
@@ -34,7 +34,34 @@ def _record(
     )
 
 
-def _result(candidate_id: str, records: tuple[PredictionRecord, ...]) -> CandidateResult:
+def _result(
+    candidate_id: str,
+    records: tuple[PredictionRecord, ...],
+    *,
+    task_maes: dict[str, float] | None = None,
+) -> CandidateResult:
+    task_metrics = (
+        {
+            "task-a": {
+                "n_points": 2,
+                "n_trajectories": 1,
+                "weight_sum": 0.5,
+                "weighted_mae": task_maes["task-a"],
+                "weighted_interval_score": 0.0,
+                "weighted_coverage": 1.0,
+            },
+            "task-b": {
+                "n_points": 1,
+                "n_trajectories": 1,
+                "weight_sum": 0.5,
+                "weighted_mae": task_maes["task-b"],
+                "weighted_interval_score": 0.0,
+                "weighted_coverage": 1.0,
+            },
+        }
+        if task_maes is not None
+        else {}
+    )
     return CandidateResult(
         candidate_id=candidate_id,
         candidate_hash=f"hash-{candidate_id}",
@@ -49,6 +76,7 @@ def _result(candidate_id: str, records: tuple[PredictionRecord, ...]) -> Candida
         metric_suite_id="metrics-a",
         predictions=records,
         metrics={},
+        task_metrics=task_metrics,
     )
 
 
@@ -99,6 +127,39 @@ class PairedTaskBootstrapTests(unittest.TestCase):
             seed=91,
         )
         self.assertEqual(first, second)
+
+    def test_label_free_task_metrics_reproduce_the_paired_mae_comparison(self) -> None:
+        candidate = _result(
+            "candidate",
+            self.candidate_records,
+            task_maes={"task-a": 1.0, "task-b": 1.0},
+        )
+        reference = _result(
+            "reference",
+            self.reference_records,
+            task_maes={"task-a": 2.0, "task-b": 2.0},
+        )
+        comparison = paired_task_metric_bootstrap(
+            candidate,
+            reference,
+            iterations=500,
+            seed=17,
+        )
+        self.assertEqual(comparison.n_points, 3)
+        self.assertEqual(comparison.n_tasks, 2)
+        self.assertEqual(comparison.candidate_mae, 1.0)
+        self.assertEqual(comparison.reference_mae, 2.0)
+        self.assertEqual(comparison.mae_delta, -1.0)
+        self.assertEqual(comparison.candidate_win_probability, 1.0)
+
+        incompatible = CandidateResult(
+            **{
+                **reference.__dict__,
+                "dataset_id": "another-dataset",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "same experiment cohort"):
+            paired_task_metric_bootstrap(candidate, incompatible, iterations=10)
 
     def test_rejects_point_task_and_weight_mismatches(self) -> None:
         with self.assertRaisesRegex(ValueError, "cohorts differ"):

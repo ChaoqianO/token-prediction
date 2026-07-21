@@ -256,7 +256,7 @@ def _artifact_manifest(artifact: Path, expected_artifact_id: str | None) -> Any:
     if any(path.is_symlink() for path in artifact.rglob("*")):
         raise BaselineVerificationError("artifact must not contain symbolic links")
     try:
-        manifest = verify_artifact(artifact)
+        manifest = verify_artifact(artifact, allow_legacy_crlf_success=True)
     except ArtifactVerificationError as exc:
         raise BaselineVerificationError("artifact integrity verification failed") from exc
     if manifest.stage_name != STAGE_NAME or manifest.schema_version != 1:

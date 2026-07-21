@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .schema import (
+    CAPABILITY_DATASET_SCHEMA_VERSION,
     DatasetRow,
     LabelStatus,
     PredictionPoint,
@@ -20,6 +21,8 @@ from .schema import (
 
 
 SPEND_DATASET_SCHEMA_VERSION = 1
+SWE_BENCH_METADATA_PROJECTION_SCHEMA_VERSION = 1
+SWE_BENCH_METADATA_READER_POLICY_ID = "hyparquet_swebench_metadata_projection_v1"
 
 
 @dataclass(frozen=True)
@@ -47,7 +50,7 @@ def load_swebench_verified_metadata(
 
     try:
         import pyarrow.parquet as pq
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional base-only install
+    except (ModuleNotFoundError, ImportError, OSError) as exc:  # pragma: no cover
         raise RuntimeError(
             "SWE-bench parquet ingestion requires pyarrow; "
             "install token-prediction[data]"
@@ -79,6 +82,101 @@ def load_swebench_verified_metadata(
     return result
 
 
+def load_swebench_verified_metadata_json(
+    projection_path: str | Path,
+    *,
+    expected_projection_sha256: str | None = None,
+    expected_source_sha256: str | None = None,
+) -> dict[str, SweBenchTaskMetadata]:
+    """Load the deterministic, label-free fallback projection of task metadata."""
+
+    source = Path(projection_path).resolve()
+    payload = source.read_bytes()
+    projection_sha256 = hashlib.sha256(payload).hexdigest()
+    if (
+        expected_projection_sha256 is not None
+        and projection_sha256 != _required_sha256(
+            expected_projection_sha256,
+            name="metadata projection SHA-256",
+        )
+    ):
+        raise ValueError("metadata projection SHA-256 does not match")
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("metadata projection is not UTF-8 JSON") from exc
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "reader",
+        "source",
+        "task_count",
+        "tasks",
+    }:
+        raise ValueError("metadata projection keys do not match the schema")
+    if document["schema_version"] != SWE_BENCH_METADATA_PROJECTION_SCHEMA_VERSION:
+        raise ValueError("unsupported metadata projection schema")
+    reader = document["reader"]
+    if not isinstance(reader, dict) or reader != {
+        "policy_id": SWE_BENCH_METADATA_READER_POLICY_ID,
+        "package": "hyparquet",
+        "version": "1.26.2",
+        "columns": ["instance_id", "repo", "problem_statement", "difficulty"],
+    }:
+        raise ValueError("metadata projection reader identity is invalid")
+    source_identity = document["source"]
+    if not isinstance(source_identity, dict) or set(source_identity) != {
+        "bytes",
+        "sha256",
+    }:
+        raise ValueError("metadata projection source identity is invalid")
+    source_sha256 = _required_sha256(
+        source_identity["sha256"],
+        name="metadata source SHA-256",
+    )
+    if (
+        expected_source_sha256 is not None
+        and source_sha256
+        != _required_sha256(expected_source_sha256, name="expected source SHA-256")
+    ):
+        raise ValueError("metadata source SHA-256 does not match")
+    if (
+        isinstance(source_identity["bytes"], bool)
+        or not isinstance(source_identity["bytes"], int)
+        or source_identity["bytes"] <= 0
+    ):
+        raise ValueError("metadata source byte count is invalid")
+    raw_tasks = document["tasks"]
+    if not isinstance(raw_tasks, list) or document["task_count"] != len(raw_tasks):
+        raise ValueError("metadata projection task count does not close")
+    result: dict[str, SweBenchTaskMetadata] = {}
+    previous = ""
+    for index, raw in enumerate(raw_tasks):
+        if not isinstance(raw, dict) or set(raw) != {
+            "instance_id",
+            "repo",
+            "problem_statement",
+            "difficulty",
+        }:
+            raise ValueError(f"metadata projection task {index} is invalid")
+        item = SweBenchTaskMetadata(
+            instance_id=str(raw["instance_id"] or "").strip(),
+            repo=str(raw["repo"] or "").strip(),
+            problem_statement=str(raw["problem_statement"] or ""),
+            difficulty=(
+                str(raw["difficulty"]).strip() if raw["difficulty"] is not None else None
+            ),
+        )
+        if not item.instance_id or not item.repo or not item.problem_statement:
+            raise ValueError("metadata projection contains an incomplete task")
+        if item.instance_id <= previous or item.instance_id in result:
+            raise ValueError("metadata projection tasks are not uniquely sorted")
+        previous = item.instance_id
+        result[item.instance_id] = item
+    if not result:
+        raise ValueError("metadata projection is empty")
+    return result
+
+
 def build_spend_your_money_dataset(
     aggregate_csv_path: str | Path,
     task_metadata: Mapping[str, SweBenchTaskMetadata],
@@ -88,6 +186,9 @@ def build_spend_your_money_dataset(
     agent_id: str = "openhands",
     condition_id: str | None = None,
     metadata_sha256: str | None = None,
+    source_descriptor_hash: str | None = None,
+    capability_contract_hash: str | None = None,
+    input_contract_hash: str | None = None,
 ) -> SpendYourMoneyImport:
     """Build a Task-launch dataset from the paper's four-run aggregate CSV.
 
@@ -208,12 +309,32 @@ def build_spend_your_money_dataset(
         "metadata_sha256": resolved_metadata_hash,
         "model_key": model_key,
         "condition_id": resolved_condition,
+        "source_descriptor_hash": source_descriptor_hash,
+        "capability_contract_hash": capability_contract_hash,
+        "input_contract_hash": input_contract_hash,
         "labels": labels,
     }
+    provenance = (
+        source_descriptor_hash,
+        capability_contract_hash,
+        input_contract_hash,
+    )
+    if any(value is not None for value in provenance) and not all(
+        value is not None for value in provenance
+    ):
+        raise ValueError("aggregate dataset provenance must be complete or absent")
     dataset_id = "spend-your-money:" + _semantic_hash(dataset_semantic)
     dataset = SupervisedDataset(
         dataset_id=dataset_id,
         rows=tuple(sorted(rows, key=lambda item: item.point.point_id)),
+        schema_version=(
+            CAPABILITY_DATASET_SCHEMA_VERSION
+            if source_descriptor_hash is not None
+            else SPEND_DATASET_SCHEMA_VERSION
+        ),
+        source_descriptor_hash=source_descriptor_hash,
+        capability_contract_hash=capability_contract_hash,
+        input_contract_hash=input_contract_hash,
     )
     return SpendYourMoneyImport(
         dataset=dataset,
@@ -245,6 +366,17 @@ def _finite_non_negative_float(value: Any, column: str) -> float:
     if parsed < 0 or parsed != parsed or parsed in {float("inf"), float("-inf")}:
         raise ValueError(f"column {column!r} must be finite and non-negative")
     return parsed
+
+
+def _required_sha256(value: object, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
 
 
 def _sha256_file(path: Path) -> str:

@@ -34,11 +34,13 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --editable ".[dev,data,estimators]"
+          python -m pip install --editable ".[dev,data,estimators,neural]"
       - name: Scan repository-intended files for secrets
         run: python scripts/scan_secrets.py
       - name: Verify tracked production baseline lock and frozen Git objects
         run: python scripts/verify_data_foundation_prediction_lock.py --tracked-only
+      - name: Verify tracked Stage 2 release lock and frozen source tree
+        run: python scripts/verify_stage2_release.py --tracked-only
       - name: Ruff lint
         run: python -m ruff check src tests scripts
       - name: Target schema and prefix-causality contracts
@@ -62,6 +64,7 @@ jobs:
             tests/test_verify_data_foundation_prediction_lock.py \
             tests/test_lineage.py \
             tests/test_lightgbm_bundle.py::LightGBMBundleTests::test_round_trip_predictions_are_exact_and_scope_is_preserved \
+            tests/test_neural_bundle.py \
             tests/test_pipeline_prediction.py::PredictionPipelineSmokeTests::test_lightgbm_fold_audit_artifacts_and_runtime_versions_are_published
       - name: Run full pytest suite
         run: python -m pytest -q
@@ -97,5 +100,5 @@ jobs:
           wheel_env="$RUNNER_TEMP/token-prediction-wheel-${{ matrix.python-version }}"
           python -m venv "$wheel_env"
           "$wheel_env/bin/python" -m pip install --no-deps dist/*.whl
-          "$wheel_env/bin/python" -c "import importlib.metadata, token_prediction; assert importlib.metadata.version('token-prediction') == token_prediction.__version__"
+          "$wheel_env/bin/python" -c "import importlib.metadata, token_prediction, token_prediction.estimators; assert importlib.metadata.version('token-prediction') == token_prediction.__version__"
           "$wheel_env/bin/python" -m token_prediction.cli --help

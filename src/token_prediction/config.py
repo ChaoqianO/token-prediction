@@ -16,6 +16,7 @@ from token_prediction.dataset import PredictionPosition, PredictionTarget
 from token_prediction.experiment import (
     AblationAxis,
     AblationSpec,
+    CandidateGraph,
     CandidateRole,
     CandidateSpec,
     ExperimentSpec,
@@ -296,7 +297,16 @@ def load_config(path: str | Path) -> ProjectConfig:
         item = dict(value or {})
         _reject_unknown(
             item,
-            {"id", "estimator", "feature_set", "role", "params", "ablation"},
+            {
+                "id",
+                "estimator",
+                "feature_set",
+                "role",
+                "params",
+                "initializer_params",
+                "graph",
+                "ablation",
+            },
             "candidate",
         )
         candidate_id = str(item.get("id") or "").strip()
@@ -306,6 +316,36 @@ def load_config(path: str | Path) -> ProjectConfig:
                 f"candidate {candidate_id!r} references unknown feature set {feature_set_id!r}"
             )
         role = CandidateRole(str(item.get("role") or CandidateRole.MODEL.value))
+        graph_payload = item.get("graph")
+        graph = None
+        if graph_payload is not None:
+            if schema_version == 1:
+                raise ValueError("config schema_version=1 cannot declare candidate graphs")
+            graph_item = dict(graph_payload)
+            _reject_unknown(
+                graph_item,
+                {
+                    "initializer",
+                    "updater",
+                    "lifecycle_schema",
+                    "seed_policy",
+                    "inner_split_policy",
+                },
+                f"candidate {candidate_id!r} graph",
+            )
+            graph = CandidateGraph(
+                initializer_estimator_id=str(
+                    graph_item.get("initializer") or ""
+                ).strip(),
+                updater_estimator_id=str(graph_item.get("updater") or "").strip(),
+                lifecycle_schema_id=str(
+                    graph_item.get("lifecycle_schema") or ""
+                ).strip(),
+                seed_policy_id=str(graph_item.get("seed_policy") or "").strip(),
+                inner_split_policy_id=str(
+                    graph_item.get("inner_split_policy") or ""
+                ).strip(),
+            )
         ablation_payload = item.get("ablation")
         ablation = None
         if ablation_payload is not None:
@@ -330,6 +370,8 @@ def load_config(path: str | Path) -> ProjectConfig:
                 estimator_id=str(item.get("estimator") or "").strip(),
                 feature_set=feature_sets[feature_set_id],
                 params=dict(item.get("params") or {}),
+                initializer_params=dict(item.get("initializer_params") or {}),
+                graph=graph,
                 role=role,
                 ablation=ablation,
             )

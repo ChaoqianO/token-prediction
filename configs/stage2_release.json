@@ -1,0 +1,119 @@
+{
+  "release_schema_version": 1,
+  "stage_name": "stage2_development",
+  "policy_id": "stage2_commit_bound_four_source_release_v1",
+  "code_binding": {
+    "artifact_git_commit": "ceecf9cf9cacb9e2aac395a6b29ad3cf130d1592",
+    "code_tree_sha256": "4e15c9f9b1c1eeeec14b1f22f8db74613591d3b4ecd14255018e9c035cf2c650"
+  },
+  "protocol": {
+    "outer_folds": 5,
+    "inner_folds": 5,
+    "split_seeds": [
+      20260719,
+      20260720,
+      20260721
+    ],
+    "calibrator_id": "task_max_conformal",
+    "alpha": 0.1,
+    "final_holdout_evaluated": false,
+    "final_holdout_prediction_count": 0
+  },
+  "artifacts": {
+    "spend_aggregate": {
+      "kind": "experiment",
+      "path": "workspace/stage2/experiments/s2-4bfd11bb3e2cb1ea0367",
+      "source_id": "spend_your_money_aggregate_v1",
+      "source_descriptor_hash": "566e3ccb74fe3b1d9b35d48432abee422946e67a67433006ea4020ad4013f6d0",
+      "run_id": "4bfd11bb3e2cb1ea03674426",
+      "artifact_id": "e37fa788bc972e426bd57bff9438159a22ae44d55aa7ab9a4ac4e03f54252faf",
+      "results_payload_sha256": "b6dbaf62e9beb3440550a490b5c70b75ef7fc11a3734f30b59a9bc20620327f2",
+      "base_dataset_id": "spend-your-money:293e3c2aa714172996406465e5e2411b3a136883bf1335a8eb9c5224076a13db",
+      "derived_dataset_id": "spend-your-money:293e3c2aa714172996406465e5e2411b3a136883bf1335a8eb9c5224076a13db",
+      "development_dataset_id": "338ceee186b0f9708b692ebaa2071d0918c3578d923a23007a69f2a10d9e2f1f",
+      "development_protocol_id": "9e6fd39eaf602710dcfe399d057272d3bda056d0f2c4a820e7e618e4256c4ef4",
+      "matrix_id": "a69f6bce0d5d4c2d7de5494c3606a2de0408661aed0dedae947abb62a8e4f25e",
+      "experiment_count": 1,
+      "candidate_seed_run_count": 12,
+      "manifest_file_count": 376
+    },
+    "bagen_sokoban": {
+      "kind": "experiment",
+      "path": "workspace/stage2/experiments/s2-f913d50d680862b0a470",
+      "source_id": "bagen_sokoban_dialogues_v1",
+      "source_descriptor_hash": "b76215d4d686bfeabf37092b73ae93407fe20db898932019248b182fa092cc45",
+      "run_id": "f913d50d680862b0a47089a4",
+      "artifact_id": "286d8296b73ddf4a926e0fd2e016ee9927843457985e296af259dc53cdbf670c",
+      "results_payload_sha256": "0efacc7f7b1215f62b956940ab2ac0c596e3a752d52eb397583aa91ce6f1b18c",
+      "base_dataset_id": "8a5b8cd8e7550d1a0587632bf686e742ead0a5adc76dd6ad81d2d43634913b52",
+      "derived_dataset_id": "f0d7aa728e05aace92d34e42575ea80e01dd089d400a1eb749d1c4fea58425dd",
+      "development_dataset_id": "56a93f1afdb420e490bd25c09d96d79044653b3b490d27a9de11425d85de6fe4",
+      "development_protocol_id": "510e1b4087c04aa5ac4ed2ec6c431e7c5f90ad77b172a88c2d4feabb4a1e83cf",
+      "matrix_id": "7a3e46429a85a05710ae4380d7f013577a9108373b111f39f60fc89dab9c6d5b",
+      "experiment_count": 2,
+      "candidate_seed_run_count": 36,
+      "manifest_file_count": 1756
+    },
+    "bagen_swebench": {
+      "kind": "experiment",
+      "path": "workspace/stage2/experiments/s2-25d25ae2874896dd85c1",
+      "source_id": "bagen_swebench_traj_v2",
+      "source_descriptor_hash": "17c8f88de18bb4734923b331287648cb5ff92e368c85a2f0b1aeb103ef84f4cb",
+      "run_id": "25d25ae2874896dd85c150cd",
+      "artifact_id": "2aa6e2d5bb455777b34b98b6db139448c3a79f5581400ceb9af101f07dc39497",
+      "results_payload_sha256": "9bd7bfcea66c134837e2e5310162277ee29ded5cad1684275c77b6dc631f5ba5",
+      "base_dataset_id": "db2f5baf2f2139e25fb8479cd3b3c33c528961d04c930d93009755fcb889bd23",
+      "derived_dataset_id": "bee534130055f9e0b512adcad85d17831f8020ed991ceb18f4c8daa2d43dcc8b",
+      "development_dataset_id": "bdbe83fd0495419d294d7f344d424b2d2c541d8608ff3e01c46354f08a15d23c",
+      "development_protocol_id": "f5217563e8bf21f1551c20e14b42e41b23f0ac46715a0dbe5ddccb59d0ff854a",
+      "matrix_id": "51f25a8391def06d8ed0bd032b4d659d17724188c03f97577189ce328f942e9c",
+      "experiment_count": 10,
+      "candidate_seed_run_count": 195,
+      "manifest_file_count": 8776
+    },
+    "spend_openhands": {
+      "kind": "experiment",
+      "path": "workspace/stage2/experiments/s2-1344b60559f72695ef85",
+      "source_id": "openhands_archive_trajectory_v3",
+      "source_descriptor_hash": "b9242d9a2f7ee8232eb273fa80b6135e87c62e891f1f2f7a78db1300d208011f",
+      "run_id": "1344b60559f72695ef85a5c7",
+      "artifact_id": "ef1660b24d1cd5965101d4ad9b50636d36023b6c8ac857990172c5c00b19769b",
+      "results_payload_sha256": "b7ecab7f96c3c68b746db7a556a3a1401374c92be73e89478a3c11116b46d90c",
+      "base_dataset_id": "c9548f8ed397953c1220efd2cfcee7f811cc9dd693e3c9ca363f20b8f4d4141c",
+      "derived_dataset_id": "d9b317bbb6eeb0579f4e745d3cce8d1534949f8d3dc202ee5abdb5b28d0c5c05",
+      "development_dataset_id": "8f2f70ba020649fd56e5669539a3c24763c4a9e24783ccc1823d971640b1a37a",
+      "development_protocol_id": "6b61bcb993f79ce416a68addc3ec58e765a87630bd6d051b41c62d8932da0ba6",
+      "matrix_id": "62e2c75d3967f7dbe5641b6dea7e6c8cc1a1772534bb5b983d05f7f15187c3ed",
+      "experiment_count": 2,
+      "candidate_seed_run_count": 39,
+      "manifest_file_count": 1756
+    },
+    "bagen_sokoban_compatibility": {
+      "kind": "audit",
+      "path": "workspace/stage2/experiments/s2-fe1659fe753f635ba4cf",
+      "source_id": "bagen_sokoban_dialogues_v1",
+      "source_descriptor_hash": "b76215d4d686bfeabf37092b73ae93407fe20db898932019248b182fa092cc45",
+      "run_id": "fe1659fe753f635ba4cf6e37",
+      "artifact_id": "73016c8c32fba8885af07b49061bc649d786a4bae4362af51143f2ea9ecd6d26",
+      "results_payload_sha256": "f49ee5fe9fb54c09d9435f220074b8ccf327048e3290716ad6a22f6f7ab61b0c",
+      "stage1_artifact_id": "d26969603582ff590a6193234e17d39e6f0697a8e36e08a559549d0a45597afe",
+      "stage1_bundle_count": 20,
+      "stage1_parity_record_count": 992,
+      "stage1_parity_mismatch_count": 0,
+      "manifest_file_count": 1
+    }
+  },
+  "totals": {
+    "experiment_artifact_count": 4,
+    "audit_artifact_count": 1,
+    "experiment_count": 15,
+    "candidate_seed_run_count": 282,
+    "reloadable_candidate_seed_run_count": 195,
+    "exact_reload_fold_count": 975,
+    "manifest_file_count": 12665
+  },
+  "report": {
+    "path": "docs/stage-2-report.md",
+    "sha256": "aa41ab4a2bb1e3de6b95161bc30a11c153ed4fe8e51403ffbbb774c0dfe322da"
+  }
+}

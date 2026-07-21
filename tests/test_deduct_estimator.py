@@ -370,6 +370,32 @@ class DeductOnlyEstimatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Task-update"):
             DeductOnlyEstimator().fit(wrong_position, wrong_position, FitContext(1, 0))
 
+    def test_provider_accounted_target_uses_the_same_within_cell_algebra(self) -> None:
+        target = PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
+        base = _view()
+        examples = tuple(
+            replace(
+                example,
+                point=replace(example.point, target=target, known_offset_tokens=0),
+            )
+            for example in base.examples
+        )
+        view = replace(base, target=target, examples=examples)
+        fitted = DeductOnlyEstimator().fit(
+            view,
+            view,
+            FitContext(seed=7, fold=0, interval_alpha=0.5),
+        )
+        session = fitted.start(RunContext("task", "trajectory", "run"))
+        first_point = replace(_point(1, offset=0), target=target)
+        first = session.predict(first_point)
+        session.observe(ObservedTransition(first.point_id, "point-2", 30))
+        second = session.predict(replace(_point(2, offset=0), target=target))
+        self.assertEqual(
+            (second.lower, second.point, second.upper),
+            (70.0, 170.0, 270.0),
+        )
+
     def test_forecast_has_no_evaluation_label_dependency(self) -> None:
         point = _point(1, offset=10)
         low_label = DatasetRow(point, 1, LabelStatus.OBSERVED)

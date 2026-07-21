@@ -188,7 +188,7 @@ class FittedDeductOnly:
 
 
 class DeductOnlyEstimator:
-    """Mechanical, within-cell baseline for Task-update unknown-remaining tokens.
+    """Mechanical, within-cell baseline for Task-update remaining-token targets.
 
     ``ExperimentRunner`` evaluates one position at a time, so a Task-update slice
     does not contain the trajectory's Task-pre forecast. Consequently the first
@@ -221,9 +221,14 @@ class DeductOnlyEstimator:
     ) -> FittedDeductOnly:
         if train.position != PredictionPosition.TASK_UPDATE:
             raise ValueError("deduct_only supports only the Task-update position")
-        if train.target != PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS:
+        supported_targets = {
+            PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS,
+            PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS,
+        }
+        if train.target not in supported_targets:
             raise ValueError(
-                "deduct_only supports only task_unknown_remaining_tokens"
+                "deduct_only supports only Task-update provider-accounted or "
+                "request-local unknown remaining tokens"
             )
         if validation.dataset_id != train.dataset_id:
             raise ValueError("train and validation views belong to different datasets")

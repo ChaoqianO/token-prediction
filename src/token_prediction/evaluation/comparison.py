@@ -28,6 +28,7 @@ class CandidateResultLike(Protocol):
     candidate_id: str
     predictions: Sequence[PredictionRecordLike]
     comparability_key: tuple[str, ...]
+    task_metrics: Mapping[str, Mapping[str, float | int]]
 
 
 PredictionInput = CandidateResultLike | Sequence[PredictionRecordLike]
@@ -253,6 +254,111 @@ def paired_task_bootstrap(
         candidate_id=candidate_resolved.candidate_id,
         reference_id=reference_resolved.candidate_id,
         n_points=len(candidate_points),
+        n_tasks=n_tasks,
+        iterations=iterations,
+        seed=seed,
+        candidate_mae=candidate_mae,
+        reference_mae=reference_mae,
+        mae_delta=observed_delta,
+        mae_delta_ci_lower=_percentile(deltas, 0.025),
+        mae_delta_ci_upper=_percentile(deltas, 0.975),
+        candidate_win_probability=wins / iterations,
+    )
+
+
+def paired_task_metric_bootstrap(
+    candidate: CandidateResultLike,
+    reference: CandidateResultLike,
+    *,
+    iterations: int = 10_000,
+    seed: int = 0,
+) -> PairedBootstrapComparison:
+    """Paired task bootstrap from label-free task aggregate metrics.
+
+    ``CandidateResult.task_metrics`` retains each task's weight sum and weighted
+    MAE, so the exact weighted absolute-error numerator can be reconstructed
+    without serializing point labels.
+    """
+
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+        raise ValueError("iterations must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+    if candidate.comparability_key != reference.comparability_key:
+        raise ValueError("candidate results are not from the same experiment cohort")
+    if not candidate.candidate_id or not reference.candidate_id:
+        raise ValueError("candidate ids must be non-empty")
+    if not candidate.task_metrics or not reference.task_metrics:
+        raise ValueError("paired task comparison requires task metrics")
+    if set(candidate.task_metrics) != set(reference.task_metrics):
+        raise ValueError("candidate and reference task cohorts differ")
+
+    totals: list[_TaskErrorTotals] = []
+    n_points = 0
+    for task_id in sorted(candidate.task_metrics):
+        candidate_metrics = candidate.task_metrics[task_id]
+        reference_metrics = reference.task_metrics[task_id]
+        required = {"n_points", "weight_sum", "weighted_mae"}
+        if not required <= set(candidate_metrics) or not required <= set(reference_metrics):
+            raise ValueError("task metrics are missing paired-comparison fields")
+        candidate_points = candidate_metrics["n_points"]
+        reference_points = reference_metrics["n_points"]
+        if (
+            isinstance(candidate_points, bool)
+            or not isinstance(candidate_points, int)
+            or candidate_points <= 0
+            or candidate_points != reference_points
+        ):
+            raise ValueError("paired task point counts must be equal and positive")
+        candidate_weight = float(candidate_metrics["weight_sum"])
+        reference_weight = float(reference_metrics["weight_sum"])
+        candidate_mae = float(candidate_metrics["weighted_mae"])
+        reference_mae = float(reference_metrics["weighted_mae"])
+        if (
+            not math.isfinite(candidate_weight)
+            or candidate_weight <= 0
+            or candidate_weight != reference_weight
+            or not math.isfinite(candidate_mae)
+            or candidate_mae < 0
+            or not math.isfinite(reference_mae)
+            or reference_mae < 0
+        ):
+            raise ValueError("paired task weights and MAE values are invalid")
+        totals.append(
+            _TaskErrorTotals(
+                weight=candidate_weight,
+                candidate_absolute_error=candidate_weight * candidate_mae,
+                reference_absolute_error=reference_weight * reference_mae,
+            )
+        )
+        n_points += candidate_points
+
+    total_weight = sum(task.weight for task in totals)
+    candidate_mae = sum(task.candidate_absolute_error for task in totals) / total_weight
+    reference_mae = sum(task.reference_absolute_error for task in totals) / total_weight
+    observed_delta = candidate_mae - reference_mae
+    rng = random.Random(seed)
+    deltas: list[float] = []
+    wins = 0
+    n_tasks = len(totals)
+    for _ in range(iterations):
+        sampled = [totals[rng.randrange(n_tasks)] for _ in range(n_tasks)]
+        replicate_weight = sum(task.weight for task in sampled)
+        replicate_candidate = (
+            sum(task.candidate_absolute_error for task in sampled) / replicate_weight
+        )
+        replicate_reference = (
+            sum(task.reference_absolute_error for task in sampled) / replicate_weight
+        )
+        delta = replicate_candidate - replicate_reference
+        deltas.append(delta)
+        if delta < 0:
+            wins += 1
+    deltas.sort()
+    return PairedBootstrapComparison(
+        candidate_id=candidate.candidate_id,
+        reference_id=reference.candidate_id,
+        n_points=n_points,
         n_tasks=n_tasks,
         iterations=iterations,
         seed=seed,
