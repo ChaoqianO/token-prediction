@@ -152,26 +152,38 @@ statistics because they are not fields in the pinned aggregate audit.
 
 ## Commit-bound empirical development baseline
 
-The first source-reproducible post-handoff prediction baseline was produced
+The current source-reproducible post-handoff prediction baseline was produced
 from clean commit
-`042fddb172d912a109ea66be9695a2185db29449`. Its complete runner-and-package
+`23955dcd815144a5aee1c3c088be172fcfe27cca`. Its complete runner-and-package
 code tree contains 42 Git blobs and has SHA256
-`162444d699c7fba7d63390d72997876e1b9f9aab35a69f4e6dab925d2f4a4d22`.
-Its operator-observed wall-clock time was 811.7 seconds after verifying both
+`8373e5041509a1b04f23bf416d2c1274f40876e6b11a767b4ed536ce756e81cf`.
+Its operator-observed wall-clock time was 820.2 seconds after verifying both
 raw sources before and after model construction. Wall-clock timings are run
 notes, not fields authenticated by the artifact lock.
 
+This v2 run supersedes, but does not overwrite, the immutable v1 artifact at
+`workspace/data_foundation/baselines/empirical-development-v1` (artifact ID
+`c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f`). The
+v2 development dataset identity hashes only development-cohort rows plus the
+source descriptor/capability and task-only holdout assignment. The full source
+dataset ID remains separate provenance; final-holdout labels/status therefore
+cannot alter a development split, bundle, forecast, or model identity. The v1
+and v2 numerical prediction projections are byte-semantically equal across all
+15,846 evaluation records, with SHA256
+`2cfb8f5f2e4e71d4282a3afd69b62237bfd94af017a732254c1ec35b7ac57ca5`;
+their aggregate metrics are also exactly equal.
+
 The ignored artifact is
-`workspace/data_foundation/baselines/empirical-development-v1`; the tracked,
+`workspace/data_foundation/baselines/empirical-development-v2`; the tracked,
 aggregate-only identity lock is
 `configs/data_foundation_prediction_baseline.json`. The frozen identities are:
 
 | Identity | Value |
 | --- | --- |
-| Artifact ID | `c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f` |
-| Manifest SHA256 | `609b3c22760fd06e6b9ed0e7a7121a4d18aee089d9e52e9898d986aec731b019` |
-| Results file SHA256 | `39ba0f9926d5959d86f18f205b848ef0bd7dc92c52ac7480674fce9658e1f50e` |
-| Results payload SHA256 | `cde65ebbf7035d21c46a70625a68a44a1bed836585d65698355ab7d1271d811e` |
+| Artifact ID | `e81a4bf777076c7bd7f00695f66053b91d2da620a4e326da168629750bb74fd5` |
+| Manifest SHA256 | `28777b478215f3cefb57978fbaef273a641128f51febd0be6ea7049a15b7d95f` |
+| Results file SHA256 | `df908c4496f7dca3ab0347be62789b0fcc3bc2384329b9796cdf5264cc5d55e6` |
+| Results payload SHA256 | `d6193be10a1398d7b5ab87743522b98aab12c9013459e3ba9df3aa39abad0626` |
 | Aggregate metrics SHA256 | `484391e623249466ded342cbf6be824a01a5aabe133b45ff1ca1eed61bfe4b5b` |
 | Verified contents | 90 bundles; 6 estimable cells; 4 gated conditions; 5,282 scored development points per seed and 15,846 three-seed evaluation records |
 
@@ -214,11 +226,20 @@ verification use:
 
 ```powershell
 python scripts/run_data_foundation_baseline.py
+python scripts/verify_data_foundation_prediction_lock.py --tracked-only
 python scripts/verify_data_foundation_prediction_lock.py `
   --require-workspace-source-match
 ```
 
-The verifier rejects a dirty or mismatched tracked runner/control tree,
+CI runs the tracked-only command after fetching complete Git history. It reads
+the production lock, verifies its exact frozen protocol and Data Foundation
+cross-bindings, and reconstructs the pinned runner/source blobs and tracked
+controls without requiring ignored raw data or model artifacts. Synthetic CI
+tests exercise bundle reload and tamper parity. The second command is the
+local production-artifact attestation over all 90 ignored bundles; CI does not
+claim to download or replay that unredistributed artifact.
+
+The full verifier rejects a dirty or mismatched tracked runner/control tree,
 absolute or traversal paths, reparse points, symlinks, missing or extra bundle
 files, non-regular filesystem nodes, modified hashes, split/weight
 inconsistencies, and any mismatch between the tracked lock and the complete

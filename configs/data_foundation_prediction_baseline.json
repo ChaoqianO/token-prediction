@@ -1,14 +1,14 @@
 {
   "artifact": {
-    "artifact_id": "c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f",
+    "artifact_id": "e81a4bf777076c7bd7f00695f66053b91d2da620a4e326da168629750bb74fd5",
     "artifact_schema_version": 1,
-    "baseline_id": "data_foundation_empirical_development_v1",
+    "baseline_id": "data_foundation_empirical_development_v2",
     "manifest_bytes": 15956,
-    "manifest_sha256": "609b3c22760fd06e6b9ed0e7a7121a4d18aee089d9e52e9898d986aec731b019",
-    "relative_path": "workspace/data_foundation/baselines/empirical-development-v1",
+    "manifest_sha256": "28777b478215f3cefb57978fbaef273a641128f51febd0be6ea7049a15b7d95f",
+    "relative_path": "workspace/data_foundation/baselines/empirical-development-v2",
     "results_bytes": 12904216,
-    "results_file_sha256": "39ba0f9926d5959d86f18f205b848ef0bd7dc92c52ac7480674fce9658e1f50e",
-    "results_payload_sha256": "cde65ebbf7035d21c46a70625a68a44a1bed836585d65698355ab7d1271d811e"
+    "results_file_sha256": "df908c4496f7dca3ab0347be62789b0fcc3bc2384329b9796cdf5264cc5d55e6",
+    "results_payload_sha256": "d6193be10a1398d7b5ab87743522b98aab12c9013459e3ba9df3aa39abad0626"
   },
   "conditions": {
     "condition_gate_policy_id": "frozen_condition_minimum_cohort_gate_v1",
@@ -40,7 +40,7 @@
     "final_holdout_bucket_threshold_exclusive": 2000,
     "independent_of_split_seed_labels_and_suffixes": true,
     "policy_id": "stable_task_sha256_bucket_v1",
-    "policy_payload_sha256": "b1ff0beb1ed0f34fcc6a54a027c6c477aadcc163fde7d9d0ac3cea1217ece674",
+    "policy_payload_sha256": "7375b64f3de5442704d796fcd663117268a4e3be1d78be936d3fb8402f4e2733",
     "salt": "token-prediction/final-holdout/2026-07-21/v1"
   },
   "lock_type": "data_foundation_prediction_baseline",
@@ -73,8 +73,8 @@
   "runner": {
     "code_blob_count": 42,
     "code_paths_sha256": "b62ee0c423cb6fba47af9a50ad802b69e4f91f4be55550f76cbd54d09c245ad5",
-    "code_tree_sha256": "162444d699c7fba7d63390d72997876e1b9f9aab35a69f4e6dab925d2f4a4d22",
-    "git_commit": "042fddb172d912a109ea66be9695a2185db29449",
+    "code_tree_sha256": "8373e5041509a1b04f23bf416d2c1274f40876e6b11a767b4ed536ce756e81cf",
+    "git_commit": "23955dcd815144a5aee1c3c088be172fcfe27cca",
     "runner_path": "scripts/run_data_foundation_baseline.py",
     "tracked_control_blob_count": 3,
     "tracked_control_paths_sha256": "fc70c518c608f50478d59e81ad29783bb94fd0bf365c782d2b39f4b929f02c8e",
