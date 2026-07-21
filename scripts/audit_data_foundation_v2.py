@@ -55,6 +55,7 @@ SPEND_DESCRIPTOR_SHA256 = (
 BAGEN_COMBINED_AUDIT_SHA256 = (
     "2d8f3abe10b526f80488554d672039c9f9bc81b31e230b7bb6b14c94b0ffaea5"
 )
+BAGEN_COMBINED_AUDIT_SOURCE_ID = "bagen_swebench_combined_audit_v1"
 BAGEN_MANIFEST_SHA256 = (
     "f5900dead3a32ca303d500f123ee96b89e6797527cbb99fef0cd9beaf2a00071"
 )
@@ -64,6 +65,9 @@ SPEND_ARCHIVE_SHA256 = (
 SPEND_ARCHIVE_BYTES = 2_908_192_516
 EXPECTED_BAGEN_TRAJECTORIES = 316
 EXPECTED_SPEND_TRAJECTORIES = 2_000
+SPEND_INVENTORY_SOURCE_ID = (
+    "spend_your_money/openhands_trajectories:gpt_5.2_4runs"
+)
 
 BUILD_COMMAND = (
     "$env:PYTHONPATH='src'; python scripts/audit_data_foundation_v2.py"
@@ -117,6 +121,17 @@ def _require_text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DataFoundationAuditError(f"{label} must be a non-empty string")
     return value
+
+
+def _require_source_id(
+    value: Mapping[str, Any],
+    *,
+    expected: str,
+    label: str,
+) -> None:
+    actual = _require_text(value.get("source_id"), f"{label}.source_id")
+    if actual != expected:
+        raise DataFoundationAuditError(f"{label} source_id mismatch")
 
 
 def _require_non_negative_int(value: Any, label: str) -> int:
@@ -656,8 +671,11 @@ def _family_raw_index(
         )
         audit_index[audit_relative] = (audit_bytes, audit_sha)
         audit = load_strict_json(audit_path, label=f"BAGEN family audit {family_name}")
-        if audit.get("source_id") != BagenSwebenchReader.source_id:
-            raise DataFoundationAuditError("BAGEN family audit source_id mismatch")
+        _require_source_id(
+            audit,
+            expected=BagenSwebenchReader.source_id,
+            label="BAGEN family audit",
+        )
         family_root = _canonical_relative_path(
             family.get("local_relative_root"),
             label=f"BAGEN family {family_name}.local_relative_root",
@@ -732,8 +750,11 @@ def load_bagen_source_summary(
     )
     combined = load_strict_json(combined_path, label="BAGEN combined audit")
     _verify_embedded_payload_hash(combined, label="BAGEN combined audit")
-    if combined.get("source_id") != BagenSwebenchReader.source_id:
-        raise DataFoundationAuditError("BAGEN combined audit source_id mismatch")
+    _require_source_id(
+        combined,
+        expected=BAGEN_COMBINED_AUDIT_SOURCE_ID,
+        label="BAGEN combined audit",
+    )
 
     manifest_info = _require_mapping(combined.get("manifest"), "BAGEN manifest")
     manifest_raw = _require_mapping(manifest_info.get("raw"), "BAGEN manifest.raw")
@@ -862,6 +883,11 @@ def load_spend_source_summary(
         label="Spend inventory",
     )
     inventory = load_strict_json(inventory_path, label="Spend inventory")
+    _require_source_id(
+        inventory,
+        expected=SPEND_INVENTORY_SOURCE_ID,
+        label="Spend inventory",
+    )
     if inventory.get("resolved_revision") != descriptor.revision:
         raise DataFoundationAuditError("Spend inventory revision mismatch")
     archive_relative = _canonical_relative_path(

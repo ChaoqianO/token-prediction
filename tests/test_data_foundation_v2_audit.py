@@ -9,10 +9,13 @@ import unittest
 from pathlib import Path
 
 from scripts.audit_data_foundation_v2 import (
+    BAGEN_COMBINED_AUDIT_SOURCE_ID,
+    SPEND_INVENTORY_SOURCE_ID,
     ArtifactEvidence,
     DataFoundationAuditError,
     _assert_aggregate_safe,
     _canonical_relative_path,
+    _require_source_id,
     _strict_json_loads,
     atomic_write_json,
     build_data_foundation_audit,
@@ -25,6 +28,7 @@ from scripts.audit_data_foundation_v2 import (
     verify_git_source_binding,
 )
 from tests.helpers import make_two_call_trajectory
+from token_prediction.collection import BagenSwebenchReader, OpenHandsArchiveReader
 from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
 
 
@@ -83,6 +87,59 @@ def _source_summary() -> dict[str, object]:
 
 
 class DataFoundationV2AuditTests(unittest.TestCase):
+    def test_artifact_source_ids_are_distinct_from_reader_source_ids(self) -> None:
+        self.assertNotEqual(
+            BAGEN_COMBINED_AUDIT_SOURCE_ID,
+            BagenSwebenchReader.source_id,
+        )
+        self.assertNotEqual(
+            SPEND_INVENTORY_SOURCE_ID,
+            OpenHandsArchiveReader.source_id,
+        )
+        accepted = (
+            (
+                {"source_id": BAGEN_COMBINED_AUDIT_SOURCE_ID},
+                BAGEN_COMBINED_AUDIT_SOURCE_ID,
+                "BAGEN combined audit",
+            ),
+            (
+                {"source_id": BagenSwebenchReader.source_id},
+                BagenSwebenchReader.source_id,
+                "BAGEN family audit",
+            ),
+            (
+                {"source_id": SPEND_INVENTORY_SOURCE_ID},
+                SPEND_INVENTORY_SOURCE_ID,
+                "Spend inventory",
+            ),
+            (
+                {"source_id": OpenHandsArchiveReader.source_id},
+                OpenHandsArchiveReader.source_id,
+                "Spend descriptor",
+            ),
+        )
+        for value, expected, label in accepted:
+            with self.subTest(label=label):
+                _require_source_id(value, expected=expected, label=label)
+
+        crossed = (
+            (
+                {"source_id": BagenSwebenchReader.source_id},
+                BAGEN_COMBINED_AUDIT_SOURCE_ID,
+                "BAGEN combined audit",
+            ),
+            (
+                {"source_id": OpenHandsArchiveReader.source_id},
+                SPEND_INVENTORY_SOURCE_ID,
+                "Spend inventory",
+            ),
+        )
+        for value, expected, label in crossed:
+            with self.subTest(label=f"crossed {label}"), self.assertRaisesRegex(
+                DataFoundationAuditError, "source_id mismatch"
+            ):
+                _require_source_id(value, expected=expected, label=label)
+
     def test_pure_single_source_audit_is_deterministic_and_aggregate_only(self) -> None:
         first_summary = _source_summary()
         second_summary = _source_summary()
