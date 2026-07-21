@@ -125,6 +125,18 @@ $env:PYTHONPATH = 'src'
 python scripts/audit_data_foundation_v2.py
 ```
 
+The frozen audit was then replayed by the independent lock verifier with both
+`--full-source-verify` and `--require-workspace-source-match`. That gate
+rehash-built both active datasets from raw storage, rechecked the frozen Git
+blobs, and had an operator-observed wall-clock time of 783.9 seconds with
+`raw_artifacts_rehashed=true`:
+
+```powershell
+python scripts/verify_data_foundation_baseline.py `
+  --full-source-verify `
+  --require-workspace-source-match
+```
+
 | Active source | Dataset ID | Rows | Tasks / trajectories / conditions | Observed / missing / censored / invalid |
 | --- | --- | ---: | --- | ---: |
 | BAGEN SWE v2 | `db2f5baf2f2139e25fb8479cd3b3c33c528961d04c930d93009755fcb889bd23` | 45,564 | 64 / 316 / 9 | 34,871 / 7,621 / 3,072 / 0 |
@@ -137,6 +149,79 @@ transition and may change within a trajectory. Configured metadata drift still
 fails closed, and source-reported zero-call tasks do not inherit another task's
 realized route identity. Exact route diagnostics are not promoted as frozen
 statistics because they are not fields in the pinned aggregate audit.
+
+## Commit-bound empirical development baseline
+
+The first source-reproducible post-handoff prediction baseline was produced
+from clean commit
+`042fddb172d912a109ea66be9695a2185db29449`. Its complete runner-and-package
+code tree contains 42 Git blobs and has SHA256
+`162444d699c7fba7d63390d72997876e1b9f9aab35a69f4e6dab925d2f4a4d22`.
+Its operator-observed wall-clock time was 811.7 seconds after verifying both
+raw sources before and after model construction. Wall-clock timings are run
+notes, not fields authenticated by the artifact lock.
+
+The ignored artifact is
+`workspace/data_foundation/baselines/empirical-development-v1`; the tracked,
+aggregate-only identity lock is
+`configs/data_foundation_prediction_baseline.json`. The frozen identities are:
+
+| Identity | Value |
+| --- | --- |
+| Artifact ID | `c5a4a7cd2c9a3ae6baf2b0c34245592a8ef633ccd98258561730fcd8e7aa510f` |
+| Manifest SHA256 | `609b3c22760fd06e6b9ed0e7a7121a4d18aee089d9e52e9898d986aec731b019` |
+| Results file SHA256 | `39ba0f9926d5959d86f18f205b848ef0bd7dc92c52ac7480674fce9658e1f50e` |
+| Results payload SHA256 | `cde65ebbf7035d21c46a70625a68a44a1bed836585d65698355ab7d1271d811e` |
+| Aggregate metrics SHA256 | `484391e623249466ded342cbf6be824a01a5aabe133b45ff1ca1eed61bfe4b5b` |
+| Verified contents | 90 bundles; 6 estimable cells; 4 gated conditions; 5,282 scored development points per seed and 15,846 three-seed evaluation records |
+
+The runner used the empirical-quantile candidate, five task-grouped folds,
+split seeds `20260719`, `20260720`, and `20260721`, task/run/point-equal
+weights, and task-max conformal calibration at alpha 0.1. The table reports
+the mean across the three split seeds; its prediction column is the three-seed
+total, not a count of unique points. The `final tasks` column records only the
+permanent task-hash partition size; those tasks were not predicted or scored.
+
+| Source | Condition ID | Position / target | Development / final tasks | Scored predictions (3-seed total) | MAE | WAPE | Point coverage | Task-simultaneous coverage |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| BAGEN SWE | `condition:54cb50fce273f0aa2d74` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 / 12 | 3,258 | 211,622.79 | 0.872549 | 0.968018 | 0.909091 |
+| BAGEN SWE | `condition:949ac3b7a342718cd505` | `task_update` / `task_provider_accounted_remaining_tokens` | 45 / 14 | 2,580 | 54,221.44 | 0.673281 | 0.977173 | 0.918519 |
+| BAGEN SWE | `condition:d94078c05d91b0d58aee` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 / 14 | 957 | 27,533.92 | 0.727881 | 0.961125 | 0.906977 |
+| BAGEN SWE | `condition:dce86ced00dc11c77205` | `task_update` / `task_provider_accounted_remaining_tokens` | 44 / 13 | 2,946 | 102,731.76 | 0.787336 | 0.970742 | 0.916667 |
+| BAGEN SWE | `condition:f95ae2a5e11682f6b7fc` | `task_update` / `task_provider_accounted_remaining_tokens` | 43 / 13 | 1,593 | 40,295.63 | 0.753741 | 0.951446 | 0.899225 |
+| Spend OpenHands | `condition:b407e0d1ec34f386ebc4` | `task_launch` / `task_total_accounted_tokens` | 397 / 103 | 4,512 | 750,412.13 | 0.544315 | 0.959558 | 0.906801 |
+
+Four sparse BAGEN configuration variants failed closed instead of pooling or
+reducing the fold count. Their eligible-task counts were 5, 5, 5, and 3; each
+had zero permanent-holdout tasks under the frozen task-hash policy, so all four
+were recorded as `not_estimable` with zero predictions and zero bundles.
+
+| Gated condition ID | Eligible / development / final tasks | Eligible points | Reason | Predictions / bundles | Target values used |
+| --- | ---: | ---: | --- | ---: | --- |
+| `condition:20f615a22697984db6cc` | 5 / 5 / 0 | 95 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
+| `condition:562b4f6934238e459db9` | 5 / 5 / 0 | 181 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
+| `condition:686d78e7865f5e646e0b` | 5 / 5 / 0 | 103 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
+| `condition:8fe0be8b5f924006a166` | 3 / 3 / 0 | 49 | insufficient tasks for frozen five-fold CV and holdout policy | 0 / 0 | false |
+
+The permanent final holdout remains sealed for fitting, calibration,
+prediction, scoring, and model selection:
+`final_holdout_evaluated=false`, `final_holdout_prediction_count=0`, and
+`final_holdout_target_values_used_for_fit_calibration_scoring=false`. This
+artifact is a reproducible development baseline, not final model selection or
+a final-holdout result. Cohort membership and task counts were inspected to
+enforce partition disjointness and the condition gate. Build and reload
+verification use:
+
+```powershell
+python scripts/run_data_foundation_baseline.py
+python scripts/verify_data_foundation_prediction_lock.py `
+  --require-workspace-source-match
+```
+
+The verifier rejects a dirty or mismatched tracked runner/control tree,
+absolute or traversal paths, reparse points, symlinks, missing or extra bundle
+files, modified hashes, split/weight inconsistencies, and any mismatch between
+the tracked lock and the complete calibrated artifact trajectory.
 
 ## Historical Stage 1 artifact
 
@@ -253,8 +338,8 @@ imports both package metadata and the CLI.
 ## Data-handling boundary
 
 Public availability is not a redistribution license. Raw trajectories,
-archives, record-level derivatives, baseline bundles, and generated baseline
-bindings stay under ignored `workspace/` storage. Only aggregate counts,
-relative repository paths, revisions, and cryptographic identities appear in
-this report. Publication or redistribution remains gated on independent
-license and dataset-terms review.
+archives, record-level derivatives, baseline bundles, and full generated
+artifacts stay under ignored `workspace/` storage. The tracked prediction lock
+contains only aggregate counts, relative repository paths, revisions, and
+cryptographic identities. Publication or redistribution remains gated on
+independent license and dataset-terms review.
