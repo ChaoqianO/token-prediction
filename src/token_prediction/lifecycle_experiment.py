@@ -41,6 +41,7 @@ from token_prediction.estimators import (
     TrainingExample,
     TrainingView,
 )
+from token_prediction.estimators.gru_bundle import GRU_BUNDLE_FORMAT
 from token_prediction.evaluation import (
     METRIC_SUITE_ID,
     CalibrationExample,
@@ -487,6 +488,46 @@ def _updater_payload_files(
         calibrator=calibrator,
         provenance=provenance,
     )
+    if estimator_id == "gru_residual":
+        standalone = {
+            name.removeprefix("bundle/"): payload
+            for name, payload in files.items()
+            if name.startswith("bundle/")
+        }
+        try:
+            manifest = json.loads(standalone["manifest.json"].decode("utf-8"))
+            component_path = manifest["component"]["path"]
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TypeError("GRU updater bundle manifest is invalid") from exc
+        if not isinstance(component_path, str) or not component_path.startswith(
+            "components/"
+        ):
+            raise TypeError("GRU updater bundle component path is invalid")
+        expected = {
+            "manifest.json",
+            "manifest.sha256",
+            "calibrator.json",
+            f"{component_path}/component.json",
+            f"{component_path}/encoder.json",
+            f"{component_path}/architecture.json",
+            f"{component_path}/weights.safetensors",
+        }
+        if set(standalone) != expected:
+            raise TypeError("GRU updater did not produce a reloadable neural bundle")
+        embedded = {
+            "gru/manifest.json": standalone["manifest.json"],
+            "gru/manifest.sha256": standalone["manifest.sha256"],
+            "gru/calibrator.json": standalone["calibrator.json"],
+            "gru/component.json": standalone[f"{component_path}/component.json"],
+            "gru/encoder.json": standalone[f"{component_path}/encoder.json"],
+            "gru/architecture.json": standalone[
+                f"{component_path}/architecture.json"
+            ],
+            "gru/weights.safetensors": standalone[
+                f"{component_path}/weights.safetensors"
+            ],
+        }
+        return GRU_BUNDLE_FORMAT, artifact, embedded
     return OPAQUE_AUDIT_FORMAT, artifact, files
 
 
@@ -819,7 +860,7 @@ def _validate_inputs(
     if split_plan.dataset_id != dataset.dataset_id:
         raise ValueError("split plan belongs to another dataset")
     if split_plan.folds != 5:
-        raise ValueError("Stage 2 lifecycle CV requires exactly five outer folds")
+        raise ValueError("lifecycle CV requires exactly five outer folds")
     if split_plan.seed != seed:
         raise ValueError("lifecycle model seed must match the outer split seed")
     if lifecycle_slice.dataset_id != dataset.dataset_id:
@@ -837,7 +878,7 @@ def _validate_inputs(
     if lifecycle_slice.input_contract_hash not in allowed_input_contract_hashes:
         raise ValueError("lifecycle input contract differs from its capability contract")
     if lifecycle_slice.target != PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS:
-        raise ValueError("Stage 2 lifecycle CV requires the provider-accounted Task target")
+        raise ValueError("lifecycle CV requires the provider-accounted Task target")
     if candidate.graph is None or not candidate.graph.is_lifecycle:
         raise ValueError("lifecycle CV requires an initializer/updater candidate graph")
     if candidate.graph.lifecycle_schema_id != TASK_LIFECYCLE_SCHEMA_ID:
@@ -846,14 +887,15 @@ def _validate_inputs(
         raise ValueError("candidate seed policy does not match the crossfit runtime")
     if candidate.graph.inner_split_policy_id != INNER_FOLD_POLICY_ID:
         raise ValueError("candidate inner split policy does not match the runtime")
+    allowed_updaters = frozenset({"cross_position_deduct", "gru_residual"})
     if (
         candidate.graph.initializer_estimator_id != "empirical_quantile"
-        or candidate.graph.updater_estimator_id != "cross_position_deduct"
-        or candidate.estimator_id != "cross_position_deduct"
+        or candidate.graph.updater_estimator_id not in allowed_updaters
+        or candidate.estimator_id != candidate.graph.updater_estimator_id
     ):
         raise ValueError(
-            "Stage 2 lifecycle CV requires the reloadable "
-            "empirical_quantile -> cross_position_deduct DAG"
+            "lifecycle CV requires a reloadable empirical_quantile initializer "
+            "and an explicitly supported updater DAG"
         )
     if any(
         sequence.steps[0].loss_mask

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -61,6 +62,9 @@ from tests.helpers import make_two_call_trajectory
 
 
 TARGET = PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
+HAS_NEURAL = bool(
+    importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors")
+)
 
 
 def _descriptor() -> SourceDescriptor:
@@ -345,6 +349,67 @@ class LifecycleExperimentTests(unittest.TestCase):
             {step.point.point_id for step in self.lifecycle.scored_steps},
         )
         self.assertEqual(len(self.empirical_result.fold_artifacts), 5)
+
+    @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
+    def test_gru_lifecycle_bundle_reloads_complete_calibrated_trajectories(self) -> None:
+        candidate = CandidateSpec(
+            candidate_id="gru-residual-small",
+            estimator_id="gru_residual",
+            feature_set=FULL_FEATURE_SET,
+            params={
+                "transition_dim": 8,
+                "hidden_dim": 8,
+                "residual_head_dim": 8,
+                "max_epochs": 2,
+                "patience": 1,
+            },
+            graph=CandidateGraph(
+                initializer_estimator_id="empirical_quantile",
+                updater_estimator_id="gru_residual",
+                lifecycle_schema_id=TASK_LIFECYCLE_SCHEMA_ID,
+                seed_policy_id=SEED_POLICY_ID,
+                inner_split_policy_id=INNER_FOLD_POLICY_ID,
+            ),
+        )
+        result = run_lifecycle_candidate_cv(
+            self.dataset,
+            self.lifecycle,
+            self.split_plan,
+            candidate,
+            builtin_registry(),
+            alpha=0.10,
+            calibrator_id="task_max_conformal",
+            seed=self.split_plan.seed,
+            inner_plans=self.inner_plans,
+            source_provenance=self.source_provenance,
+        )
+        self.assertEqual(
+            {record.point_id for record in result.predictions},
+            {step.point.point_id for step in self.lifecycle.scored_steps},
+        )
+        for artifact in result.fold_artifacts:
+            loaded = load_lifecycle_bundle(
+                dict(artifact.bundle_files or {}),
+                expected_source_provenance=self.source_provenance,
+            )
+            test_tasks = self.split_plan.partition(artifact.fold).test_tasks
+            sequences = tuple(
+                sequence
+                for sequence in self.lifecycle.sequences
+                if sequence.task_id in test_tasks
+            )
+            replay = loaded.run_calibrated(sequences)
+            expected = {
+                record.point_id: record.forecast
+                for record in result.predictions
+                if record.fold == artifact.fold
+            }
+            actual = {
+                prediction.step.point.point_id: prediction.forecast
+                for run in replay
+                for prediction in run.scored_predictions
+            }
+            self.assertEqual(actual, expected)
 
     def test_experiment_runner_routes_mixed_point_and_lifecycle_candidates(self) -> None:
         lifecycle_candidate = CandidateSpec(

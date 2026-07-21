@@ -1,8 +1,8 @@
-"""Strict persistence for Stage 2 lifecycle composite estimators.
+"""Strict persistence for lifecycle composite estimators.
 
-The loader intentionally supports only the fully specified Stage 2 baseline:
-five empirical Task-pre initializers, a cross-position Deduct updater, and a
-fitted interval calibrator.  Unknown component formats fail closed.
+The loader supports the frozen empirical Task-pre initializer ensemble with
+either the mechanical cross-position Deduct updater or the Stage 3 GRU
+residual updater.  Unknown component formats fail closed.
 """
 
 from __future__ import annotations
@@ -42,6 +42,12 @@ from token_prediction.development import OUTER_FOLDS
 from token_prediction.estimators import RunContext, SessionSeed, TokenForecast
 from token_prediction.estimators.cross_position_deduct import (
     FittedCrossPositionDeduct,
+)
+from token_prediction.estimators.gru import FittedGRUResidual
+from token_prediction.estimators.gru_bundle import (
+    GRUBundleError,
+    GRU_BUNDLE_FORMAT,
+    load_gru_bundle,
 )
 from token_prediction.evaluation import FittedExpansionCalibrator
 from token_prediction.features import FEATURE_SCHEMA_VERSION, FeatureGroup, FeatureSet
@@ -758,7 +764,7 @@ class LoadedLifecycleBundle:
     manifest: Mapping[str, Any]
     feature_set: FeatureSet
     initializers: tuple[LoadedInitializer, ...]
-    updater: FittedCrossPositionDeduct
+    updater: FittedCrossPositionDeduct | FittedGRUResidual
     calibrator: FittedExpansionCalibrator
 
     def _initializer_point(self, point: PredictionPoint) -> PredictionPoint:
@@ -1092,14 +1098,16 @@ def load_lifecycle_bundle(
     _string(manifest["condition_id"], description="manifest condition id")
     graph = _mapping(manifest["candidate_graph"], description="candidate graph")
     _keys(graph, _CANDIDATE_GRAPH_KEYS, description="candidate graph")
-    expected_graph = {
-        "initializer_estimator_id": "empirical_quantile",
-        "updater_estimator_id": "cross_position_deduct",
-        "lifecycle_schema_id": _TASK_LIFECYCLE_SCHEMA_ID,
-        "seed_policy_id": SEED_POLICY_ID,
-        "inner_split_policy_id": INNER_FOLD_POLICY_ID,
-    }
-    if dict(graph) != expected_graph:
+    if dict(graph) not in (
+        {
+            "initializer_estimator_id": "empirical_quantile",
+            "updater_estimator_id": updater_id,
+            "lifecycle_schema_id": _TASK_LIFECYCLE_SCHEMA_ID,
+            "seed_policy_id": SEED_POLICY_ID,
+            "inner_split_policy_id": INNER_FOLD_POLICY_ID,
+        }
+        for updater_id in ("cross_position_deduct", "gru_residual")
+    ):
         raise LifecycleBundleError("unsupported lifecycle candidate graph")
     descriptor_document = _mapping(
         manifest["source_descriptor"], description="manifest source descriptor"
@@ -1378,17 +1386,103 @@ def load_lifecycle_bundle(
     )
     if updater_descriptor.get("role") != "lifecycle_updater":
         raise LifecycleBundleError("updater component role is invalid")
-    if updater_descriptor.get("serialization_format") != CROSS_POSITION_DEDUCT_FORMAT:
-        raise LifecycleBundleError("unsupported lifecycle updater component")
-    if updater_descriptor.get("estimator_id") != "cross_position_deduct":
-        raise LifecycleBundleError("updater estimator id is invalid")
+    updater_format = updater_descriptor.get("serialization_format")
+    updater_id = updater_descriptor.get("estimator_id")
     if updater_descriptor.get("candidate_hash") != manifest["candidate_hash"]:
         raise LifecycleBundleError("updater candidate identity differs from manifest")
     if updater_descriptor.get("outer_fold") != manifest["outer_fold"]:
         raise LifecycleBundleError("updater outer fold differs from manifest")
-    if set(updater_payloads) != {"state.json"}:
-        raise LifecycleBundleError("cross-position updater state files are invalid")
-    updater = _load_cross_position_state(updater_payloads["state.json"])
+    if updater_format == CROSS_POSITION_DEDUCT_FORMAT and updater_id == "cross_position_deduct":
+        if set(updater_payloads) != {"state.json"}:
+            raise LifecycleBundleError("cross-position updater state files are invalid")
+        updater: FittedCrossPositionDeduct | FittedGRUResidual = (
+            _load_cross_position_state(updater_payloads["state.json"])
+        )
+    elif updater_format == GRU_BUNDLE_FORMAT and updater_id == "gru_residual":
+        expected_embedded = {
+            "gru/manifest.json",
+            "gru/manifest.sha256",
+            "gru/calibrator.json",
+            "gru/component.json",
+            "gru/encoder.json",
+            "gru/architecture.json",
+            "gru/weights.safetensors",
+        }
+        if set(updater_payloads) != expected_embedded:
+            raise LifecycleBundleError("GRU updater bundle files are invalid")
+        try:
+            embedded_manifest = json.loads(
+                updater_payloads["gru/manifest.json"].decode("utf-8")
+            )
+            component_path = embedded_manifest["component"]["path"]
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LifecycleBundleError("GRU updater manifest is invalid") from exc
+        if not isinstance(component_path, str):
+            raise LifecycleBundleError("GRU updater component path is invalid")
+        nested = {
+            "manifest.json": updater_payloads["gru/manifest.json"],
+            "manifest.sha256": updater_payloads["gru/manifest.sha256"],
+            "calibrator.json": updater_payloads["gru/calibrator.json"],
+            f"{component_path}/component.json": updater_payloads[
+                "gru/component.json"
+            ],
+            f"{component_path}/encoder.json": updater_payloads["gru/encoder.json"],
+            f"{component_path}/architecture.json": updater_payloads[
+                "gru/architecture.json"
+            ],
+            f"{component_path}/weights.safetensors": updater_payloads[
+                "gru/weights.safetensors"
+            ],
+        }
+        nested_calibrator = nested.get("calibrator.json")
+        if nested_calibrator is None or not nested_calibrator.endswith(b"\n"):
+            raise LifecycleBundleError(
+                "GRU updater calibrator differs from lifecycle calibrator"
+            )
+        nested_calibrator_document = _parse_json(
+            nested_calibrator[:-1],
+            description="nested GRU calibrator",
+        )
+        lifecycle_calibrator_document = _parse_json(
+            files[_CALIBRATOR],
+            description="lifecycle calibrator",
+        )
+        if _canonical_json_bytes(nested_calibrator_document) != _canonical_json_bytes(
+            lifecycle_calibrator_document
+        ):
+            raise LifecycleBundleError(
+                "GRU updater calibrator differs from lifecycle calibrator"
+            )
+        expected_updater_provenance = {
+            "role": "lifecycle_updater",
+            "candidate_id": manifest["candidate_id"],
+            "candidate_hash": manifest["candidate_hash"],
+            "candidate_graph": dict(graph),
+            "dataset_id": manifest["dataset_id"],
+            "split_plan_id": manifest["split_plan_id"],
+            "eligibility_hash": manifest["eligibility_hash"],
+            "lifecycle_context_hash": manifest["lifecycle_context_hash"],
+            "lifecycle_scored_hash": manifest["lifecycle_scored_hash"],
+            "outer_fold": manifest["outer_fold"],
+            "outer_task_partitions_sha256": manifest[
+                "outer_task_partitions_sha256"
+            ],
+            "initializer_hash": manifest["initializer_hash"],
+            "inner_split_id": manifest["inner_split_id"],
+            "seed_set_hash": manifest["seed_set_hash"],
+            "interval_alpha": manifest["interval_alpha"],
+            "calibrator_id": manifest["calibrator_id"],
+        }
+        try:
+            updater = load_gru_bundle(
+                nested,
+                expected_provenance=expected_updater_provenance,
+                apply_calibrator=False,
+            )
+        except GRUBundleError as exc:
+            raise LifecycleBundleError("GRU updater bundle is invalid") from exc
+    else:
+        raise LifecycleBundleError("unsupported lifecycle updater component")
     if (
         updater.dataset_id != manifest["dataset_id"]
         or updater.condition_id != manifest["condition_id"]
@@ -1409,6 +1503,7 @@ def load_lifecycle_bundle(
 __all__ = [
     "CROSS_POSITION_DEDUCT_FORMAT",
     "EMPIRICAL_INITIALIZER_FORMAT",
+    "GRU_BUNDLE_FORMAT",
     "LIFECYCLE_COMPONENT_SCHEMA_VERSION",
     "LIFECYCLE_COMPOSITE_BUNDLE_SCHEMA_VERSION",
     "LifecycleBundleError",

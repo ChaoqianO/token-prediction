@@ -7,6 +7,7 @@ from .base import EstimatorFactory, TokenEstimator
 from .baselines import DirectFeatureEstimator, EmpiricalQuantileEstimator, LengthOnlyEstimator
 from .deduct import DeductOnlyEstimator
 from .cross_position_deduct import CrossPositionDeductEstimator
+from .gru import GRUResidualEstimator
 from .mlp import IndependentMLPQuantileEstimator
 
 
@@ -71,5 +72,9 @@ def builtin_registry() -> EstimatorRegistry:
     registry.register(
         "independent_mlp",
         lambda params: IndependentMLPQuantileEstimator(**params),
+    )
+    registry.register(
+        "gru_residual",
+        lambda params: GRUResidualEstimator(**params),
     )
     return registry
