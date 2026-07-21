@@ -286,41 +286,52 @@ class DataFoundationBaselineTests(unittest.TestCase):
         original_results, original_bundles = _build_results_for_datasets(
             bagen_dataset, spend_dataset
         )
-        plan = baseline.make_holdout_plan(bagen_dataset)
-        perturbed = replace(
-            bagen_dataset,
-            dataset_id="9" * 64,
-            rows=tuple(
-                replace(
-                    row,
-                    label=None,
-                    status=LabelStatus.MISSING,
-                    invalid_reason="final_holdout_redacted_for_regression_test",
+        cases = (
+            ("bagen_swebench", bagen_dataset, LabelStatus.MISSING, "9" * 64),
+            ("spend_openhands", spend_dataset, LabelStatus.CENSORED, "8" * 64),
+        )
+        for source_name, source_dataset, status, dataset_id in cases:
+            with self.subTest(source_name=source_name, status=status.value):
+                plan = baseline.make_holdout_plan(source_dataset)
+                perturbed = replace(
+                    source_dataset,
+                    dataset_id=dataset_id,
+                    rows=tuple(
+                        replace(
+                            row,
+                            label=None,
+                            status=status,
+                            invalid_reason=(
+                                "final_holdout_redacted_for_regression_test"
+                            ),
+                        )
+                        if row.point.task_id in plan.final_holdout_tasks
+                        else row
+                        for row in source_dataset.rows
+                    ),
                 )
-                if row.point.task_id in plan.final_holdout_tasks
-                else row
-                for row in bagen_dataset.rows
-            ),
-        )
-        perturbed_plan = baseline.make_holdout_plan(perturbed)
-        perturbed_results, perturbed_bundles = _build_results_for_datasets(
-            perturbed, spend_dataset
-        )
+                perturbed_plan = baseline.make_holdout_plan(perturbed)
+                perturbed_results, perturbed_bundles = _build_results_for_datasets(
+                    perturbed if source_name == "bagen_swebench" else bagen_dataset,
+                    perturbed if source_name == "spend_openhands" else spend_dataset,
+                )
 
-        self.assertEqual(
-            perturbed_plan.development_dataset_id,
-            plan.development_dataset_id,
-        )
-        self.assertEqual(perturbed_results["cells"], original_results["cells"])
-        self.assertEqual(
-            perturbed_results["not_estimable_conditions"],
-            original_results["not_estimable_conditions"],
-        )
-        self.assertEqual(
-            perturbed_results["condition_gate_policy"],
-            original_results["condition_gate_policy"],
-        )
-        self.assertEqual(perturbed_bundles, original_bundles)
+                self.assertEqual(
+                    perturbed_plan.development_dataset_id,
+                    plan.development_dataset_id,
+                )
+                self.assertEqual(
+                    perturbed_results["cells"], original_results["cells"]
+                )
+                self.assertEqual(
+                    perturbed_results["not_estimable_conditions"],
+                    original_results["not_estimable_conditions"],
+                )
+                self.assertEqual(
+                    perturbed_results["condition_gate_policy"],
+                    original_results["condition_gate_policy"],
+                )
+                self.assertEqual(perturbed_bundles, original_bundles)
 
     def test_test_fold_label_does_not_change_its_prediction(self) -> None:
         condition = next(iter({row.point.condition_id for row in self.development.rows}))
