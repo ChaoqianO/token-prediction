@@ -96,6 +96,48 @@ revisions and raw manifest hashes, but their new source IDs and capability
 contract hashes ensure that new dataset IDs cannot alias the historical
 canonical semantics.
 
+## Schema-v2 production freeze
+
+The active proxy-free/capability-gated data baseline is frozen in
+`configs/data_foundation_v2_baseline.json`. The full aggregate-only audit stays
+under the ignored path
+`workspace/data_foundation/data_foundation_v2_audit.json`; raw records and task
+identities are not copied into Git.
+
+The production build ran from commit
+`3d3edf3fdbd870300260a690b48313ce225c33f0`. Before reading data and again
+before publication, the audit proved that every relevant
+`src/token_prediction/**/*.py` file and the audit script were tracked and
+clean, then compared the workspace tree with the corresponding HEAD blobs.
+The resulting source-tree SHA256 is
+`ae5379cd0069069a69fa68fd0938f389628f210c82b5b8eae3863e612b3a99cf`.
+
+Two independent full runs from the raw manifest/archive completed in 790.3 and
+784.7 seconds. Their 80,115-byte outputs were byte-for-byte identical, with
+file SHA256
+`d2b316caac39f9912556b4242c156cca3bee7a17fbccf27101b9b5bafc221a19`
+and canonical payload SHA256
+`e58593a8edc6535a5838913eb25b125b7890be78f21a54d8a439babcfe308171`.
+The exact build command is:
+
+```powershell
+$env:PYTHONPATH = 'src'
+python scripts/audit_data_foundation_v2.py
+```
+
+| Active source | Dataset ID | Rows | Tasks / trajectories / conditions | Observed / missing / censored / invalid |
+| --- | --- | ---: | --- | ---: |
+| BAGEN SWE v2 | `db2f5baf2f2139e25fb8479cd3b3c33c528961d04c930d93009755fcb889bd23` | 45,564 | 64 / 316 / 9 | 34,871 / 7,621 / 3,072 / 0 |
+| Spend OpenHands v3 | `c9548f8ed397953c1220efd2cfcee7f811cc9dd693e3c9ca363f20b8f4d4141c` | 382,456 | 500 / 2,000 / 1 | 379,234 / 0 / 3,222 / 0 |
+
+The Spend v3 reader was additionally checked against the entire 2.9 GB
+archive. The configured execution condition remains a launch-time cohort,
+while realized provider/model routing is emitted only on each `api_completed`
+transition and may change within a trajectory. Configured metadata drift still
+fails closed, and source-reported zero-call tasks do not inherit another task's
+realized route identity. Exact route diagnostics are not promoted as frozen
+statistics because they are not fields in the pinned aggregate audit.
+
 ## Historical Stage 1 artifact
 
 The retained preliminary artifact is
@@ -125,7 +167,7 @@ reproducibility. The protocol records code hash
 `d03c979e6ac290089787456fee4258df073da014509812e3977d2fce28121fe8`,
 but no commit in the available repository history reconstructs that exact
 source set. The old source is therefore unrecoverable and the artifact must
-remain explicitly “unbound”. Its metrics cannot be promoted as a
+remain explicitly "unbound". Its metrics cannot be promoted as a
 commit-reproducible baseline. Exact compatibility also does not make the
 post-response proxy a valid online feature or constitute recovery of the old
 source.
