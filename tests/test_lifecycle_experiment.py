@@ -67,6 +67,10 @@ HAS_NEURAL = bool(
 )
 
 
+def _without_latency(forecast: TokenForecast) -> TokenForecast:
+    return replace(forecast, latency_ms=0.0)
+
+
 def _descriptor() -> SourceDescriptor:
     return SourceDescriptor(
         source_id="lifecycle-cv-fixture",
@@ -400,12 +404,12 @@ class LifecycleExperimentTests(unittest.TestCase):
             )
             replay = loaded.run_calibrated(sequences)
             expected = {
-                record.point_id: record.forecast
+                record.point_id: _without_latency(record.forecast)
                 for record in result.predictions
                 if record.fold == artifact.fold
             }
             actual = {
-                prediction.step.point.point_id: prediction.forecast
+                prediction.step.point.point_id: _without_latency(prediction.forecast)
                 for run in replay
                 for prediction in run.scored_predictions
             }
@@ -570,12 +574,12 @@ class LifecycleExperimentTests(unittest.TestCase):
             )
             replay = loaded.run_calibrated((sequence,))[0]
             expected = {
-                record.point_id: record.forecast
+                record.point_id: _without_latency(record.forecast)
                 for record in result.predictions
                 if record.fold == artifact.fold
             }
             self.assertEqual(
-                [item.forecast for item in replay.predictions],
+                [_without_latency(item.forecast) for item in replay.predictions],
                 [expected[item.step.point.point_id] for item in replay.predictions],
             )
 
@@ -694,16 +698,18 @@ class LifecycleExperimentTests(unittest.TestCase):
         self.assertEqual(len(offline.predictions), len(sequence.steps) - 1)
         self.assertFalse(offline.predictions[0].step.score_mask)
         self.assertEqual(
-            [item.forecast for item in offline.predictions],
-            [item.forecast for item in shadow.predictions],
+            [_without_latency(item.forecast) for item in offline.predictions],
+            [_without_latency(item.forecast) for item in shadow.predictions],
         )
+        self.assertTrue(all(item.forecast.latency_ms > 0 for item in offline.predictions))
+        self.assertTrue(all(item.forecast.latency_ms > 0 for item in shadow.predictions))
         expected = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in self.empirical_result.predictions
             if record.fold == fold
         }
         self.assertEqual(
-            [item.forecast for item in offline.predictions],
+            [_without_latency(item.forecast) for item in offline.predictions],
             [expected[item.step.point.point_id] for item in offline.predictions],
         )
 
@@ -742,12 +748,12 @@ class LifecycleExperimentTests(unittest.TestCase):
         )
         replay = loaded.run_calibrated((sequence,))[0]
         expected = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in result.predictions
             if record.fold == 0
         }
         self.assertEqual(
-            [item.forecast for item in replay.predictions],
+            [_without_latency(item.forecast) for item in replay.predictions],
             [expected[item.step.point.point_id] for item in replay.predictions],
         )
 
@@ -1081,12 +1087,12 @@ class LifecycleExperimentTests(unittest.TestCase):
             source_provenance=self.source_provenance,
         )
         baseline_fold = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in self.result.predictions
             if record.fold == fold
         }
         mutated_fold = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in mutated_result.predictions
             if record.fold == fold
         }
@@ -1135,12 +1141,12 @@ class LifecycleExperimentTests(unittest.TestCase):
             source_provenance=self.source_provenance,
         )
         baseline_forecasts = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in self.result.predictions
             if record.fold == fold
         }
         mutated_forecasts = {
-            record.point_id: record.forecast
+            record.point_id: _without_latency(record.forecast)
             for record in mutated_result.predictions
             if record.fold == fold
         }

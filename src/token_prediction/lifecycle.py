@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Callable, Literal, Mapping, Sequence
@@ -157,7 +158,10 @@ def run_lifecycle_sequence(
             observed_spend_tokens=visible_spend_delta(previous, step.point),
         )
         session.observe(transition)
+        started = time.perf_counter_ns()
         forecast = session.predict(selected)
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+        forecast = forecast.with_latency(elapsed_ms)
         predictions.append(LifecyclePrediction(step, forecast, transition))
         previous = step.point
     return LifecycleRun(sequence, runtime_mode, seed, tuple(predictions))

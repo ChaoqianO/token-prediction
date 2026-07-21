@@ -1293,16 +1293,18 @@ def run_lifecycle_candidate_cv(
             raise ValueError("lifecycle bundle reload changed the test trajectory count")
         for original_run, replayed_run in zip(test_runs, replayed_runs):
             expected_forecasts = tuple(
-                calibrator.transform(item.forecast)
-                for item in original_run.predictions
+                calibrator.transform(item.forecast) for item in original_run.predictions
             )
-            actual_forecasts = tuple(
-                item.forecast for item in replayed_run.predictions
-            )
-            if expected_forecasts != actual_forecasts:
-                raise ValueError(
-                    "lifecycle bundle reload changed a calibrated test trajectory"
-                )
+            actual_forecasts = tuple(item.forecast for item in replayed_run.predictions)
+            for expected, actual in zip(
+                expected_forecasts,
+                actual_forecasts,
+                strict=True,
+            ):
+                if replace(expected, latency_ms=actual.latency_ms) != actual:
+                    raise ValueError(
+                        "lifecycle bundle reload changed a calibrated test trajectory"
+                    )
         fold_artifacts.append(fold_artifact)
         fold_scored: list[ScoredForecast] = []
         for prediction in test_predictions:

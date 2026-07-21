@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import unittest
+from dataclasses import replace
 
 from token_prediction.dataset import (
     LIFECYCLE_SCHEMA_VERSION,
@@ -137,8 +138,14 @@ class LifecycleDriverTests(unittest.TestCase):
         )
         self.assertEqual(len(offline.scored_predictions), 1)
         self.assertEqual(
-            [item.forecast for item in offline.predictions],
-            [item.forecast for item in shadow.predictions],
+            [replace(item.forecast, latency_ms=0.0) for item in offline.predictions],
+            [replace(item.forecast, latency_ms=0.0) for item in shadow.predictions],
+        )
+        self.assertTrue(
+            all(item.forecast.latency_ms > 0 for item in offline.predictions)
+        )
+        self.assertTrue(
+            all(item.forecast.latency_ms > 0 for item in shadow.predictions)
         )
 
     def test_missing_counter_growth_blocks_only_that_transition(self) -> None:

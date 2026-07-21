@@ -10,7 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -483,7 +483,13 @@ def _lifecycle_diagnostics(
                     raise Stage3ExperimentError(
                         "lifecycle replay differs from the scored result cohort"
                     )
-                if prediction.forecast != record.forecast:
+                if (
+                    replace(
+                        record.forecast,
+                        latency_ms=prediction.forecast.latency_ms,
+                    )
+                    != prediction.forecast
+                ):
                     raise Stage3ExperimentError(
                         "lifecycle replay differs from the calibrated result trajectory"
                     )
