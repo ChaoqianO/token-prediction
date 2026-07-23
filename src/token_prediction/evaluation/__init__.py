@@ -31,6 +31,15 @@ from .stratification import (
     evaluate_same_task_run_variance,
     evaluate_termination_strata,
 )
+from .stage4 import (
+    STAGE4_CROSS_CONDITION_PAIRING_POLICY_ID,
+    STAGE4_MATCHED_COVERAGE_POLICY_ID,
+    CrossConditionPairedComparison,
+    MatchedCoverageComparison,
+    assert_calibration_raw_prediction_parity,
+    compare_matched_coverage,
+    compare_same_tasks_across_conditions,
+)
 
 __all__ = [
     "CALIBRATOR_SCHEMA_VERSION",
@@ -55,6 +64,13 @@ __all__ = [
     "evaluate_same_task_run_variance",
     "evaluate_task_forecasts",
     "evaluate_termination_strata",
+    "STAGE4_CROSS_CONDITION_PAIRING_POLICY_ID",
+    "STAGE4_MATCHED_COVERAGE_POLICY_ID",
+    "CrossConditionPairedComparison",
+    "MatchedCoverageComparison",
+    "assert_calibration_raw_prediction_parity",
+    "compare_matched_coverage",
+    "compare_same_tasks_across_conditions",
     "paired_task_bootstrap",
     "paired_task_metric_bootstrap",
 ]

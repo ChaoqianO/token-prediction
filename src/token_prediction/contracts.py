@@ -115,6 +115,7 @@ class Observable(StrEnum):
     REQUEST_BOUNDARIES = "request_boundaries"
     TASK_TERMINATION = "task_termination"
     REQUEST_LOCAL_COUNT = "request_local_count"
+    TASK_TEXT = "task_text"
     REQUEST_MESSAGES = "request_messages"
     REQUEST_WIRE = "request_wire"
     TOOL_EVENTS = "tool_events"

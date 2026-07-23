@@ -62,6 +62,7 @@ class CandidateRole(StrEnum):
 
 
 class AblationAxis(StrEnum):
+    METHOD = "method"
     FEATURE_SET = "feature_set"
     STATE_UPDATE = "state_update"
     PROBE_INTERVAL = "probe_interval"
