@@ -32,6 +32,7 @@ from token_prediction.development import (
 from token_prediction.estimators import EstimatorRegistry, builtin_registry
 from token_prediction.experiment import (
     CandidateResult,
+    CandidateResultStore,
     ExperimentRunner,
     ExperimentSpec,
     FoldArtifact,
@@ -171,9 +172,10 @@ def _lightgbm_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str
 
 
 def _neural_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str]:
-    uses_independent_mlp = any(
-        "independent_mlp"
-        in {
+    neural_estimators = {"independent_mlp", "gru_residual"}
+    uses_neural = any(
+        neural_estimators
+        & {
             candidate.estimator_id,
             candidate.graph.initializer_estimator_id,
             candidate.graph.updater_estimator_id,
@@ -181,7 +183,7 @@ def _neural_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str]:
         for spec in specs
         for candidate in spec.candidates
     )
-    if not uses_independent_mlp:
+    if not uses_neural:
         return {}
     versions = {
         "numpy_version": _module_version("numpy", "numpy"),
@@ -191,8 +193,27 @@ def _neural_runtime_versions(specs: Sequence[ExperimentSpec]) -> dict[str, str]:
     missing = sorted(name for name, value in versions.items() if value == "not-installed")
     if missing:
         raise RuntimeError(
-            "Independent MLP runtime identity is incomplete; missing distributions: "
-            + ", ".join(missing)
+            "Neural runtime identity is incomplete; missing distributions: " + ", ".join(missing)
+        )
+    explicit_devices = {
+        str(candidate.params["training_device"])
+        for spec in specs
+        for candidate in spec.candidates
+        if candidate.estimator_id in neural_estimators and "training_device" in candidate.params
+    }
+    if len(explicit_devices) > 1:
+        raise RuntimeError("one experiment run cannot mix neural training devices")
+    if explicit_devices:
+        from token_prediction.estimators.neural_runtime import (
+            neural_runtime_identity,
+        )
+
+        torch = importlib.import_module("torch")
+        versions.update(
+            neural_runtime_identity(
+                torch,
+                requested_device=next(iter(explicit_devices)),
+            )
         )
     return versions
 
@@ -215,6 +236,7 @@ def run_development_experiments(
     source_provenance: Mapping[str, object],
     protocol: DevelopmentProtocol | None = None,
     registry: EstimatorRegistry | None = None,
+    result_store: CandidateResultStore | None = None,
 ) -> DevelopmentExperimentResults:
     """Run the frozen three-seed protocol for an already constructed dataset."""
 
@@ -248,6 +270,7 @@ def run_development_experiments(
                 seed=nested_plan.split_seed,
                 development_protocol=resolved_protocol,
                 source_provenance=validated_source_provenance,
+                result_store=result_store,
             )
             for spec in specs
         )

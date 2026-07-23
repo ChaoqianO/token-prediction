@@ -39,9 +39,7 @@ class TrainingView:
         point_ids = [example.point.point_id for example in self.examples]
         if len(set(point_ids)) != len(point_ids):
             raise ValueError("training point ids must be unique")
-        if self.lifecycle_sequences is not None and not isinstance(
-            self.lifecycle_sequences, tuple
-        ):
+        if self.lifecycle_sequences is not None and not isinstance(self.lifecycle_sequences, tuple):
             raise TypeError("lifecycle_sequences must be a tuple or None")
         if self.input_contract_hash is not None:
             _require_sha256(self.input_contract_hash, name="input_contract_hash")
@@ -66,15 +64,36 @@ class TrainingView:
         )
 
 
+class FitCheckpoint(Protocol):
+    """Atomic, non-pickle persistence supplied to long neural fits."""
+
+    def load(self, identity: Mapping[str, Any]) -> Mapping[str, bytes] | None: ...
+
+    def save(
+        self,
+        identity: Mapping[str, Any],
+        *,
+        epoch: int,
+        files: Mapping[str, bytes],
+    ) -> None: ...
+
+    def clear(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class FitContext:
     seed: int
     fold: int
     interval_alpha: float = 0.10
+    checkpoint: FitCheckpoint | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.interval_alpha) or not 0 < self.interval_alpha < 1:
             raise ValueError("interval_alpha must be finite and in (0, 1)")
+        if self.checkpoint is not None and not all(
+            callable(getattr(self.checkpoint, name, None)) for name in ("load", "save", "clear")
+        ):
+            raise TypeError("checkpoint must implement load/save/clear")
 
 
 @dataclass(frozen=True)
@@ -111,9 +130,7 @@ class TokenForecast:
         if self.overhead_input_tokens < 0 or self.overhead_output_tokens < 0:
             raise ValueError("prediction overhead must be non-negative")
         raw = (self.raw_lower, self.raw_point, self.raw_upper)
-        if any(value is not None for value in raw) and not all(
-            value is not None for value in raw
-        ):
+        if any(value is not None for value in raw) and not all(value is not None for value in raw):
             raise ValueError("raw forecast values must be provided together or omitted together")
         if all(value is not None for value in raw) and any(
             not math.isfinite(float(value)) for value in raw
@@ -188,7 +205,7 @@ class SessionSeed:
         ):
             raise ValueError(
                 "session seed forecast is not the non-negative/ordered repair of its raw values"
-        )
+            )
 
         for name in ("initializer_id", "inner_split_id", "seed_policy_id"):
             _require_identifier(getattr(self, name), name=name)

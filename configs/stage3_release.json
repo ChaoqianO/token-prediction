@@ -1,0 +1,160 @@
+{
+  "release_schema_version": 1,
+  "stage_name": "stage3_development",
+  "policy_id": "stage3_commit_bound_four_source_release_v1",
+  "code_binding": {
+    "artifact_git_commit": "d3767c135c255d3803195573130f8bb0aefe0d67",
+    "artifact_git_tag": "stage3-artifact-source-v1",
+    "code_tree_sha256": "18cb3fdc20df475f556683d3b1db7f83f549aa94442a39fe59225a084fdfba26"
+  },
+  "protocol": {
+    "outer_folds": 5,
+    "inner_folds": 5,
+    "split_seeds": [
+      20260719,
+      20260720,
+      20260721
+    ],
+    "run_policy_id": "stage3_source_three_seed_cuda_resumable_nested_cv_v2",
+    "checkpoint_policy_id": "atomic_candidate_and_every_neural_epoch_v1",
+    "checkpoint_interval_epochs": 1,
+    "neural_training_device": "cuda",
+    "neural_inference_device": "cpu",
+    "calibrator_id": "task_max_conformal",
+    "alpha": 0.1,
+    "budget_thresholds": [
+      16384,
+      32768,
+      65536,
+      131072
+    ],
+    "progress_checkpoints": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "final_holdout_evaluated": false,
+    "final_holdout_prediction_count": 0
+  },
+  "stage2_regression": {
+    "release_lock_path": "configs/stage2_release.json",
+    "release_lock_sha256": "2d5bf2c749999d2f99322dfea240ab6d057df0ae142a7bc3a5aa41af0e3b45b3",
+    "exact_candidate_ids": [
+      "cross_position_deduct",
+      "empirical",
+      "lightgbm_history"
+    ],
+    "runtime_scoped_candidate_ids": [
+      "mlp_history"
+    ],
+    "normalization_policy_id": "exact_non_neural_and_stage3_mlp_contract_v2",
+    "candidate_seed_run_count": 84
+  },
+  "artifacts": {
+    "spend_aggregate": {
+      "kind": "gate",
+      "path": "workspace/stage3/runs/s3-0eadef35bf584fcb1ee7",
+      "source_id": "spend_your_money_aggregate_v1",
+      "source_descriptor_hash": "566e3ccb74fe3b1d9b35d48432abee422946e67a67433006ea4020ad4013f6d0",
+      "run_id": "0eadef35bf584fcb1ee7f198",
+      "artifact_id": "fde2a966692daed67b2ab5e860b8e856eaa685534ebf2e4c495f819e0f33aa5f",
+      "results_payload_sha256": "ca8f75f232bcb7cb524ccea5ef66c25093bd1269ab75653b78d487d6e4f0c03e",
+      "base_dataset_id": "spend-your-money:293e3c2aa714172996406465e5e2411b3a136883bf1335a8eb9c5224076a13db",
+      "derived_dataset_id": "spend-your-money:293e3c2aa714172996406465e5e2411b3a136883bf1335a8eb9c5224076a13db",
+      "development_dataset_id": "338ceee186b0f9708b692ebaa2071d0918c3578d923a23007a69f2a10d9e2f1f",
+      "development_protocol_id": "9e6fd39eaf602710dcfe399d057272d3bda056d0f2c4a820e7e618e4256c4ef4",
+      "matrix_id": "ac4628b4b2af7377be011bdf370c5f312929a4447fb7201d7c6b90fd524dbd59",
+      "experiment_count": 0,
+      "candidate_seed_run_count": 0,
+      "lifecycle_candidate_seed_run_count": 0,
+      "exact_lifecycle_reload_fold_count": 0,
+      "reloadable_bundle_fold_count": 0,
+      "independently_loaded_bundle_count": 0,
+      "stage2_regression_candidate_seed_run_count": 0,
+      "manifest_file_count": 1
+    },
+    "bagen_sokoban": {
+      "kind": "experiment",
+      "path": "workspace/stage3/runs/s3-b0231bd18f6af59bb6e8",
+      "source_id": "bagen_sokoban_dialogues_v1",
+      "source_descriptor_hash": "b76215d4d686bfeabf37092b73ae93407fe20db898932019248b182fa092cc45",
+      "run_id": "b0231bd18f6af59bb6e808d9",
+      "artifact_id": "9fbb5ec2ff97b3e10f268453a5f701adf750495f01b24199f111f427e6113b86",
+      "results_payload_sha256": "d45bf93f3d2d8c91fd69f9f964f68121f8e9376157306d04f9dc5af0e8fe12f6",
+      "base_dataset_id": "8a5b8cd8e7550d1a0587632bf686e742ead0a5adc76dd6ad81d2d43634913b52",
+      "derived_dataset_id": "f0d7aa728e05aace92d34e42575ea80e01dd089d400a1eb749d1c4fea58425dd",
+      "development_dataset_id": "56a93f1afdb420e490bd25c09d96d79044653b3b490d27a9de11425d85de6fe4",
+      "development_protocol_id": "510e1b4087c04aa5ac4ed2ec6c431e7c5f90ad77b172a88c2d4feabb4a1e83cf",
+      "matrix_id": "92b9b91226d0a91f7280576ca0a785a766cfb6f75314bc23718e17921861de9b",
+      "experiment_count": 1,
+      "candidate_seed_run_count": 21,
+      "lifecycle_candidate_seed_run_count": 12,
+      "exact_lifecycle_reload_fold_count": 60,
+      "reloadable_bundle_fold_count": 90,
+      "independently_loaded_bundle_count": 90,
+      "stage2_regression_candidate_seed_run_count": 12,
+      "manifest_file_count": 1756
+    },
+    "bagen_swebench": {
+      "kind": "experiment",
+      "path": "workspace/stage3/runs/s3-b35d4daecbeaa016a00a",
+      "source_id": "bagen_swebench_traj_v2",
+      "source_descriptor_hash": "17c8f88de18bb4734923b331287648cb5ff92e368c85a2f0b1aeb103ef84f4cb",
+      "run_id": "b35d4daecbeaa016a00ae0ba",
+      "artifact_id": "4f1853a5692462e3cac5e6b6ae6a1d2f9111e958e995d0942d8d9545dd38f218",
+      "results_payload_sha256": "40faac7625c9ad3dc4a4aee9bae6655a0e3781b5253a28f9e0c393358e758b61",
+      "base_dataset_id": "db2f5baf2f2139e25fb8479cd3b3c33c528961d04c930d93009755fcb889bd23",
+      "derived_dataset_id": "bee534130055f9e0b512adcad85d17831f8020ed991ceb18f4c8daa2d43dcc8b",
+      "development_dataset_id": "bdbe83fd0495419d294d7f344d424b2d2c541d8608ff3e01c46354f08a15d23c",
+      "development_protocol_id": "f5217563e8bf21f1551c20e14b42e41b23f0ac46715a0dbe5ddccb59d0ff854a",
+      "matrix_id": "ccd5215e0c60955cee731cc85e4bb25caf852c2c9baff2fcbe063bfc5ef98d02",
+      "experiment_count": 5,
+      "candidate_seed_run_count": 105,
+      "lifecycle_candidate_seed_run_count": 60,
+      "exact_lifecycle_reload_fold_count": 300,
+      "reloadable_bundle_fold_count": 450,
+      "independently_loaded_bundle_count": 450,
+      "stage2_regression_candidate_seed_run_count": 60,
+      "manifest_file_count": 8776
+    },
+    "spend_openhands": {
+      "kind": "experiment",
+      "path": "workspace/stage3/runs/s3-6c57b8ef3acc736cceea",
+      "source_id": "openhands_archive_trajectory_v3",
+      "source_descriptor_hash": "b9242d9a2f7ee8232eb273fa80b6135e87c62e891f1f2f7a78db1300d208011f",
+      "run_id": "6c57b8ef3acc736cceea2608",
+      "artifact_id": "145b6b17ae6b67f07803845c3c4f06c1f321a5e5dad40e63380806f8e07d9f59",
+      "results_payload_sha256": "ec14a98f607576c64687d41d21a3c9e07a22639fa14c68065c769958624ac31c",
+      "base_dataset_id": "c9548f8ed397953c1220efd2cfcee7f811cc9dd693e3c9ca363f20b8f4d4141c",
+      "derived_dataset_id": "d9b317bbb6eeb0579f4e745d3cce8d1534949f8d3dc202ee5abdb5b28d0c5c05",
+      "development_dataset_id": "8f2f70ba020649fd56e5669539a3c24763c4a9e24783ccc1823d971640b1a37a",
+      "development_protocol_id": "6b61bcb993f79ce416a68addc3ec58e765a87630bd6d051b41c62d8932da0ba6",
+      "matrix_id": "42fea8c50b7db794c783a42727bd1f7444155ed6bec29244bee3b79552ccaed7",
+      "experiment_count": 1,
+      "candidate_seed_run_count": 21,
+      "lifecycle_candidate_seed_run_count": 12,
+      "exact_lifecycle_reload_fold_count": 60,
+      "reloadable_bundle_fold_count": 90,
+      "independently_loaded_bundle_count": 90,
+      "stage2_regression_candidate_seed_run_count": 12,
+      "manifest_file_count": 1756
+    }
+  },
+  "totals": {
+    "artifact_count": 4,
+    "experiment_artifact_count": 3,
+    "gate_artifact_count": 1,
+    "experiment_count": 7,
+    "candidate_seed_run_count": 147,
+    "lifecycle_candidate_seed_run_count": 84,
+    "exact_lifecycle_reload_fold_count": 420,
+    "reloadable_bundle_fold_count": 630,
+    "independently_loaded_bundle_count": 630,
+    "stage2_regression_candidate_seed_run_count": 84,
+    "manifest_file_count": 12289
+  },
+  "report": {
+    "path": "docs/stage-3-report.md",
+    "sha256": "74d81e08bca6ff6d14face93b320c24df0b7e8bbab65cdb67505b6f452b173a6"
+  }
+}

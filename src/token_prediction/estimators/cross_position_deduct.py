@@ -79,6 +79,78 @@ def _missing_usage_counter(point: PredictionPoint) -> int | None:
     return value
 
 
+@dataclass(frozen=True)
+class MechanicalDeductOperands:
+    """Visible operands for one mechanical Task remaining update.
+
+    ``delta_tokens`` is absent when any required operand is unavailable or a
+    newly missing usage attempt pollutes the transition.  Callers must carry
+    their own previous forecast in that case; a missing value is never treated
+    as zero.
+    """
+
+    delta_tokens: int | None
+    fallback_reason: str | None
+
+    def __post_init__(self) -> None:
+        if (self.delta_tokens is None) != (self.fallback_reason is not None):
+            raise ValueError("mechanical deduct fallback identity is inconsistent")
+
+
+def mechanical_deduct_operands(
+    previous_point: PredictionPoint,
+    current_point: PredictionPoint,
+    transition: ObservedTransition,
+) -> MechanicalDeductOperands:
+    """Resolve the exact prefix-visible mechanical update operands."""
+
+    if previous_point.task_id != current_point.task_id:
+        raise ValueError("mechanical deduct transition crossed tasks")
+    if previous_point.trajectory_id != current_point.trajectory_id:
+        raise ValueError("mechanical deduct transition crossed trajectories")
+    if previous_point.run_id != current_point.run_id:
+        raise ValueError("mechanical deduct transition crossed runs")
+    if current_point.cutoff_event_seq <= previous_point.cutoff_event_seq:
+        raise ValueError("prediction points must advance in visibility order")
+    if transition.from_point_id != previous_point.point_id:
+        raise ValueError("transition from_point_id does not match the previous point")
+    if transition.to_point_id != current_point.point_id:
+        raise ValueError("transition to_point_id does not match the current point")
+
+    previous_counter = _missing_usage_counter(previous_point)
+    current_counter = _missing_usage_counter(current_point)
+    counter_increased = False
+    counter_unavailable = (previous_counter is None) != (current_counter is None)
+    if previous_counter is not None and current_counter is not None:
+        if current_counter < previous_counter:
+            raise ValueError("missing usage attempt count decreased within a trajectory")
+        counter_increased = current_counter > previous_counter
+
+    missing: list[str] = []
+    if previous_point.known_offset_tokens is None:
+        missing.append("previous_offset")
+    if transition.observed_spend_tokens is None:
+        missing.append("observed_spend")
+    if current_point.known_offset_tokens is None:
+        missing.append("current_offset")
+    if counter_increased:
+        missing.append("usage_counter_increased")
+    elif counter_unavailable:
+        missing.append("usage_counter")
+    if missing:
+        return MechanicalDeductOperands(
+            None,
+            "missing_" + "_and_".join(missing),
+        )
+
+    return MechanicalDeductOperands(
+        int(previous_point.known_offset_tokens)
+        - int(transition.observed_spend_tokens)
+        - int(current_point.known_offset_tokens),
+        None,
+    )
+
+
 @dataclass
 class CrossPositionDeductSession:
     """Carry an uncalibrated Task-pre forecast through real request boundaries."""
@@ -137,41 +209,17 @@ class CrossPositionDeductSession:
         if point.cutoff_event_seq <= previous_point.cutoff_event_seq:
             raise ValueError("prediction points must advance in visibility order")
 
-        previous_counter = _missing_usage_counter(previous_point)
-        current_counter = _missing_usage_counter(point)
-        counter_increased = False
-        counter_unavailable = (previous_counter is None) != (current_counter is None)
-        if previous_counter is not None and current_counter is not None:
-            if current_counter < previous_counter:
-                raise ValueError("missing usage attempt count decreased within a trajectory")
-            counter_increased = current_counter > previous_counter
-
-        missing: list[str] = []
-        if previous_point.known_offset_tokens is None:
-            missing.append("previous_offset")
-        if transition.observed_spend_tokens is None:
-            missing.append("observed_spend")
-        if point.known_offset_tokens is None:
-            missing.append("current_offset")
-        if counter_increased:
-            missing.append("usage_counter_increased")
-        elif counter_unavailable:
-            missing.append("usage_counter")
-
-        if missing:
+        operands = mechanical_deduct_operands(previous_point, point, transition)
+        if operands.delta_tokens is None:
             # The newly missing attempt is never treated as zero.  Advancing the
             # stored point lets a later equal counter resume with a visible delta.
             raw_lower = previous_forecast.lower
             raw_point = previous_forecast.point
             raw_upper = previous_forecast.upper
             self.fallback_count += 1
-            self.last_fallback_reason = "missing_" + "_and_".join(missing)
+            self.last_fallback_reason = operands.fallback_reason
         else:
-            delta = (
-                int(previous_point.known_offset_tokens)
-                - int(transition.observed_spend_tokens)
-                - int(point.known_offset_tokens)
-            )
+            delta = operands.delta_tokens
             raw_lower = previous_forecast.lower + delta
             raw_point = previous_forecast.point + delta
             raw_upper = previous_forecast.upper + delta
@@ -327,4 +375,6 @@ __all__ = [
     "CrossPositionDeductEstimator",
     "CrossPositionDeductSession",
     "FittedCrossPositionDeduct",
+    "MechanicalDeductOperands",
+    "mechanical_deduct_operands",
 ]

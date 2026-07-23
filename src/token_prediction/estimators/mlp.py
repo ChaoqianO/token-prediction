@@ -17,7 +17,12 @@ from typing import Any, Mapping, Sequence
 from token_prediction.dataset import PredictionPoint, PredictionPosition, PredictionTarget
 
 from .base import FitContext, ObservedTransition, RunContext, TokenForecast, TrainingView
+from .neural_checkpoint import load_neural_epoch, save_neural_epoch
 from .neural_encoder import NeuralFeatureEncoder, OptionalNeuralDependencyError
+from .neural_runtime import (
+    configure_deterministic_training,
+    normalize_training_device,
+)
 
 
 INDEPENDENT_MLP_ESTIMATOR_VERSION = 1
@@ -48,9 +53,7 @@ def _deep_freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise ValueError("fit report parameter keys must be strings")
-        return MappingProxyType(
-            {key: _deep_freeze_json(item) for key, item in value.items()}
-        )
+        return MappingProxyType({key: _deep_freeze_json(item) for key, item in value.items()})
     if isinstance(value, (tuple, list)):
         return tuple(_deep_freeze_json(item) for item in value)
     if value is None or isinstance(value, (str, bool, int, float)):
@@ -87,9 +90,7 @@ def _point_hash(point_ids: Sequence[str]) -> str:
 
 def _derived_seed(seed: int, fold: int) -> int:
     payload = f"independent-mlp-v{INDEPENDENT_MLP_ESTIMATOR_VERSION}:{seed}:{fold}"
-    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], "big") % (
-        2**31 - 1
-    )
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], "big") % (2**31 - 1)
 
 
 def _view_condition_ids(view: TrainingView, *, description: str) -> tuple[str, ...]:
@@ -103,27 +104,19 @@ def _view_condition_ids(view: TrainingView, *, description: str) -> tuple[str, .
     return tuple(sorted(conditions))
 
 
-def _configure_deterministic_cpu(torch: Any, seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        # PyTorch permits setting the inter-op pool only before parallel work.
-        # A prior deterministic fit may already have fixed it to one thread.
-        if torch.get_num_interop_threads() != 1:
-            raise
-    torch.use_deterministic_algorithms(True)
-
-
-def _build_network(torch: Any, architecture: "MLPArchitecture") -> Any:
+def _build_network(
+    torch: Any,
+    architecture: "MLPArchitecture",
+    *,
+    device: str = "cpu",
+) -> Any:
     dimensions = (architecture.input_dim, *architecture.hidden_dims, architecture.output_dim)
     layers: list[Any] = []
     for index, (input_width, output_width) in enumerate(zip(dimensions, dimensions[1:])):
         layers.append(torch.nn.Linear(input_width, output_width, bias=True))
         if index < len(dimensions) - 2:
             layers.append(torch.nn.SiLU())
-    return torch.nn.Sequential(*layers).to(device="cpu", dtype=torch.float32)
+    return torch.nn.Sequential(*layers).to(device=device, dtype=torch.float32)
 
 
 def _weighted_quantile_loss(
@@ -270,7 +263,7 @@ def _validate_fit_report_semantics(
         raise ValueError("fit report hidden_dims do not match the architecture")
     if parameters["activation"] != architecture.activation:
         raise ValueError("fit report activation does not match the architecture")
-    if parameters["device"] != "cpu" or parameters["optimizer"] != "adamw":
+    if parameters["device"] not in {"cpu", "cuda"} or parameters["optimizer"] != "adamw":
         raise ValueError("fit report runtime/optimizer contract is invalid")
     if parameters["deterministic"] is not True or parameters["num_threads"] != 1:
         raise ValueError("fit report deterministic CPU contract is invalid")
@@ -472,6 +465,7 @@ class IndependentMLPQuantileEstimator:
         patience: int = 20,
         min_delta: float = 0.0,
         q50_huber_delta: float | None = None,
+        training_device: str = "cpu",
     ) -> None:
         if quantiles is not None and (
             not isinstance(quantiles, (tuple, list))
@@ -487,12 +481,9 @@ class IndependentMLPQuantileEstimator:
             tuple(float(value) for value in quantiles) if quantiles is not None else None
         )
         if normalized_quantiles is not None and not _valid_quantiles(normalized_quantiles):
-            raise ValueError(
-                "quantiles must contain symmetric ordered (lower, 0.5, upper) values"
-            )
+            raise ValueError("quantiles must contain symmetric ordered (lower, 0.5, upper) values")
         if not isinstance(hidden_dims, (tuple, list)) or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in hidden_dims
+            isinstance(value, bool) or not isinstance(value, int) for value in hidden_dims
         ):
             raise ValueError("hidden_dims must contain integer widths")
         normalized_hidden = tuple(hidden_dims)
@@ -541,9 +532,8 @@ class IndependentMLPQuantileEstimator:
         self.max_epochs = int(max_epochs)
         self.patience = int(patience)
         self.min_delta = float(min_delta)
-        self.q50_huber_delta = (
-            float(q50_huber_delta) if q50_huber_delta is not None else None
-        )
+        self.q50_huber_delta = float(q50_huber_delta) if q50_huber_delta is not None else None
+        self.training_device = normalize_training_device(training_device)
 
     def fit(
         self,
@@ -577,7 +567,11 @@ class IndependentMLPQuantileEstimator:
             raise ValueError("train and validation views must share condition scope")
         np, torch = _load_neural_dependencies()
         seed = _derived_seed(context.seed, context.fold)
-        _configure_deterministic_cpu(torch, seed)
+        device = configure_deterministic_training(
+            torch,
+            seed=seed,
+            device=self.training_device,
+        )
 
         train_points = tuple(example.point for example in train.examples)
         validation_points = tuple(example.point for example in validation.examples)
@@ -588,29 +582,35 @@ class IndependentMLPQuantileEstimator:
             input_dim=encoder.schema.output_width,
             hidden_dims=self.hidden_dims,  # type: ignore[arg-type]
         )
-        encoded_cells = (
-            len(train_points) + len(validation_points)
-        ) * architecture.input_dim
+        encoded_cells = (len(train_points) + len(validation_points)) * architecture.input_dim
         if encoded_cells > MAX_MLP_ENCODED_CELLS:
-            raise ValueError(
-                "Independent MLP encoded matrices exceed the safe cell-count limit"
-            )
+            raise ValueError("Independent MLP encoded matrices exceed the safe cell-count limit")
         encoded_train = encoder.transform(train_points)
         encoded_validation = encoder.transform(validation_points)
-        model = _build_network(torch, architecture)
-        train_x = torch.from_numpy(encoded_train.matrix).to(dtype=torch.float32)
-        validation_x = torch.from_numpy(encoded_validation.matrix).to(dtype=torch.float32)
+        model = _build_network(torch, architecture, device=device)
+        train_x = torch.from_numpy(encoded_train.matrix).to(device=device, dtype=torch.float32)
+        validation_x = torch.from_numpy(encoded_validation.matrix).to(
+            device=device, dtype=torch.float32
+        )
         train_y = torch.tensor(
-            [example.target_value for example in train.examples], dtype=torch.float32
+            [example.target_value for example in train.examples],
+            device=device,
+            dtype=torch.float32,
         )
         validation_y = torch.tensor(
-            [example.target_value for example in validation.examples], dtype=torch.float32
+            [example.target_value for example in validation.examples],
+            device=device,
+            dtype=torch.float32,
         )
         train_weight = torch.tensor(
-            [example.sample_weight for example in train.examples], dtype=torch.float32
+            [example.sample_weight for example in train.examples],
+            device=device,
+            dtype=torch.float32,
         )
         validation_weight = torch.tensor(
-            [example.sample_weight for example in validation.examples], dtype=torch.float32
+            [example.sample_weight for example in validation.examples],
+            device=device,
+            dtype=torch.float32,
         )
         if not all(
             bool(torch.isfinite(tensor).all())
@@ -627,12 +627,57 @@ class IndependentMLPQuantileEstimator:
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        history: list[float] = []
-        best_loss = math.inf
-        best_epoch = 0
-        best_state: dict[str, Any] | None = None
-        stale_epochs = 0
-        for epoch in range(1, self.max_epochs + 1):
+        train_point_hash = _point_hash(tuple(point.point_id for point in train_points))
+        validation_point_hash = _point_hash(tuple(point.point_id for point in validation_points))
+        fit_identity = {
+            "checkpoint_policy_id": "independent_mlp_full_state_every_epoch_v1",
+            "estimator_id": self.estimator_id,
+            "estimator_version": INDEPENDENT_MLP_ESTIMATOR_VERSION,
+            "dataset_id": train.dataset_id,
+            "input_contract_hash": train.input_contract_hash,
+            "position": train.position.value,
+            "target": train.target.value,
+            "condition_ids": list(train_conditions),
+            "train_point_hash": train_point_hash,
+            "validation_point_hash": validation_point_hash,
+            "encoder_schema_hash": encoder.schema.content_hash,
+            "architecture": architecture.to_dict(),
+            "seed": seed,
+            "interval_alpha": context.interval_alpha,
+            "quantiles": list(resolved_quantiles),
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "max_epochs": self.max_epochs,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "q50_huber_delta": self.q50_huber_delta,
+            "training_device": self.training_device,
+        }
+        resumed = load_neural_epoch(
+            context.checkpoint,
+            identity=fit_identity,
+            model=model,
+            optimizer=optimizer,
+            torch=torch,
+            device=device,
+        )
+        if resumed is None:
+            history: list[float] = []
+            best_loss = math.inf
+            best_epoch = 0
+            best_state: dict[str, Any] | None = None
+            stale_epochs = 0
+            first_epoch = 1
+        else:
+            history = list(resumed.history)
+            best_loss = resumed.best_loss
+            best_epoch = resumed.best_epoch
+            best_state = dict(resumed.best_state)
+            stale_epochs = resumed.stale_epochs
+            first_epoch = (
+                self.max_epochs + 1 if stale_epochs >= self.patience else resumed.epoch + 1
+            )
+        for epoch in range(first_epoch, self.max_epochs + 1):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             predictions = model(train_x)
@@ -672,14 +717,32 @@ class IndependentMLPQuantileEstimator:
                     for name, tensor in model.state_dict().items()
                 }
                 stale_epochs = 0
+                should_stop = False
             else:
                 stale_epochs += 1
-                if stale_epochs >= self.patience:
-                    break
+                should_stop = stale_epochs >= self.patience
+            if best_state is None:
+                raise RuntimeError("Independent MLP did not produce a valid checkpoint")
+            save_neural_epoch(
+                context.checkpoint,
+                identity=fit_identity,
+                epoch=epoch,
+                model=model,
+                best_state=best_state,
+                optimizer=optimizer,
+                best_epoch=best_epoch,
+                best_loss=best_loss,
+                stale_epochs=stale_epochs,
+                history=history,
+                torch=torch,
+            )
+            if should_stop:
+                break
         if best_state is None or best_epoch <= 0:
             raise RuntimeError("Independent MLP did not produce a valid checkpoint")
-        model.load_state_dict(best_state, strict=True)
-        model.eval()
+        frozen_model = _build_network(torch, architecture, device="cpu")
+        frozen_model.load_state_dict(best_state, strict=True)
+        frozen_model.eval()
         parameters: dict[str, Any] = {
             "quantiles": list(resolved_quantiles),
             "hidden_dims": list(self.hidden_dims),
@@ -689,7 +752,7 @@ class IndependentMLPQuantileEstimator:
             "patience": self.patience,
             "min_delta": self.min_delta,
             "q50_huber_delta": self.q50_huber_delta,
-            "device": "cpu",
+            "device": self.training_device,
             "deterministic": True,
             "num_threads": 1,
             "optimizer": "adamw",
@@ -698,10 +761,8 @@ class IndependentMLPQuantileEstimator:
         report = MLPFitReport(
             estimator_version=INDEPENDENT_MLP_ESTIMATOR_VERSION,
             encoder_schema_hash=encoder.schema.content_hash,
-            train_point_hash=_point_hash(tuple(point.point_id for point in train_points)),
-            validation_point_hash=_point_hash(
-                tuple(point.point_id for point in validation_points)
-            ),
+            train_point_hash=train_point_hash,
+            validation_point_hash=validation_point_hash,
             train_point_count=len(train_points),
             validation_point_count=len(validation_points),
             seed=seed,
@@ -722,7 +783,7 @@ class IndependentMLPQuantileEstimator:
             allowed_condition_ids=train_conditions,
             encoder=encoder,
             architecture=architecture,
-            model=model,
+            model=frozen_model,
             quantiles=resolved_quantiles,
             fit_report=report,
         )

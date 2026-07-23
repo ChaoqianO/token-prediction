@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import tempfile
 import time
 from collections import defaultdict
@@ -11,7 +12,7 @@ from enum import Enum, StrEnum
 from functools import lru_cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from token_prediction.dataset import (
     DatasetRow,
@@ -33,6 +34,7 @@ from token_prediction.development import (
 )
 from token_prediction.estimators import (
     EstimatorRegistry,
+    FitCheckpoint,
     FitContext,
     ObservedTransition,
     RunContext,
@@ -427,6 +429,239 @@ def _mapping_artifact(value: Any, *, context: str) -> Mapping[str, Any]:
     return converted
 
 
+@dataclass(frozen=True)
+class CandidateExecutionKey:
+    """Complete semantic identity for one resumable candidate/seed execution."""
+
+    experiment_id: str
+    candidate_id: str
+    candidate_hash: str
+    dataset_id: str
+    split_plan_id: str
+    split_seed: int
+    eligibility_hash: str
+    position: PredictionPosition
+    target: PredictionTarget
+    condition_id: str
+    calibrator_id: str
+    alpha: float
+    source_provenance_hash: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "experiment_id",
+            "candidate_id",
+            "dataset_id",
+            "condition_id",
+            "calibrator_id",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"candidate execution {name} is required")
+        for name in (
+            "candidate_hash",
+            "split_plan_id",
+            "eligibility_hash",
+            "source_provenance_hash",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or value != value.lower()
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"candidate execution {name} must be a SHA-256 digest")
+        if isinstance(self.split_seed, bool) or not isinstance(self.split_seed, int):
+            raise ValueError("candidate execution split_seed must be an integer")
+        if not math.isfinite(self.alpha) or not 0 < self.alpha < 1:
+            raise ValueError("candidate execution alpha must be in (0, 1)")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "experiment_id": self.experiment_id,
+            "candidate_id": self.candidate_id,
+            "candidate_hash": self.candidate_hash,
+            "dataset_id": self.dataset_id,
+            "split_plan_id": self.split_plan_id,
+            "split_seed": self.split_seed,
+            "eligibility_hash": self.eligibility_hash,
+            "position": self.position.value,
+            "target": self.target.value,
+            "condition_id": self.condition_id,
+            "calibrator_id": self.calibrator_id,
+            "alpha": self.alpha,
+            "source_provenance_hash": self.source_provenance_hash,
+        }
+
+    @property
+    def content_hash(self) -> str:
+        payload = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+class CandidateResultStore(Protocol):
+    """Safe persistence boundary used to resume long development matrices."""
+
+    def load(self, key: CandidateExecutionKey) -> CandidateResult | None: ...
+
+    def save(self, key: CandidateExecutionKey, result: CandidateResult) -> None: ...
+
+    def fit_checkpoint(
+        self,
+        key: CandidateExecutionKey,
+        fold: int,
+    ) -> FitCheckpoint | None: ...
+
+
+def _source_provenance_hash(value: Mapping[str, object] | None) -> str:
+    normalized = _json_compatible(
+        dict(value or {}),
+        context="candidate execution source provenance",
+    )
+    payload = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _candidate_execution_key(
+    *,
+    spec: ExperimentSpec,
+    candidate: CandidateSpec,
+    dataset_slice: DatasetSlice,
+    split_plan: SplitPlan,
+    seed: int,
+    source_provenance: Mapping[str, object] | None,
+) -> CandidateExecutionKey:
+    return CandidateExecutionKey(
+        experiment_id=spec.experiment_id,
+        candidate_id=candidate.candidate_id,
+        candidate_hash=candidate.content_hash,
+        dataset_id=dataset_slice.dataset_id,
+        split_plan_id=split_plan.split_plan_id,
+        split_seed=seed,
+        eligibility_hash=dataset_slice.eligibility_hash,
+        position=dataset_slice.position,
+        target=dataset_slice.target,
+        condition_id=dataset_slice.condition_id,
+        calibrator_id=spec.calibrator_id,
+        alpha=spec.alpha,
+        source_provenance_hash=_source_provenance_hash(source_provenance),
+    )
+
+
+def _validate_resumed_candidate_result(
+    result: CandidateResult,
+    *,
+    key: CandidateExecutionKey,
+    dataset_slice: DatasetSlice,
+    split_plan: SplitPlan,
+) -> None:
+    """Recompute every scored projection before accepting a checkpoint."""
+
+    expected_identity = (
+        key.candidate_id,
+        key.candidate_hash,
+        key.dataset_id,
+        key.split_plan_id,
+        key.eligibility_hash,
+        key.position,
+        key.target,
+        key.condition_id,
+        key.calibrator_id,
+        key.alpha,
+        METRIC_SUITE_ID,
+    )
+    actual_identity = (
+        result.candidate_id,
+        result.candidate_hash,
+        result.dataset_id,
+        result.split_plan_id,
+        result.eligibility_hash,
+        result.position,
+        result.target,
+        result.condition_id,
+        result.calibrator_id,
+        result.alpha,
+        result.metric_suite_id,
+    )
+    if actual_identity != expected_identity:
+        raise ValueError("resumed candidate result identity differs from its execution key")
+
+    rows = {row.point.point_id: row for row in dataset_slice.rows}
+    weighted = {
+        item.row.point.point_id: item.sample_weight for item in dataset_slice.weighted_rows()
+    }
+    records = {record.point_id: record for record in result.predictions}
+    if len(records) != len(result.predictions) or set(records) != set(rows):
+        raise ValueError("resumed candidate result changed the eligible point cohort")
+
+    scored: list[ScoredForecast] = []
+    scored_by_fold: dict[int, list[ScoredForecast]] = defaultdict(list)
+    assignment = split_plan.task_to_fold
+    for point_id, row in rows.items():
+        record = records[point_id]
+        point = row.point
+        expected_fold = assignment.get(point.task_id)
+        if expected_fold is None:
+            raise ValueError("resumed candidate task is absent from the split plan")
+        if (
+            record.task_id != point.task_id
+            or record.trajectory_id != point.trajectory_id
+            or record.condition_id != point.condition_id
+            or record.fold != expected_fold
+            or record.target != point.target
+            or record.forecast.point_id != point_id
+            or record.forecast.target != point.target
+            or not math.isclose(
+                record.sample_weight,
+                weighted[point_id],
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+        ):
+            raise ValueError("resumed candidate prediction differs from its frozen cohort")
+        if row.label is None:
+            raise ValueError("resumed eligible candidate row has no label")
+        item = ScoredForecast(
+            task_id=record.task_id,
+            trajectory_id=record.trajectory_id,
+            forecast=record.forecast,
+            target_value=float(row.label),
+            sample_weight=record.sample_weight,
+        )
+        scored.append(item)
+        scored_by_fold[record.fold].append(item)
+
+    expected_metrics = evaluate_forecasts(scored, alpha=key.alpha)
+    if dict(result.metrics) != dict(expected_metrics):
+        raise ValueError("resumed candidate aggregate metrics do not recompute")
+    expected_fold_metrics = {
+        fold: dict(evaluate_forecasts(scored_by_fold[fold], alpha=key.alpha))
+        for fold in range(split_plan.folds)
+    }
+    if {fold: dict(value) for fold, value in result.fold_metrics.items()} != (
+        expected_fold_metrics
+    ):
+        raise ValueError("resumed candidate fold metrics do not recompute")
+    expected_task_metrics = {
+        task_id: metric.to_dict()
+        for task_id, metric in evaluate_task_forecasts(scored, alpha=key.alpha).items()
+    }
+    if {task: dict(value) for task, value in result.task_metrics.items()} != (
+        expected_task_metrics
+    ):
+        raise ValueError("resumed candidate task metrics do not recompute")
+
+
 def _collect_fold_artifact(
     fitted: Any,
     *,
@@ -669,9 +904,7 @@ def _verify_point_fold_reload(
         expected = calibrator.transform(raw_forecast)
         actual_raw = replayed[point_id]
         actual = (
-            actual_raw
-            if estimator_id == "independent_mlp"
-            else calibrator.transform(actual_raw)
+            actual_raw if estimator_id == "independent_mlp" else calibrator.transform(actual_raw)
         )
         # Latency is measured around each invocation and is intentionally not a
         # serialized model output.  Replacing only that measurement leaves every
@@ -714,6 +947,7 @@ def run_candidate_cv(
     calibrator_id: str,
     seed: int,
     source_provenance: Mapping[str, object] | None = None,
+    fit_checkpoint_factory: Callable[[int], FitCheckpoint | None] | None = None,
 ) -> CandidateResult:
     if split_plan.dataset_id != dataset_slice.dataset_id:
         raise ValueError("split plan belongs to another dataset")
@@ -751,7 +985,14 @@ def run_candidate_cv(
         fitted = estimator.fit(
             _make_training_view(dataset_slice, train_rows, weights, candidate.feature_set),
             _make_training_view(dataset_slice, validation_rows, weights, candidate.feature_set),
-            FitContext(seed=seed, fold=fold, interval_alpha=alpha),
+            FitContext(
+                seed=seed,
+                fold=fold,
+                interval_alpha=alpha,
+                checkpoint=(
+                    fit_checkpoint_factory(fold) if fit_checkpoint_factory is not None else None
+                ),
+            ),
         )
         calibration_forecasts = _predict_rows(
             fitted,
@@ -803,9 +1044,7 @@ def run_candidate_cv(
         }
         if candidate.estimator_id == "independent_mlp":
             assert source_provenance is not None
-            fold_provenance["source_descriptor"] = source_provenance[
-                "source_descriptor"
-            ]
+            fold_provenance["source_descriptor"] = source_provenance["source_descriptor"]
         fold_artifact = _collect_fold_artifact(
             fitted,
             fold=fold,
@@ -829,9 +1068,7 @@ def run_candidate_cv(
             raw_test_forecasts=raw_test_forecasts,
             calibrator=calibrator,
             expected_provenance=fold_provenance,
-            expected_source_provenance=(
-                source_provenance if source_provenance is not None else {}
-            ),
+            expected_source_provenance=(source_provenance if source_provenance is not None else {}),
         )
         fold_scored: list[ScoredForecast] = []
         for row in test_rows:
@@ -918,6 +1155,7 @@ class ExperimentRunner:
         seed: int,
         development_protocol: DevelopmentProtocol | None = None,
         source_provenance: Mapping[str, object] | None = None,
+        result_store: CandidateResultStore | None = None,
     ) -> tuple[CandidateResult, ...]:
         nested_plan: NestedDevelopmentPlan | None = None
         if development_protocol is not None:
@@ -977,6 +1215,29 @@ class ExperimentRunner:
                 inner_plans = {plan.outer_test_fold: plan for plan in nested_plan.inner_plans}
         resolved: list[CandidateResult] = []
         for candidate in spec.candidates:
+            execution_key = _candidate_execution_key(
+                spec=spec,
+                candidate=candidate,
+                dataset_slice=dataset_slice,
+                split_plan=split_plan,
+                seed=seed,
+                source_provenance=source_provenance,
+            )
+            cached = result_store.load(execution_key) if result_store is not None else None
+            if cached is not None:
+                _validate_resumed_candidate_result(
+                    cached,
+                    key=execution_key,
+                    dataset_slice=dataset_slice,
+                    split_plan=split_plan,
+                )
+                resolved.append(cached)
+                continue
+            fit_checkpoint_factory = (
+                (lambda fold, *, _key=execution_key: result_store.fit_checkpoint(_key, fold))
+                if result_store is not None
+                else None
+            )
             if candidate.graph.is_lifecycle:
                 if lifecycle_slice is None:
                     raise AssertionError("lifecycle slice was not constructed")
@@ -996,6 +1257,7 @@ class ExperimentRunner:
                     seed=seed,
                     inner_plans=inner_plans,
                     source_provenance=source_provenance,
+                    fit_checkpoint_factory=fit_checkpoint_factory,
                 )
             else:
                 result = run_candidate_cv(
@@ -1007,7 +1269,20 @@ class ExperimentRunner:
                     calibrator_id=spec.calibrator_id,
                     seed=seed,
                     source_provenance=source_provenance,
+                    fit_checkpoint_factory=fit_checkpoint_factory,
                 )
+            if result_store is not None:
+                result_store.save(execution_key, result)
+                persisted = result_store.load(execution_key)
+                if persisted is None:
+                    raise RuntimeError("candidate checkpoint disappeared after publication")
+                _validate_resumed_candidate_result(
+                    persisted,
+                    key=execution_key,
+                    dataset_slice=dataset_slice,
+                    split_plan=split_plan,
+                )
+                result = persisted
             resolved.append(result)
         results = tuple(resolved)
         compare_candidate_results(results)
