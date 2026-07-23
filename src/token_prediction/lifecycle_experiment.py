@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from token_prediction.crossfit import (
     SEED_POLICY_HASH,
@@ -34,6 +34,7 @@ from token_prediction.dataset import (
 from token_prediction.development import OuterInnerPlan
 from token_prediction.estimators import (
     EstimatorRegistry,
+    FitCheckpoint,
     FitContext,
     ObservedTransition,
     SessionSeed,
@@ -112,9 +113,7 @@ def _pseudonymous_tasks(
     *,
     split_plan_id: str,
 ) -> tuple[str, ...]:
-    return tuple(
-        sorted(_task_pseudonym(task, split_plan_id=split_plan_id) for task in tasks)
-    )
+    return tuple(sorted(_task_pseudonym(task, split_plan_id=split_plan_id) for task in tasks))
 
 
 def _derived_fit_seed(seed: int, *, outer_fold: int, inner_fold: int | None) -> int:
@@ -319,13 +318,9 @@ def _make_updater_view(
             key=lambda item: (item.task_id, item.run_id, item.trajectory_id),
         )
     )
-    expected_seed_ids = {
-        sequence.steps[0].point.point_id for sequence in selected_sequences
-    }
+    expected_seed_ids = {sequence.steps[0].point.point_id for sequence in selected_sequences}
     if set(seeds) != expected_seed_ids:
-        raise ValueError(
-            f"updater {partition_name} seeds do not exactly cover lifecycle sequences"
-        )
+        raise ValueError(f"updater {partition_name} seeds do not exactly cover lifecycle sequences")
     seeded_sequences = tuple(
         SeededLifecycleTrainingSequence(
             sequence,
@@ -383,9 +378,7 @@ def _artifact_payload_files(
                 [dict(record) for record in artifact.feature_importance]
             )
         if artifact.model_strings is not None:
-            files["model-strings.json"] = _canonical_json_bytes(
-                dict(artifact.model_strings)
-            )
+            files["model-strings.json"] = _canonical_json_bytes(dict(artifact.model_strings))
     if not files:
         converted = _json_compatible(fitted, context="fitted lifecycle component")
         files["fitted-state.json"] = _canonical_json_bytes(converted)
@@ -417,9 +410,7 @@ def _empirical_initializer_payload(
         "point": point,
         "upper": upper,
     }
-    return EMPIRICAL_INITIALIZER_FORMAT, None, {
-        "state.json": _canonical_json_bytes(state)
-    }
+    return EMPIRICAL_INITIALIZER_FORMAT, None, {"state.json": _canonical_json_bytes(state)}
 
 
 def _cross_position_updater_payload(
@@ -448,9 +439,7 @@ def _cross_position_updater_payload(
         "condition_id": expected["condition_id"],
         "input_contract_hash": expected["input_contract_hash"],
     }
-    return CROSS_POSITION_DEDUCT_FORMAT, None, {
-        "state.json": _canonical_json_bytes(state)
-    }
+    return CROSS_POSITION_DEDUCT_FORMAT, None, {"state.json": _canonical_json_bytes(state)}
 
 
 def _initializer_payload_files(
@@ -499,9 +488,7 @@ def _updater_payload_files(
             component_path = manifest["component"]["path"]
         except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise TypeError("GRU updater bundle manifest is invalid") from exc
-        if not isinstance(component_path, str) or not component_path.startswith(
-            "components/"
-        ):
+        if not isinstance(component_path, str) or not component_path.startswith("components/"):
             raise TypeError("GRU updater bundle component path is invalid")
         expected = {
             "manifest.json",
@@ -520,12 +507,8 @@ def _updater_payload_files(
             "gru/calibrator.json": standalone["calibrator.json"],
             "gru/component.json": standalone[f"{component_path}/component.json"],
             "gru/encoder.json": standalone[f"{component_path}/encoder.json"],
-            "gru/architecture.json": standalone[
-                f"{component_path}/architecture.json"
-            ],
-            "gru/weights.safetensors": standalone[
-                f"{component_path}/weights.safetensors"
-            ],
+            "gru/architecture.json": standalone[f"{component_path}/architecture.json"],
+            "gru/weights.safetensors": standalone[f"{component_path}/weights.safetensors"],
         }
         return GRU_BUNDLE_FORMAT, artifact, embedded
     return OPAQUE_AUDIT_FORMAT, artifact, files
@@ -594,9 +577,7 @@ def _pack_initializer(
             "calibration": "none",
         },
     )
-    model_hashes = {
-        name: _sha256_bytes(payload) for name, payload in sorted(model_files.items())
-    }
+    model_hashes = {name: _sha256_bytes(payload) for name, payload in sorted(model_files.items())}
     semantic: dict[str, Any] = {
         "component_schema_version": LIFECYCLE_COMPONENT_SCHEMA_VERSION,
         "role": "inner_initializer",
@@ -619,14 +600,10 @@ def _pack_initializer(
         "component.json": component_document,
         **{f"model/{name}": payload for name, payload in model_files.items()},
     }
-    bundle_hashes = tuple(
-        sorted(_sha256_bytes(payload) for payload in component_files.values())
-    )
+    bundle_hashes = tuple(sorted(_sha256_bytes(payload) for payload in component_files.values()))
     component = InitializerComponent(
         inner_fold=partition.holdout_fold,
-        component_id=(
-            f"{initializer_id}:outer-{outer_fold}:inner-{partition.holdout_fold}"
-        ),
+        component_id=(f"{initializer_id}:outer-{outer_fold}:inner-{partition.holdout_fold}"),
         component_hash=component_hash,
         bundle_hashes=bundle_hashes,
         fit_tasks=partition.initializer_fit_tasks,
@@ -641,19 +618,11 @@ def _partition_sequences(
     lifecycle_slice: LifecycleSlice,
     tasks: frozenset[str],
 ) -> tuple[LifecycleSequence, ...]:
-    return tuple(
-        sequence
-        for sequence in lifecycle_slice.sequences
-        if sequence.task_id in tasks
-    )
+    return tuple(sequence for sequence in lifecycle_slice.sequences if sequence.task_id in tasks)
 
 
 def _scored_from_runs(runs: Sequence[Any]) -> tuple[Any, ...]:
-    return tuple(
-        prediction
-        for run in runs
-        for prediction in run.scored_predictions
-    )
+    return tuple(prediction for run in runs for prediction in run.scored_predictions)
 
 
 def _fit_calibrator(
@@ -694,8 +663,7 @@ def _pack_composite_artifact(
         name: _pseudonymous_tasks(tasks, split_plan_id=split_plan.assignment_id)
         for name, tasks in sorted(outer_partitions.items())
     }
-    updater_serialization, updater_artifact, updater_model_files = (
-        _updater_payload_files(
+    updater_serialization, updater_artifact, updater_model_files = _updater_payload_files(
         fitted_updater,
         estimator_id=candidate.estimator_id,
         fold=fold,
@@ -718,11 +686,9 @@ def _pack_composite_artifact(
             "interval_alpha": alpha,
             "calibrator_id": calibrator_id,
         },
-        )
     )
     updater_model_hashes = {
-        name: _sha256_bytes(payload)
-        for name, payload in sorted(updater_model_files.items())
+        name: _sha256_bytes(payload) for name, payload in sorted(updater_model_files.items())
     }
     updater_semantic: dict[str, Any] = {
         "component_schema_version": LIFECYCLE_COMPONENT_SCHEMA_VERSION,
@@ -734,9 +700,7 @@ def _pack_composite_artifact(
         "model_files": updater_model_hashes,
     }
     updater_hash = _semantic_hash(updater_semantic)
-    updater_document = _canonical_json_bytes(
-        {**updater_semantic, "component_hash": updater_hash}
-    )
+    updater_document = _canonical_json_bytes({**updater_semantic, "component_hash": updater_hash})
 
     bundle: dict[str, bytes] = {
         "calibrator.json": _canonical_json_bytes(dict(calibrator_document)),
@@ -777,9 +741,7 @@ def _pack_composite_artifact(
             for task, inner_fold in inner_assignments
         )
     )
-    file_hashes = {
-        name: _sha256_bytes(payload) for name, payload in sorted(bundle.items())
-    }
+    file_hashes = {name: _sha256_bytes(payload) for name, payload in sorted(bundle.items())}
     manifest = {
         "bundle_schema_version": LIFECYCLE_COMPOSITE_BUNDLE_SCHEMA_VERSION,
         "bundle_kind": "lifecycle_composite",
@@ -817,8 +779,7 @@ def _pack_composite_artifact(
         "inner_split_id": inner_split_id,
         "inner_task_assignments_sha256": _semantic_hash(inner_mapping),
         "inner_task_assignments": [
-            {"task_pseudonym": task, "fold": inner_fold}
-            for task, inner_fold in inner_mapping
+            {"task_pseudonym": task, "fold": inner_fold} for task, inner_fold in inner_mapping
         ],
         "seed_policy_id": SEED_POLICY_ID,
         "seed_policy_hash": SEED_POLICY_HASH,
@@ -837,9 +798,7 @@ def _pack_composite_artifact(
         feature_importance=(
             None if updater_artifact is None else updater_artifact.feature_importance
         ),
-        model_strings=(
-            None if updater_artifact is None else updater_artifact.model_strings
-        ),
+        model_strings=(None if updater_artifact is None else updater_artifact.model_strings),
         bundle_files=bundle,
         calibrator=calibrator_document,
         provenance=manifest,
@@ -867,8 +826,7 @@ def _validate_inputs(
         raise ValueError("lifecycle slice belongs to another dataset")
     if (
         dataset.source_descriptor_hash != lifecycle_slice.source_descriptor_hash
-        or dataset.capability_contract_hash
-        != lifecycle_slice.capability_contract_hash
+        or dataset.capability_contract_hash != lifecycle_slice.capability_contract_hash
         or dataset.input_contract_hash != lifecycle_slice.input_contract_hash
     ):
         raise ValueError("lifecycle slice provenance differs from its dataset")
@@ -954,9 +912,7 @@ def _validated_inner_plans(
             raise ValueError("inner plan belongs to another outer split plan")
         expected_tasks = split_plan.partition(outer_fold).train_tasks
         if plan.assignment.task_ids != expected_tasks:
-            raise ValueError(
-                "inner plan task universe must equal the full outer-train partition"
-            )
+            raise ValueError("inner plan task universe must equal the full outer-train partition")
         validated[outer_fold] = plan
     return validated
 
@@ -972,9 +928,7 @@ def _condition_inner_partition(
     frozen = plan.assignment.partition(inner_fold)
     return InnerFoldPartition(
         holdout_fold=inner_fold,
-        initializer_fit_tasks=(
-            frozen.initializer_fit_tasks & condition_train_tasks
-        ),
+        initializer_fit_tasks=(frozen.initializer_fit_tasks & condition_train_tasks),
         validation_tasks=frozen.validation_tasks & condition_train_tasks,
         holdout_tasks=frozen.holdout_tasks & condition_train_tasks,
     )
@@ -992,6 +946,7 @@ def run_lifecycle_candidate_cv(
     seed: int,
     inner_plans: Mapping[int, OuterInnerPlan],
     source_provenance: Mapping[str, Any],
+    fit_checkpoint_factory: Callable[[int], FitCheckpoint | None] | None = None,
 ) -> CandidateResult:
     """Run leakage-free outer CV for a Task-pre initializer -> Task-update updater DAG."""
 
@@ -1040,9 +995,7 @@ def run_lifecycle_candidate_cv(
             "test": actual & partition.test_tasks,
         }
         if any(not tasks for tasks in outer_tasks.values()):
-            raise ValueError(
-                f"outer fold {outer_fold} has an empty lifecycle partition"
-            )
+            raise ValueError(f"outer fold {outer_fold} has an empty lifecycle partition")
         inner_plan = validated_inner_plans[outer_fold]
         inner_assignment = inner_plan.assignment
         initializer_scope_id = _initializer_training_scope_id(
@@ -1096,9 +1049,7 @@ def run_lifecycle_candidate_cv(
                     pre_weights,
                     candidate.feature_set,
                     dataset_id=initializer_scope_id,
-                    partition_name=(
-                        f"outer-{outer_fold}/inner-{inner_fold}/fit"
-                    ),
+                    partition_name=(f"outer-{outer_fold}/inner-{inner_fold}/fit"),
                 ),
                 _make_initializer_view(
                     pre_slice,
@@ -1106,9 +1057,7 @@ def run_lifecycle_candidate_cv(
                     pre_weights,
                     candidate.feature_set,
                     dataset_id=initializer_scope_id,
-                    partition_name=(
-                        f"outer-{outer_fold}/inner-{inner_fold}/validation"
-                    ),
+                    partition_name=(f"outer-{outer_fold}/inner-{inner_fold}/validation"),
                 ),
                 FitContext(
                     seed=_derived_fit_seed(
@@ -1137,9 +1086,7 @@ def run_lifecycle_candidate_cv(
 
         components = tuple(packed.component for packed in packed_initializers)
         external_tasks = frozenset(
-            task
-            for role in ("validation", "calibration", "test")
-            for task in outer_tasks[role]
+            task for role in ("validation", "calibration", "test") for task in outer_tasks[role]
         )
         task_pre_points = tuple(
             _lifecycle_selected_point(sequence.steps[0].point, candidate.feature_set)
@@ -1166,9 +1113,7 @@ def run_lifecycle_candidate_cv(
             lifecycle_slice,
             outer_tasks["validation"],
         )
-        train_seed_ids = {
-            sequence.steps[0].point.point_id for sequence in train_sequences
-        }
+        train_seed_ids = {sequence.steps[0].point.point_id for sequence in train_sequences}
         validation_seed_ids = {
             sequence.steps[0].point.point_id for sequence in validation_sequences
         }
@@ -1178,10 +1123,7 @@ def run_lifecycle_candidate_cv(
                 dataset_id=dataset.dataset_id,
                 target=lifecycle_slice.target,
                 sequences=train_sequences,
-                seeds={
-                    point_id: seed_set.by_point_id[point_id]
-                    for point_id in train_seed_ids
-                },
+                seeds={point_id: seed_set.by_point_id[point_id] for point_id in train_seed_ids},
                 feature_set=candidate.feature_set,
                 partition_name=f"outer-{outer_fold}/train",
                 input_contract_hash=lifecycle_slice.input_contract_hash,
@@ -1191,8 +1133,7 @@ def run_lifecycle_candidate_cv(
                 target=lifecycle_slice.target,
                 sequences=validation_sequences,
                 seeds={
-                    point_id: seed_set.by_point_id[point_id]
-                    for point_id in validation_seed_ids
+                    point_id: seed_set.by_point_id[point_id] for point_id in validation_seed_ids
                 },
                 feature_set=candidate.feature_set,
                 partition_name=f"outer-{outer_fold}/validation",
@@ -1206,6 +1147,11 @@ def run_lifecycle_candidate_cv(
                 ),
                 fold=outer_fold,
                 interval_alpha=alpha,
+                checkpoint=(
+                    fit_checkpoint_factory(outer_fold)
+                    if fit_checkpoint_factory is not None
+                    else None
+                ),
             ),
         )
 
@@ -1219,10 +1165,7 @@ def run_lifecycle_candidate_cv(
         calibration_runs = run_lifecycle_batch(
             fitted_updater,
             calibration_sequences,
-            {
-                point_id: seed_set.by_point_id[point_id]
-                for point_id in calibration_seed_ids
-            },
+            {point_id: seed_set.by_point_id[point_id] for point_id in calibration_seed_ids},
             select_point=lambda point: _lifecycle_selected_point(
                 point,
                 candidate.feature_set,
@@ -1269,9 +1212,7 @@ def run_lifecycle_candidate_cv(
         )
 
         test_sequences = _partition_sequences(lifecycle_slice, outer_tasks["test"])
-        test_seed_ids = {
-            sequence.steps[0].point.point_id for sequence in test_sequences
-        }
+        test_seed_ids = {sequence.steps[0].point.point_id for sequence in test_sequences}
         test_runs = run_lifecycle_batch(
             fitted_updater,
             test_sequences,
@@ -1302,9 +1243,7 @@ def run_lifecycle_candidate_cv(
                 strict=True,
             ):
                 if replace(expected, latency_ms=actual.latency_ms) != actual:
-                    raise ValueError(
-                        "lifecycle bundle reload changed a calibrated test trajectory"
-                    )
+                    raise ValueError("lifecycle bundle reload changed a calibrated test trajectory")
         fold_artifacts.append(fold_artifact)
         fold_scored: list[ScoredForecast] = []
         for prediction in test_predictions:

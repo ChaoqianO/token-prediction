@@ -67,6 +67,7 @@ def _results_document() -> dict[str, object]:
         "results_schema_version": stage3.STAGE3_RESULTS_SCHEMA_VERSION,
         "stage_name": stage3.STAGE3_STAGE_NAME,
         "run_policy_id": stage3.STAGE3_RUN_POLICY_ID,
+        "checkpoint_policy_id": stage3.STAGE3_CHECKPOINT_POLICY_ID,
         "artifact_layout_id": stage3.STAGE3_ARTIFACT_LAYOUT_ID,
         "run_id": "run",
         "source": {},
@@ -124,25 +125,21 @@ class Stage3RunnerTests(unittest.TestCase):
         tampered["run_id"] = "changed"
         with self.assertRaisesRegex(stage3.Stage3ExperimentError, "does not close"):
             stage3.verify_stage3_results_document(tampered)
+        wrong_checkpoint_policy = copy.deepcopy(value)
+        wrong_checkpoint_policy["checkpoint_policy_id"] = "save_sometimes"
+        with self.assertRaisesRegex(stage3.Stage3ExperimentError, "checkpoint policy"):
+            stage3.verify_stage3_results_document(wrong_checkpoint_policy)
         opened = copy.deepcopy(value)
         opened["final_holdout"]["evaluated"] = True
         opened["results_payload_sha256"] = stage3._semantic_sha256(
-            {
-                key: item
-                for key, item in opened.items()
-                if key != "results_payload_sha256"
-            }
+            {key: item for key, item in opened.items() if key != "results_payload_sha256"}
         )
         with self.assertRaisesRegex(stage3.Stage3ExperimentError, "not sealed"):
             stage3.verify_stage3_results_document(opened)
         private = copy.deepcopy(value)
         private["source"]["task_id"] = "private-task"
         private["results_payload_sha256"] = stage3._semantic_sha256(
-            {
-                key: item
-                for key, item in private.items()
-                if key != "results_payload_sha256"
-            }
+            {key: item for key, item in private.items() if key != "results_payload_sha256"}
         )
         with self.assertRaisesRegex(stage3.Stage3ExperimentError, "forbidden raw field"):
             stage3.verify_stage3_results_document(private)
@@ -164,6 +161,24 @@ class Stage3RunnerTests(unittest.TestCase):
             with self.subTest(path=unsafe):
                 with self.assertRaises((ValueError, stage3.Stage3ExperimentError)):
                     stage3._safe_output_root(root, unsafe)
+
+    def test_checkpoint_root_is_restricted_to_ignored_stage3_tree(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        relative, resolved = stage3._safe_checkpoint_root(
+            root,
+            "workspace/stage3/checkpoints",
+        )
+        self.assertEqual(relative, "workspace/stage3/checkpoints")
+        self.assertTrue(resolved.is_absolute())
+        for unsafe in (
+            "workspace/stage3",
+            "workspace/stage3/runs",
+            "../workspace/stage3/checkpoints",
+            "C:/outside",
+        ):
+            with self.subTest(path=unsafe):
+                with self.assertRaises((ValueError, stage3.Stage3ExperimentError)):
+                    stage3._safe_checkpoint_root(root, unsafe)
 
     def test_nested_gru_bundle_fits_windows_legacy_path_budget(self) -> None:
         root = PureWindowsPath(r"E:\kabuda\token prediction")

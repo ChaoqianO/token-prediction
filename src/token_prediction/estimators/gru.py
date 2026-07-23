@@ -29,12 +29,16 @@ from .base import (
 )
 from .cross_position_deduct import mechanical_deduct_operands
 from .mlp import (
-    _configure_deterministic_cpu,
     _deep_freeze_json,
     _load_neural_dependencies,
     _valid_quantiles,
 )
+from .neural_checkpoint import load_neural_epoch, save_neural_epoch
 from .neural_encoder import NeuralFeatureEncoder
+from .neural_runtime import (
+    configure_deterministic_training,
+    normalize_training_device,
+)
 
 
 GRU_RESIDUAL_ESTIMATOR_VERSION = 1
@@ -69,9 +73,7 @@ _FIT_PARAMETER_KEYS = frozenset(
 
 def _derived_seed(seed: int, fold: int) -> int:
     payload = f"gru-residual-v{GRU_RESIDUAL_ESTIMATOR_VERSION}:{seed}:{fold}"
-    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], "big") % (
-        2**31 - 1
-    )
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], "big") % (2**31 - 1)
 
 
 def _semantic_hash(value: object) -> str:
@@ -92,6 +94,15 @@ def _repair_tensor(torch: Any, raw: Any) -> Any:
     lower = torch.minimum(torch.clamp(raw[0], min=0.0), center)
     upper = torch.maximum(torch.clamp(raw[2], min=0.0), center)
     return torch.stack((lower, center, upper))
+
+
+def _repair_tensor_batch(torch: Any, raw: Any) -> Any:
+    if raw.ndim != 2 or raw.shape[1] != 3:
+        raise ValueError("batched quantiles must have shape (n, 3)")
+    center = torch.clamp(raw[:, 1], min=0.0)
+    lower = torch.minimum(torch.clamp(raw[:, 0], min=0.0), center)
+    upper = torch.maximum(torch.clamp(raw[:, 2], min=0.0), center)
+    return torch.stack((lower, center, upper), dim=1)
 
 
 def _repair_values(raw: Sequence[float]) -> tuple[float, float, float]:
@@ -235,14 +246,17 @@ class GRUArchitecture:
             for name in integer_names
         ):
             raise ValueError("GRU architecture dimensions must be integers")
-        if not isinstance(value["activation"], str) or not isinstance(
-            value["recurrent_cell"], str
-        ):
+        if not isinstance(value["activation"], str) or not isinstance(value["recurrent_cell"], str):
             raise ValueError("GRU architecture identifiers must be strings")
         return cls(**dict(value))
 
 
-def _build_network(torch: Any, architecture: GRUArchitecture) -> Any:
+def _build_network(
+    torch: Any,
+    architecture: GRUArchitecture,
+    *,
+    device: str = "cpu",
+) -> Any:
     class GRUResidualNetwork(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -275,7 +289,7 @@ def _build_network(torch: Any, architecture: GRUArchitecture) -> Any:
             updated = self.recurrent(encoded, hidden)
             return self.residual_head(updated), updated
 
-    return GRUResidualNetwork().to(device="cpu", dtype=torch.float32)
+    return GRUResidualNetwork().to(device=device, dtype=torch.float32)
 
 
 @dataclass(frozen=True)
@@ -348,7 +362,7 @@ def _validate_fit_report(
         raise ValueError("GRU fit report activation does not match")
     if parameters["teacher_forcing"] is not False:
         raise ValueError("GRU teacher forcing must remain disabled")
-    if parameters["device"] != "cpu" or parameters["optimizer"] != "adamw":
+    if parameters["device"] not in {"cpu", "cuda"} or parameters["optimizer"] != "adamw":
         raise ValueError("GRU runtime/optimizer contract is invalid")
     if parameters["deterministic"] is not True or parameters["num_threads"] != 1:
         raise ValueError("GRU deterministic CPU contract is invalid")
@@ -547,9 +561,7 @@ def _rollout_loss(
                     state,
                 )
             ).unsqueeze(0)
-            recurrent_input = (
-                torch.zeros_like(hidden) if no_recurrence else hidden
-            )
+            recurrent_input = torch.zeros_like(hidden) if no_recurrence else hidden
             residual, updated_hidden = model.forward_step(
                 transition_input,
                 recurrent_input,
@@ -581,6 +593,225 @@ def _rollout_loss(
     if not weighted_losses or not weights:
         raise ValueError("GRU rollout contains no scored loss points")
     return torch.stack(weighted_losses).sum() / sum(weights)
+
+
+@dataclass(frozen=True)
+class _PreparedBatch:
+    context_hashes: tuple[str, ...]
+    seed_forecasts: Any
+    previous_encoded: Any
+    current_encoded: Any
+    spend_values: Any
+    spend_known: Any
+    delta_values: Any
+    delta_known: Any
+    active_masks: Any
+    labels: Any
+    loss_masks: Any
+    weights: Any
+
+    @property
+    def sequence_count(self) -> int:
+        return len(self.context_hashes)
+
+    @property
+    def step_count(self) -> int:
+        return int(self.active_masks.shape[1])
+
+
+def _prepare_batch(
+    sequences: Sequence[Any],
+    encoder: NeuralFeatureEncoder,
+    torch: Any,
+    *,
+    device: str,
+) -> _PreparedBatch:
+    from token_prediction.lifecycle import visible_spend_delta
+
+    if not sequences:
+        raise ValueError("GRU batch requires at least one sequence")
+    sequence_count = len(sequences)
+    max_steps = max(len(tuple(sequence.steps)) - 1 for sequence in sequences)
+    if max_steps <= 0:
+        raise ValueError("GRU batch sequences require at least one update")
+    width = encoder.schema.output_width
+    seed_forecasts = torch.zeros((sequence_count, 3), dtype=torch.float32)
+    previous_encoded = torch.zeros((sequence_count, max_steps, width), dtype=torch.float32)
+    current_encoded = torch.zeros((sequence_count, max_steps, width), dtype=torch.float32)
+    spend_values = torch.zeros((sequence_count, max_steps), dtype=torch.float32)
+    spend_known = torch.zeros((sequence_count, max_steps), dtype=torch.bool)
+    delta_values = torch.zeros((sequence_count, max_steps), dtype=torch.float32)
+    delta_known = torch.zeros((sequence_count, max_steps), dtype=torch.bool)
+    active_masks = torch.zeros((sequence_count, max_steps), dtype=torch.bool)
+    labels = torch.zeros((sequence_count, max_steps), dtype=torch.float32)
+    loss_masks = torch.zeros((sequence_count, max_steps), dtype=torch.bool)
+    weights = torch.zeros((sequence_count, max_steps), dtype=torch.float32)
+    context_hashes: list[str] = []
+
+    for row_index, sequence in enumerate(sequences):
+        steps = tuple(sequence.steps)
+        points = tuple(step.point for step in steps)
+        encoded = torch.from_numpy(encoder.transform(points).matrix).to(dtype=torch.float32)
+        seed_forecasts[row_index] = torch.tensor(
+            (
+                float(sequence.session_seed.forecast.lower),
+                float(sequence.session_seed.forecast.point),
+                float(sequence.session_seed.forecast.upper),
+            ),
+            dtype=torch.float32,
+        )
+        context_hashes.append(str(sequence.context_hash))
+        for step_index, (previous, current) in enumerate(zip(points, points[1:])):
+            transition = ObservedTransition(
+                previous.point_id,
+                current.point_id,
+                visible_spend_delta(previous, current),
+            )
+            operands = mechanical_deduct_operands(previous, current, transition)
+            previous_encoded[row_index, step_index] = encoded[step_index]
+            current_encoded[row_index, step_index] = encoded[step_index + 1]
+            active_masks[row_index, step_index] = True
+            if transition.observed_spend_tokens is not None:
+                spend_values[row_index, step_index] = float(transition.observed_spend_tokens)
+                spend_known[row_index, step_index] = True
+            if operands.delta_tokens is not None:
+                delta_values[row_index, step_index] = float(operands.delta_tokens)
+                delta_known[row_index, step_index] = True
+            step = steps[step_index + 1]
+            loss_masks[row_index, step_index] = bool(step.loss_mask)
+            weights[row_index, step_index] = float(step.sample_weight)
+            if step.label is not None:
+                labels[row_index, step_index] = float(step.label)
+            if step.loss_mask and (step.label is None or step.sample_weight <= 0):
+                raise ValueError("GRU batch loss mask is inconsistent with label/weight")
+
+    tensors = (
+        seed_forecasts,
+        previous_encoded,
+        current_encoded,
+        spend_values,
+        spend_known,
+        delta_values,
+        delta_known,
+        active_masks,
+        labels,
+        loss_masks,
+        weights,
+    )
+    moved = tuple(tensor.to(device=device) for tensor in tensors)
+    return _PreparedBatch(tuple(context_hashes), *moved)
+
+
+def _batched_row_quantile_loss(
+    torch: Any,
+    predictions: Any,
+    targets: Any,
+    quantiles: tuple[float, float, float],
+    *,
+    q50_huber_delta: float | None,
+) -> Any:
+    errors = targets.unsqueeze(1) - predictions
+    q = torch.tensor(quantiles, dtype=predictions.dtype, device=predictions.device)
+    losses = torch.maximum(q * errors, (q - 1.0) * errors)
+    if q50_huber_delta is not None:
+        median_error = predictions[:, 1] - targets
+        absolute = torch.abs(median_error)
+        delta = float(q50_huber_delta)
+        huber = torch.where(
+            absolute <= delta,
+            0.5 * median_error.square() / delta,
+            absolute - 0.5 * delta,
+        )
+        losses = losses.clone()
+        losses[:, 1] = 0.5 * huber
+    return losses.mean(dim=1)
+
+
+def _rollout_batch_loss(
+    torch: Any,
+    model: Any,
+    batch: _PreparedBatch,
+    *,
+    architecture: GRUArchitecture,
+    target_scale: float,
+    quantiles: tuple[float, float, float],
+    q50_huber_delta: float | None,
+    residual_scale: float,
+    no_recurrence: bool,
+) -> Any:
+    device = batch.seed_forecasts.device
+    previous_forecast = batch.seed_forecasts
+    hidden = torch.zeros(
+        (batch.sequence_count, architecture.hidden_dim),
+        device=device,
+        dtype=torch.float32,
+    )
+    numerator = torch.zeros((), device=device, dtype=torch.float32)
+    denominator = torch.zeros((), device=device, dtype=torch.float32)
+
+    for step_index in range(batch.step_count):
+        active = batch.active_masks[:, step_index]
+        active_column = active.unsqueeze(1)
+        delta = torch.where(
+            batch.delta_known[:, step_index],
+            batch.delta_values[:, step_index],
+            torch.zeros_like(batch.delta_values[:, step_index]),
+        )
+        mechanical = _repair_tensor_batch(
+            torch,
+            previous_forecast + delta.unsqueeze(1),
+        )
+        previous_point = batch.previous_encoded[:, step_index]
+        current_point = batch.current_encoded[:, step_index]
+        state = torch.stack(
+            (
+                batch.spend_values[:, step_index] / target_scale,
+                batch.spend_known[:, step_index].to(dtype=torch.float32),
+                mechanical[:, 0].detach() / target_scale,
+                mechanical[:, 1].detach() / target_scale,
+                mechanical[:, 2].detach() / target_scale,
+            ),
+            dim=1,
+        )
+        transition_input = torch.cat(
+            (
+                previous_point,
+                current_point,
+                current_point - previous_point,
+                state,
+            ),
+            dim=1,
+        )
+        recurrent_input = torch.zeros_like(hidden) if no_recurrence else hidden
+        residual, proposed_hidden = model.forward_step(
+            transition_input,
+            recurrent_input,
+        )
+        proposed = _repair_tensor_batch(
+            torch,
+            mechanical + residual * (target_scale * residual_scale),
+        )
+        prediction = torch.where(active_column, proposed, previous_forecast)
+        hidden = torch.where(active_column, proposed_hidden, hidden)
+        score_mask = active & batch.loss_masks[:, step_index]
+        row_losses = _batched_row_quantile_loss(
+            torch,
+            prediction,
+            batch.labels[:, step_index],
+            quantiles,
+            q50_huber_delta=q50_huber_delta,
+        )
+        score_weight = torch.where(
+            score_mask,
+            batch.weights[:, step_index],
+            torch.zeros_like(batch.weights[:, step_index]),
+        )
+        numerator = numerator + torch.sum(row_losses * score_weight)
+        denominator = denominator + torch.sum(score_weight)
+        previous_forecast = prediction
+    if float(denominator.detach().cpu()) <= 0:
+        raise ValueError("GRU batched rollout contains no scored loss points")
+    return numerator / denominator
 
 
 @dataclass
@@ -702,9 +933,7 @@ class GRUResidualSession:
         self._hidden = updated_hidden.detach().cpu()
         self._pending_transition = None
         return (
-            self.calibrator.transform(uncalibrated)
-            if self.calibrator is not None
-            else uncalibrated
+            self.calibrator.transform(uncalibrated) if self.calibrator is not None else uncalibrated
         )
 
 
@@ -755,12 +984,15 @@ class FittedGRUResidual:
             abs_tol=0.0,
         ):
             raise ValueError("GRU fit report target scale is inconsistent")
-        if not math.isclose(
-            float(self.fit_report.parameters["residual_scale"]),
-            self.residual_scale,
-            rel_tol=0.0,
-            abs_tol=0.0,
-        ) or bool(self.fit_report.parameters["no_recurrence"]) != self.no_recurrence:
+        if (
+            not math.isclose(
+                float(self.fit_report.parameters["residual_scale"]),
+                self.residual_scale,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            or bool(self.fit_report.parameters["no_recurrence"]) != self.no_recurrence
+        ):
             raise ValueError("GRU fit report state policy is inconsistent")
         if self.calibrator_document is not None:
             object.__setattr__(
@@ -846,6 +1078,7 @@ class GRUResidualEstimator:
         q50_huber_delta: float | None = None,
         residual_scale: float = 1.0,
         no_recurrence: bool = False,
+        training_device: str = "cpu",
     ) -> None:
         if quantiles is not None and (
             not isinstance(quantiles, (tuple, list))
@@ -883,9 +1116,17 @@ class GRUResidualEstimator:
             ):
                 qualifier = "positive" if positive else "non-negative"
                 raise ValueError(f"{name} must be finite and {qualifier}")
-        if isinstance(max_epochs, bool) or not isinstance(max_epochs, int) or not 1 <= max_epochs <= 200:
+        if (
+            isinstance(max_epochs, bool)
+            or not isinstance(max_epochs, int)
+            or not 1 <= max_epochs <= 200
+        ):
             raise ValueError("max_epochs must be an integer in [1, 200]")
-        if isinstance(patience, bool) or not isinstance(patience, int) or not 1 <= patience <= max_epochs:
+        if (
+            isinstance(patience, bool)
+            or not isinstance(patience, int)
+            or not 1 <= patience <= max_epochs
+        ):
             raise ValueError("patience must be an integer in [1, max_epochs]")
         if q50_huber_delta is not None and (
             isinstance(q50_huber_delta, bool)
@@ -905,11 +1146,10 @@ class GRUResidualEstimator:
         self.max_epochs = max_epochs
         self.patience = patience
         self.min_delta = float(min_delta)
-        self.q50_huber_delta = (
-            None if q50_huber_delta is None else float(q50_huber_delta)
-        )
+        self.q50_huber_delta = None if q50_huber_delta is None else float(q50_huber_delta)
         self.residual_scale = float(residual_scale)
         self.no_recurrence = no_recurrence
+        self.training_device = normalize_training_device(training_device)
 
     def fit(
         self,
@@ -953,10 +1193,12 @@ class GRUResidualEstimator:
 
         np, torch = _load_neural_dependencies()
         seed = _derived_seed(context.seed, context.fold)
-        _configure_deterministic_cpu(torch, seed)
-        train_points = tuple(
-            step.point for sequence in train_sequences for step in sequence.steps
+        device = configure_deterministic_training(
+            torch,
+            seed=seed,
+            device=self.training_device,
         )
+        train_points = tuple(step.point for sequence in train_sequences for step in sequence.steps)
         validation_points = tuple(
             step.point for sequence in validation_sequences for step in sequence.steps
         )
@@ -969,25 +1211,73 @@ class GRUResidualEstimator:
             hidden_dim=self.hidden_dim,
             residual_head_dim=self.residual_head_dim,
         )
-        encoded_cells = (
-            len(train_points) + len(validation_points)
-        ) * architecture.point_input_dim
+        encoded_cells = (len(train_points) + len(validation_points)) * architecture.point_input_dim
         if encoded_cells > MAX_GRU_ENCODED_CELLS:
             raise ValueError("GRU encoded matrices exceed the safe cell-count limit")
-        prepared_train = _prepare_sequences(train_sequences, encoder, torch)
-        prepared_validation = _prepare_sequences(validation_sequences, encoder, torch)
+        prepared_train = _prepare_batch(
+            train_sequences,
+            encoder,
+            torch,
+            device=device,
+        )
+        prepared_validation = _prepare_batch(
+            validation_sequences,
+            encoder,
+            torch,
+            device=device,
+        )
         target_scale = _weighted_target_scale(train.examples)
-        model = _build_network(torch, architecture)
+        model = _build_network(torch, architecture, device=device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        history: list[float] = []
-        best_loss = math.inf
-        best_epoch = 0
-        best_state: dict[str, Any] | None = None
-        stale_epochs = 0
+        train_sequence_hash = _semantic_hash(
+            [
+                {
+                    "context_hash": sequence.context_hash,
+                    "seed_hash": sequence.session_seed.content_hash,
+                }
+                for sequence in train_sequences
+            ]
+        )
+        validation_sequence_hash = _semantic_hash(
+            [
+                {
+                    "context_hash": sequence.context_hash,
+                    "seed_hash": sequence.session_seed.content_hash,
+                }
+                for sequence in validation_sequences
+            ]
+        )
+        fit_identity = {
+            "checkpoint_policy_id": "gru_residual_full_state_every_epoch_v1",
+            "estimator_id": self.estimator_id,
+            "estimator_version": GRU_RESIDUAL_ESTIMATOR_VERSION,
+            "dataset_id": train.dataset_id,
+            "input_contract_hash": train.input_contract_hash,
+            "position": train.position.value,
+            "target": train.target.value,
+            "condition_id": next(iter(train_condition)),
+            "train_sequence_hash": train_sequence_hash,
+            "validation_sequence_hash": validation_sequence_hash,
+            "encoder_schema_hash": encoder.schema.content_hash,
+            "architecture": architecture.to_dict(),
+            "target_scale": target_scale,
+            "seed": seed,
+            "interval_alpha": context.interval_alpha,
+            "quantiles": list(quantiles),
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "max_epochs": self.max_epochs,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "q50_huber_delta": self.q50_huber_delta,
+            "residual_scale": self.residual_scale,
+            "no_recurrence": self.no_recurrence,
+            "training_device": self.training_device,
+        }
         rollout_kwargs = {
             "architecture": architecture,
             "target_scale": target_scale,
@@ -996,10 +1286,71 @@ class GRUResidualEstimator:
             "residual_scale": self.residual_scale,
             "no_recurrence": self.no_recurrence,
         }
-        for epoch in range(1, self.max_epochs + 1):
+        resumed = load_neural_epoch(
+            context.checkpoint,
+            identity=fit_identity,
+            model=model,
+            optimizer=optimizer,
+            torch=torch,
+            device=device,
+        )
+        if resumed is None:
+            history: list[float] = []
+            best_loss = math.inf
+            best_epoch = 0
+            best_state: dict[str, Any] | None = None
+            stale_epochs = 0
+            first_epoch = 1
+        else:
+            history = list(resumed.history)
+            best_loss = resumed.best_loss
+            best_epoch = resumed.best_epoch
+            best_state = dict(resumed.best_state)
+            stale_epochs = resumed.stale_epochs
+            first_epoch = (
+                self.max_epochs + 1 if stale_epochs >= self.patience else resumed.epoch + 1
+            )
+
+        if self.residual_scale == 0.0 and resumed is None:
+            model.eval()
+            with torch.inference_mode():
+                best_loss = float(
+                    _rollout_batch_loss(
+                        torch,
+                        model,
+                        prepared_validation,
+                        **rollout_kwargs,
+                    ).item()
+                )
+            if not math.isfinite(best_loss):
+                raise RuntimeError("GRU zero-residual validation loss became non-finite")
+            history = [best_loss]
+            best_epoch = 1
+            stale_epochs = 0
+            best_state = {
+                name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()
+            }
+            save_neural_epoch(
+                context.checkpoint,
+                identity=fit_identity,
+                epoch=1,
+                model=model,
+                best_state=best_state,
+                optimizer=optimizer,
+                best_epoch=best_epoch,
+                best_loss=best_loss,
+                stale_epochs=stale_epochs,
+                history=history,
+                torch=torch,
+            )
+            first_epoch = 2
+
+        for epoch in range(first_epoch, self.max_epochs + 1):
+            if self.residual_scale == 0.0:
+                break
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            loss = _rollout_loss(
+            loss = _rollout_batch_loss(
                 torch,
                 model,
                 prepared_train,
@@ -1013,7 +1364,7 @@ class GRUResidualEstimator:
             model.eval()
             with torch.inference_mode():
                 validation_loss = float(
-                    _rollout_loss(
+                    _rollout_batch_loss(
                         torch,
                         model,
                         prepared_validation,
@@ -1031,14 +1382,32 @@ class GRUResidualEstimator:
                     for name, tensor in model.state_dict().items()
                 }
                 stale_epochs = 0
+                should_stop = False
             else:
                 stale_epochs += 1
-                if stale_epochs >= self.patience:
-                    break
+                should_stop = stale_epochs >= self.patience
+            if best_state is None:
+                raise RuntimeError("GRU residual did not produce a valid checkpoint")
+            save_neural_epoch(
+                context.checkpoint,
+                identity=fit_identity,
+                epoch=epoch,
+                model=model,
+                best_state=best_state,
+                optimizer=optimizer,
+                best_epoch=best_epoch,
+                best_loss=best_loss,
+                stale_epochs=stale_epochs,
+                history=history,
+                torch=torch,
+            )
+            if should_stop:
+                break
         if best_state is None:
             raise RuntimeError("GRU residual did not produce a valid checkpoint")
-        model.load_state_dict(best_state, strict=True)
-        model.eval()
+        frozen_model = _build_network(torch, architecture, device="cpu")
+        frozen_model.load_state_dict(best_state, strict=True)
+        frozen_model.eval()
         parameters: dict[str, Any] = {
             "quantiles": list(quantiles),
             "transition_dim": self.transition_dim,
@@ -1052,7 +1421,7 @@ class GRUResidualEstimator:
             "q50_huber_delta": self.q50_huber_delta,
             "residual_scale": self.residual_scale,
             "no_recurrence": self.no_recurrence,
-            "device": "cpu",
+            "device": self.training_device,
             "deterministic": True,
             "num_threads": 1,
             "optimizer": "adamw",
@@ -1062,24 +1431,8 @@ class GRUResidualEstimator:
         report = GRUFitReport(
             estimator_version=GRU_RESIDUAL_ESTIMATOR_VERSION,
             encoder_schema_hash=encoder.schema.content_hash,
-            train_sequence_hash=_semantic_hash(
-                [
-                    {
-                        "context_hash": sequence.context_hash,
-                        "seed_hash": sequence.session_seed.content_hash,
-                    }
-                    for sequence in train_sequences
-                ]
-            ),
-            validation_sequence_hash=_semantic_hash(
-                [
-                    {
-                        "context_hash": sequence.context_hash,
-                        "seed_hash": sequence.session_seed.content_hash,
-                    }
-                    for sequence in validation_sequences
-                ]
-            ),
+            train_sequence_hash=train_sequence_hash,
+            validation_sequence_hash=validation_sequence_hash,
             train_sequence_count=len(train_sequences),
             validation_sequence_count=len(validation_sequences),
             train_scored_point_count=len(train.examples),
@@ -1102,7 +1455,7 @@ class GRUResidualEstimator:
             condition_id=next(iter(train_condition)),
             encoder=encoder,
             architecture=architecture,
-            model=model,
+            model=frozen_model,
             quantiles=quantiles,
             target_scale=target_scale,
             residual_scale=self.residual_scale,

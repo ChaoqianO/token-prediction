@@ -36,8 +36,8 @@ from token_prediction.stage2_matrix import (
 )
 
 
-STAGE3_MATRIX_SCHEMA_VERSION = 1
-STAGE3_MATRIX_POLICY_ID = "stage3_gru_lifecycle_ablation_matrix_v1"
+STAGE3_MATRIX_SCHEMA_VERSION = 2
+STAGE3_MATRIX_POLICY_ID = "stage3_gru_lifecycle_ablation_matrix_cuda_v2"
 STAGE3_MIN_DEVELOPMENT_TASKS = 10
 STAGE3_ALPHA = 0.10
 STAGE3_CALIBRATOR_ID = "task_max_conformal"
@@ -89,9 +89,7 @@ class Stage3Gate:
             "source_id": self.source_id,
             "condition_id": self.condition_id,
             "position": PredictionPosition.TASK_UPDATE.value,
-            "target": (
-                PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS.value
-            ),
+            "target": (PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS.value),
             "reason": self.reason,
             "development_task_count": self.development_task_count,
             "eligible_point_count": self.eligible_point_count,
@@ -204,6 +202,7 @@ def _mlp_params() -> dict[str, object]:
         "patience": 20,
         "min_delta": 0.0,
         "q50_huber_delta": None,
+        "training_device": "cuda",
     }
 
 
@@ -221,6 +220,7 @@ def _gru_params() -> dict[str, object]:
         "q50_huber_delta": None,
         "residual_scale": 1.0,
         "no_recurrence": False,
+        "training_device": "cuda",
     }
 
 
@@ -371,9 +371,7 @@ def build_stage3_matrix(
                     "task_update-task_provider_accounted_remaining_tokens"
                 ),
                 position=PredictionPosition.TASK_UPDATE,
-                target=(
-                    PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
-                ),
+                target=(PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS),
                 candidates=_stage3_candidates(
                     condition_id=condition_id,
                     input_contract_hash=dataset.input_contract_hash,

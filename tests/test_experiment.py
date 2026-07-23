@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import platform
+import tempfile
 import unittest
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
 from token_prediction import __version__ as TOKEN_PREDICTION_VERSION
+from token_prediction.checkpoint import CandidateCheckpointStore
 from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
 from token_prediction.dataset import (
     PredictionPosition,
@@ -41,9 +44,7 @@ from token_prediction.features import FULL_FEATURE_SET, NO_FEATURES, FeatureGrou
 from tests.helpers import make_two_call_trajectory
 
 
-HAS_NEURAL = bool(
-    importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors")
-)
+HAS_NEURAL = bool(importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors"))
 
 
 class ExperimentContractTests(unittest.TestCase):
@@ -166,6 +167,65 @@ class ExperimentContractTests(unittest.TestCase):
             )
             self.assertEqual(result.fold_artifacts, ())
 
+    def test_candidate_checkpoint_skips_completed_fit_and_revalidates_metrics(self) -> None:
+        candidate = CandidateSpec(
+            "empirical",
+            "empirical_quantile",
+            NO_FEATURES,
+            role=CandidateRole.BASELINE,
+        )
+        spec = ExperimentSpec(
+            "checkpointed-call-pre",
+            PredictionPosition.CALL_PRE,
+            PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS,
+            (candidate,),
+            calibrator_id="none",
+        )
+        runner = ExperimentRunner(builtin_registry())
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CandidateCheckpointStore(
+                Path(temporary),
+                run_id="candidate-resume",
+                run_semantic={"test": "candidate-resume"},
+            )
+            first = runner.run(self.dataset, self.split, spec, seed=13, result_store=store)
+            with patch(
+                "token_prediction.experiment.run_candidate_cv",
+                side_effect=AssertionError("completed candidate was refit"),
+            ):
+                resumed = runner.run(
+                    self.dataset,
+                    self.split,
+                    spec,
+                    seed=13,
+                    result_store=store,
+                )
+            self.assertEqual(resumed, first)
+
+            tampered = replace(
+                first[0],
+                metrics={**dict(first[0].metrics), "mae": float(first[0].metrics["mae"]) + 1},
+            )
+
+            class _TamperedStore:
+                def load(self, _key: object) -> object:
+                    return tampered
+
+                def save(self, _key: object, _result: object) -> None:
+                    raise AssertionError("tampered result must not be saved")
+
+                def fit_checkpoint(self, _key: object, _fold: int) -> None:
+                    raise AssertionError("tampered result must not reach fitting")
+
+            with self.assertRaisesRegex(ValueError, "aggregate metrics"):
+                runner.run(
+                    self.dataset,
+                    self.split,
+                    spec,
+                    seed=13,
+                    result_store=_TamperedStore(),  # type: ignore[arg-type]
+                )
+
     @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
     def test_independent_mlp_fold_bundle_is_reloaded_before_result(self) -> None:
         import numpy as np
@@ -190,11 +250,7 @@ class ExperimentContractTests(unittest.TestCase):
             ),
         )
         dataset = build_capability_supervised_dataset(
-            (
-                make_two_call_trajectory(task, run)
-                for task in range(5)
-                for run in range(2)
-            ),
+            (make_two_call_trajectory(task, run) for task in range(5) for run in range(2)),
             descriptor,
         )
         split = make_task_split_plan(

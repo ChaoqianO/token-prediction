@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
+from token_prediction.checkpoint import CandidateCheckpointStore
 from token_prediction.dataset import PredictionPoint, PredictionPosition, PredictionTarget
 from token_prediction.estimators.base import (
     FitContext,
@@ -24,9 +28,48 @@ from token_prediction.estimators.neural_encoder import (
     NeuralFeatureEncoder,
     OptionalNeuralDependencyError,
 )
+from token_prediction.experiment import CandidateExecutionKey
 
 
 HAS_NEURAL = bool(importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors"))
+RUN_CUDA_TESTS = os.environ.get("TOKEN_PREDICTION_TEST_CUDA") == "1"
+
+
+class _InterruptAfterEpoch:
+    def __init__(self, delegate: object, epoch: int) -> None:
+        self.delegate = delegate
+        self.epoch = epoch
+        self.interrupted = False
+
+    def load(self, identity: object) -> object:
+        return self.delegate.load(identity)
+
+    def save(self, identity: object, *, epoch: int, files: object) -> None:
+        self.delegate.save(identity, epoch=epoch, files=files)
+        if epoch == self.epoch and not self.interrupted:
+            self.interrupted = True
+            raise RuntimeError("simulated process interruption")
+
+    def clear(self) -> None:
+        self.delegate.clear()
+
+
+def _checkpoint_key() -> CandidateExecutionKey:
+    return CandidateExecutionKey(
+        experiment_id="mlp-checkpoint-test",
+        candidate_id="independent-mlp",
+        candidate_hash="a" * 64,
+        dataset_id="mlp-dataset",
+        split_plan_id="b" * 64,
+        split_seed=17,
+        eligibility_hash="c" * 64,
+        position=PredictionPosition.TASK_PRE,
+        target=PredictionTarget.TASK_UNKNOWN_REMAINING_TOKENS,
+        condition_id="condition-a",
+        calibrator_id="none",
+        alpha=0.1,
+        source_provenance_hash="d" * 64,
+    )
 
 
 def _point(index: int, *, condition_id: str = "condition-a") -> PredictionPoint:
@@ -98,9 +141,7 @@ print('safe')
     def test_missing_optional_dependency_fails_with_actionable_error(self) -> None:
         with mock.patch(
             "token_prediction.estimators.mlp._load_neural_dependencies",
-            side_effect=OptionalNeuralDependencyError(
-                "install token-prediction[neural]"
-            ),
+            side_effect=OptionalNeuralDependencyError("install token-prediction[neural]"),
         ):
             with self.assertRaisesRegex(
                 OptionalNeuralDependencyError, r"token-prediction\[neural\]"
@@ -199,9 +240,7 @@ print('safe')
         with self.assertRaisesRegex(ValueError, "condition_id"):
             session.predict(replace(point, condition_id="condition-b"))
         with self.assertRaisesRegex(ValueError, "target"):
-            session.predict(
-                replace(point, target=PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS)
-            )
+            session.predict(replace(point, target=PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS))
         with self.assertRaisesRegex(ValueError, "dataset_id"):
             first.start(replace(context, dataset_id="another-dataset"))
         with self.assertRaisesRegex(ValueError, "input_contract_hash"):
@@ -213,6 +252,116 @@ print('safe')
         wrong_task = first.start(replace(context, task_id="another-task"))
         with self.assertRaisesRegex(ValueError, "task_id"):
             wrong_task.predict(point)
+
+    @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
+    def test_epoch_checkpoint_resumes_exactly_after_process_interruption(self) -> None:
+        import torch
+
+        estimator = IndependentMLPQuantileEstimator(
+            max_epochs=6,
+            patience=2,
+            min_delta=1e9,
+            hidden_dims=(8, 4),
+        )
+        train = _view(range(20))
+        validation = _view(range(20, 28))
+        uninterrupted = estimator.fit(train, validation, FitContext(17, 0))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CandidateCheckpointStore(
+                Path(temporary),
+                run_id="mlp-resume",
+                run_semantic={"test": "exact-resume"},
+            )
+            checkpoint = store.fit_checkpoint(_checkpoint_key(), 0)
+            interrupting = _InterruptAfterEpoch(checkpoint, 3)
+            with self.assertRaisesRegex(RuntimeError, "simulated process interruption"):
+                estimator.fit(
+                    train,
+                    validation,
+                    FitContext(17, 0, checkpoint=interrupting),
+                )
+            persisted = checkpoint.load(
+                {
+                    "checkpoint_policy_id": "independent_mlp_full_state_every_epoch_v1",
+                    "estimator_id": "independent_mlp",
+                    "estimator_version": uninterrupted.fit_report.estimator_version,
+                    "dataset_id": train.dataset_id,
+                    "input_contract_hash": train.input_contract_hash,
+                    "position": train.position.value,
+                    "target": train.target.value,
+                    "condition_ids": ["condition-a"],
+                    "train_point_hash": uninterrupted.fit_report.train_point_hash,
+                    "validation_point_hash": uninterrupted.fit_report.validation_point_hash,
+                    "encoder_schema_hash": uninterrupted.encoder.schema.content_hash,
+                    "architecture": uninterrupted.architecture.to_dict(),
+                    "seed": uninterrupted.fit_report.seed,
+                    "interval_alpha": 0.1,
+                    "quantiles": [0.05, 0.5, 0.95],
+                    "learning_rate": 1e-3,
+                    "weight_decay": 1e-4,
+                    "max_epochs": 6,
+                    "patience": 2,
+                    "min_delta": 1e9,
+                    "q50_huber_delta": None,
+                    "training_device": "cpu",
+                }
+            )
+            self.assertIsNotNone(persisted)
+            resumed = estimator.fit(
+                train,
+                validation,
+                FitContext(17, 0, checkpoint=checkpoint),
+            )
+
+        self.assertEqual(
+            uninterrupted.fit_report.validation_history,
+            resumed.fit_report.validation_history,
+        )
+        self.assertEqual(uninterrupted.fit_report.best_epoch, resumed.fit_report.best_epoch)
+        for name, tensor in uninterrupted.model.state_dict().items():
+            self.assertTrue(torch.equal(tensor, resumed.model.state_dict()[name]), name)
+
+    @unittest.skipUnless(RUN_CUDA_TESTS, "set TOKEN_PREDICTION_TEST_CUDA=1")
+    def test_cuda_epoch_checkpoint_resumes_exactly_with_cpu_frozen_model(self) -> None:
+        import torch
+
+        self.assertTrue(torch.cuda.is_available(), "CUDA test was requested without CUDA")
+        estimator = IndependentMLPQuantileEstimator(
+            max_epochs=4,
+            patience=4,
+            hidden_dims=(8, 4),
+            training_device="cuda",
+        )
+        train = _view(range(20))
+        validation = _view(range(20, 28))
+        uninterrupted = estimator.fit(train, validation, FitContext(29, 0))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CandidateCheckpointStore(
+                Path(temporary),
+                run_id="mlp-cuda-resume",
+                run_semantic={"test": "cuda-exact-resume"},
+            )
+            checkpoint = store.fit_checkpoint(_checkpoint_key(), 0)
+            interrupting = _InterruptAfterEpoch(checkpoint, 2)
+            with self.assertRaisesRegex(RuntimeError, "simulated process interruption"):
+                estimator.fit(
+                    train,
+                    validation,
+                    FitContext(29, 0, checkpoint=interrupting),
+                )
+            resumed = estimator.fit(
+                train,
+                validation,
+                FitContext(29, 0, checkpoint=checkpoint),
+            )
+        self.assertEqual(uninterrupted.fit_report.parameters["device"], "cuda")
+        self.assertEqual(
+            uninterrupted.fit_report.validation_history,
+            resumed.fit_report.validation_history,
+        )
+        for name, tensor in uninterrupted.model.state_dict().items():
+            self.assertEqual(tensor.device.type, "cpu")
+            self.assertTrue(torch.equal(tensor, resumed.model.state_dict()[name]), name)
 
     @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
     def test_configured_quantiles_must_match_interval_alpha(self) -> None:
@@ -265,9 +414,7 @@ print('safe')
         )
         with mock.patch.object(NeuralFeatureEncoder, "fit", return_value=encoder):
             with self.assertRaisesRegex(ValueError, "cell-count"):
-                IndependentMLPQuantileEstimator(
-                    hidden_dims=(1, 1), max_epochs=2, patience=1
-                ).fit(
+                IndependentMLPQuantileEstimator(hidden_dims=(1, 1), max_epochs=2, patience=1).fit(
                     _view(range(30)),
                     _view(range(30, 60)),
                     FitContext(1, 0),

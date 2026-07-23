@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from token_prediction.dataset import build_lifecycle_slice
+from token_prediction.checkpoint import CandidateCheckpointStore
 from token_prediction.development import STAGE_SPLIT_SEEDS, build_development_protocol
 from token_prediction.evaluation import (
     ScoredForecast,
@@ -29,6 +30,7 @@ from token_prediction.lifecycle_bundle import load_lifecycle_bundle
 from token_prediction.lineage import publish_artifact, verify_artifact
 from token_prediction.pipeline import (
     DevelopmentExperimentResults,
+    _experiment_runtime_versions,
     _write_fold_artifacts,
     run_development_experiments,
 )
@@ -88,10 +90,10 @@ else:  # pragma: no cover - production CLI invocation
     )
 
 
-STAGE3_RESULTS_SCHEMA_VERSION = 1
-STAGE3_ARTIFACT_SCHEMA_VERSION = 1
+STAGE3_RESULTS_SCHEMA_VERSION = 2
+STAGE3_ARTIFACT_SCHEMA_VERSION = 2
 STAGE3_STAGE_NAME = "stage3_development_source"
-STAGE3_RUN_POLICY_ID = "stage3_source_three_seed_nested_cv_v1"
+STAGE3_RUN_POLICY_ID = "stage3_source_three_seed_cuda_resumable_nested_cv_v2"
 STAGE3_PREDICTION_PROJECTION_ID = "stage3_calibrated_prediction_projection_v1"
 STAGE3_COHORT_PROJECTION_ID = "stage3_prediction_cohort_projection_v1"
 STAGE3_TASK_PSEUDONYM_POLICY_ID = "stage3_task_pseudonym_v1"
@@ -100,6 +102,9 @@ STAGE3_OUTPUT_KEY_HEX_LENGTH = 20
 STAGE3_RUNNER_RELATIVE = "scripts/run_stage3_experiments.py"
 DEFAULT_OUTPUT_ROOT = "workspace/stage3/runs"
 ALLOWED_OUTPUT_PREFIX = "workspace/stage3/runs/"
+DEFAULT_CHECKPOINT_ROOT = "workspace/stage3/checkpoints"
+ALLOWED_CHECKPOINT_PREFIX = "workspace/stage3/checkpoints/"
+STAGE3_CHECKPOINT_POLICY_ID = "atomic_candidate_and_every_neural_epoch_v1"
 _FORBIDDEN_RESULT_KEYS = frozenset(
     {
         "attempt_id",
@@ -411,11 +416,7 @@ def _budget_rows(
         spec.target,
         condition_id=spec.condition_id,
     )
-    labels = {
-        row.point.point_id: float(row.label)
-        for row in cell.rows
-        if row.label is not None
-    }
+    labels = {row.point.point_id: float(row.label) for row in cell.rows if row.label is not None}
     if set(labels) != {record.point_id for record in result.predictions}:
         raise Stage3ExperimentError("Stage 3 budget cohort differs from scored predictions")
     return tuple(
@@ -468,9 +469,7 @@ def _lifecycle_diagnostics(
         )
         test_tasks = split_plan.partition(fold).test_tasks
         sequences = tuple(
-            sequence
-            for sequence in lifecycle_slice.sequences
-            if sequence.task_id in test_tasks
+            sequence for sequence in lifecycle_slice.sequences if sequence.task_id in test_tasks
         )
         if not sequences:
             raise Stage3ExperimentError("lifecycle diagnostic fold has no test sequences")
@@ -518,15 +517,17 @@ def _result_document(
     source_provenance: Mapping[str, object],
 ) -> dict[str, object]:
     bundle_folds = [
-        artifact.fold
-        for artifact in result.fold_artifacts
-        if artifact.bundle_files is not None
+        artifact.fold for artifact in result.fold_artifacts if artifact.bundle_files is not None
     ]
-    require_bundle = candidate.estimator_id in {
-        "independent_mlp",
-        "lightgbm_quantile",
-        "gru_residual",
-    } or candidate.graph.is_lifecycle
+    require_bundle = (
+        candidate.estimator_id
+        in {
+            "independent_mlp",
+            "lightgbm_quantile",
+            "gru_residual",
+        }
+        or candidate.graph.is_lifecycle
+    )
     if require_bundle and bundle_folds != list(range(5)):
         raise Stage3ExperimentError(
             f"candidate {result.candidate_id!r} lacks five reloadable fold bundles"
@@ -554,9 +555,7 @@ def _result_document(
         "cohort_projection_id": STAGE3_COHORT_PROJECTION_ID,
         "cohort_projection_sha256": cohort_projection_sha256(result),
         "metrics": dict(result.metrics),
-        "fold_metrics": {
-            str(fold): dict(metrics) for fold, metrics in result.fold_metrics.items()
-        },
+        "fold_metrics": {str(fold): dict(metrics) for fold, metrics in result.fold_metrics.items()},
         "task_metric_policy_id": STAGE3_TASK_PSEUDONYM_POLICY_ID,
         "task_metrics": _task_metric_projection(result),
         "fold_artifact_count": len(result.fold_artifacts),
@@ -659,13 +658,9 @@ def build_stage3_results(
                     "role": candidate.role.value,
                     "ablation": (
                         {
-                            "reference_candidate_id": (
-                                candidate.ablation.reference_candidate_id
-                            ),
+                            "reference_candidate_id": (candidate.ablation.reference_candidate_id),
                             "axis": candidate.ablation.axis.value,
-                            "allowed_config_paths": sorted(
-                                candidate.ablation.allowed_config_paths
-                            ),
+                            "allowed_config_paths": sorted(candidate.ablation.allowed_config_paths),
                         }
                         if candidate.ablation is not None
                         else None
@@ -691,6 +686,7 @@ def build_stage3_results(
         "results_schema_version": STAGE3_RESULTS_SCHEMA_VERSION,
         "stage_name": STAGE3_STAGE_NAME,
         "run_policy_id": STAGE3_RUN_POLICY_ID,
+        "checkpoint_policy_id": STAGE3_CHECKPOINT_POLICY_ID,
         "artifact_layout_id": STAGE3_ARTIFACT_LAYOUT_ID,
         "run_id": run_id,
         "source": {
@@ -698,9 +694,7 @@ def build_stage3_results(
             "source_id": loaded.source_lock.descriptor.source_id,
             "revision": loaded.source_lock.descriptor.revision,
             "source_descriptor_hash": loaded.source_lock.descriptor.descriptor_hash,
-            "capability_contract_hash": (
-                loaded.source_lock.descriptor.capabilities.contract_hash
-            ),
+            "capability_contract_hash": (loaded.source_lock.descriptor.capabilities.contract_hash),
             "manifest_path": loaded.source_lock.manifest_path,
             "manifest_sha256": loaded.source_lock.manifest_sha256,
             "raw_artifact_sha256": loaded.source_lock.raw_artifact_sha256,
@@ -754,6 +748,7 @@ def verify_stage3_results_document(value: Mapping[str, object]) -> str:
         "results_schema_version",
         "stage_name",
         "run_policy_id",
+        "checkpoint_policy_id",
         "artifact_layout_id",
         "run_id",
         "source",
@@ -775,6 +770,8 @@ def verify_stage3_results_document(value: Mapping[str, object]) -> str:
         raise Stage3ExperimentError("unsupported Stage 3 results schema")
     if value["stage_name"] != STAGE3_STAGE_NAME or value["run_policy_id"] != STAGE3_RUN_POLICY_ID:
         raise Stage3ExperimentError("Stage 3 results policy identity is invalid")
+    if value["checkpoint_policy_id"] != STAGE3_CHECKPOINT_POLICY_ID:
+        raise Stage3ExperimentError("Stage 3 checkpoint policy identity is invalid")
     if value["artifact_layout_id"] != STAGE3_ARTIFACT_LAYOUT_ID:
         raise Stage3ExperimentError("Stage 3 artifact layout identity is invalid")
     _assert_aggregate_safe(value)
@@ -848,13 +845,26 @@ def _safe_output_root(root: Path, relative: str) -> tuple[str, Path]:
         raise Stage3ExperimentError("Stage 3 output root is not a safe relative path") from exc
     prefix = ALLOWED_OUTPUT_PREFIX.rstrip("/")
     if canonical != prefix and not canonical.startswith(ALLOWED_OUTPUT_PREFIX):
-        raise Stage3ExperimentError(
-            f"Stage 3 output root must be {prefix!r} or a descendant"
-        )
+        raise Stage3ExperimentError(f"Stage 3 output root must be {prefix!r} or a descendant")
     try:
         resolved = _repo_path(root, canonical, label="Stage 3 output root")
     except DataFoundationBaselineError as exc:
         raise Stage3ExperimentError("Stage 3 output root escapes the repository") from exc
+    return canonical, resolved
+
+
+def _safe_checkpoint_root(root: Path, relative: str) -> tuple[str, Path]:
+    try:
+        canonical = _safe_relative(relative, label="Stage 3 checkpoint root")
+    except DataFoundationBaselineError as exc:
+        raise Stage3ExperimentError("Stage 3 checkpoint root is not a safe relative path") from exc
+    prefix = ALLOWED_CHECKPOINT_PREFIX.rstrip("/")
+    if canonical != prefix and not canonical.startswith(ALLOWED_CHECKPOINT_PREFIX):
+        raise Stage3ExperimentError(f"Stage 3 checkpoint root must be {prefix!r} or a descendant")
+    try:
+        resolved = _repo_path(root, canonical, label="Stage 3 checkpoint root")
+    except DataFoundationBaselineError as exc:
+        raise Stage3ExperimentError("Stage 3 checkpoint root escapes the repository") from exc
     return canonical, resolved
 
 
@@ -874,9 +884,7 @@ def _run_semantic(
         "source_id": loaded.source_lock.descriptor.source_id,
         "revision": loaded.source_lock.descriptor.revision,
         "raw_artifact_sha256": loaded.source_lock.raw_artifact_sha256,
-        "data_foundation_baseline_lock_sha256": (
-            lock_context.baseline_lock_file_sha256
-        ),
+        "data_foundation_baseline_lock_sha256": (lock_context.baseline_lock_file_sha256),
         "base_dataset_id": loaded.base_dataset_id,
         "derived_dataset_id": loaded.derived_dataset.dataset_id,
         "development_protocol_id": matrix.development_protocol_id,
@@ -884,6 +892,7 @@ def _run_semantic(
         "git_commit": code_binding.git_commit,
         "code_tree_sha256": code_binding.code_tree_sha256,
         "runtime_versions": dict(runtime_versions),
+        "checkpoint_policy_id": STAGE3_CHECKPOINT_POLICY_ID,
     }
 
 
@@ -895,9 +904,9 @@ def _existing_summary(
     expected_semantic: Mapping[str, object],
 ) -> Stage3SourceSummary:
     manifest = verify_artifact(output)
-    if manifest.metadata.get("run_id") != run_id or manifest.metadata.get(
-        "run_semantic"
-    ) != dict(expected_semantic):
+    if manifest.metadata.get("run_id") != run_id or manifest.metadata.get("run_semantic") != dict(
+        expected_semantic
+    ):
         raise Stage3ExperimentError("existing Stage 3 artifact has another identity")
     try:
         results = json.loads((output / "results.json").read_text(encoding="utf-8"))
@@ -932,6 +941,7 @@ def run_stage3_source(
     source_name: str,
     baseline_lock: str = DEFAULT_BASELINE_LOCK,
     output_root: str = DEFAULT_OUTPUT_ROOT,
+    checkpoint_root: str = DEFAULT_CHECKPOINT_ROOT,
 ) -> Stage3SourceSummary:
     supplied_root = Path(repository_root)
     if _is_link_or_reparse(supplied_root):
@@ -941,6 +951,7 @@ def run_stage3_source(
         raise Stage3ExperimentError("repository root is not a directory")
     _verify_runner_origin(root)
     _canonical_output_root, output_parent = _safe_output_root(root, output_root)
+    _canonical_checkpoint_root, checkpoint_parent = _safe_checkpoint_root(root, checkpoint_root)
     code_binding = capture_stage3_code_binding(root)
     lock_context = load_lock_context(root, baseline_lock)
     loaded = load_stage2_source(root, lock_context, source_name=source_name)
@@ -950,6 +961,17 @@ def run_stage3_source(
         source_id=loaded.source_lock.descriptor.source_id,
     )
     runtime_versions = _runtime_versions()
+    experiment_runtime = _experiment_runtime_versions(matrix.experiments)
+    conflicts = {
+        key
+        for key in set(runtime_versions) & set(experiment_runtime)
+        if runtime_versions[key] != experiment_runtime[key]
+    }
+    if conflicts:
+        raise Stage3ExperimentError(
+            "Stage 3 runtime identity conflicts: " + ", ".join(sorted(conflicts))
+        )
+    runtime_versions = {**runtime_versions, **experiment_runtime}
     run_semantic = _run_semantic(
         source_name=source_name,
         loaded=loaded,
@@ -974,11 +996,17 @@ def run_stage3_source(
         "code_hash": code_binding.code_tree_sha256,
         "runtime_versions": runtime_versions,
     }
+    checkpoint_store = CandidateCheckpointStore(
+        checkpoint_parent,
+        run_id=run_id,
+        run_semantic=run_semantic,
+    )
     execution = run_development_experiments(
         loaded.derived_dataset,
         matrix.experiments,
         source_provenance=source_provenance,
         protocol=protocol,
+        result_store=checkpoint_store,
     )
     results = build_stage3_results(
         execution,
@@ -1013,9 +1041,7 @@ def run_stage3_source(
             },
         )
         if capture_stage3_code_binding(root) != code_binding:
-            raise Stage3ExperimentError(
-                "Stage 3 code changed during artifact publication"
-            )
+            raise Stage3ExperimentError("Stage 3 code changed during artifact publication")
         _verify_source_inputs(root, lock_context, loaded)
         if output.exists():
             raise FileExistsError(f"Stage 3 artifact destination appeared: {output}")
@@ -1041,8 +1067,7 @@ def run_stage3_source(
         development_protocol_id=protocol.protocol_id,
         experiment_count=len(matrix.experiments),
         candidate_seed_run_count=(
-            len(STAGE_SPLIT_SEEDS)
-            * sum(len(spec.candidates) for spec in matrix.experiments)
+            len(STAGE_SPLIT_SEEDS) * sum(len(spec.candidates) for spec in matrix.experiments)
         ),
     )
 
@@ -1058,6 +1083,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True, choices=sorted(SOURCE_NAMES))
     parser.add_argument("--baseline-lock", default=DEFAULT_BASELINE_LOCK)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--checkpoint-root", default=DEFAULT_CHECKPOINT_ROOT)
     return parser
 
 
@@ -1069,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_name=args.source,
             baseline_lock=args.baseline_lock,
             output_root=args.output_root,
+            checkpoint_root=args.checkpoint_root,
         )
     except (
         DataFoundationBaselineError,

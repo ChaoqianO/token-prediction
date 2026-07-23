@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from token_prediction.checkpoint import CandidateCheckpointStore
 from token_prediction.dataset import PredictionPoint, PredictionPosition, PredictionTarget
 from token_prediction.estimators import (
     CrossPositionDeductEstimator,
@@ -22,13 +26,52 @@ from token_prediction.estimators import (
     TrainingView,
 )
 from token_prediction.estimators.neural_encoder import OptionalNeuralDependencyError
+from token_prediction.experiment import CandidateExecutionKey
 from token_prediction.lifecycle import visible_spend_delta
 
 
 HAS_NEURAL = bool(importlib.util.find_spec("torch") and importlib.util.find_spec("safetensors"))
+RUN_CUDA_TESTS = os.environ.get("TOKEN_PREDICTION_TEST_CUDA") == "1"
 TARGET = PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
 CONDITION = "condition:gru"
 CONTRACT_HASH = "a" * 64
+
+
+class _InterruptAfterEpoch:
+    def __init__(self, delegate: object, epoch: int) -> None:
+        self.delegate = delegate
+        self.epoch = epoch
+        self.interrupted = False
+
+    def load(self, identity: object) -> object:
+        return self.delegate.load(identity)
+
+    def save(self, identity: object, *, epoch: int, files: object) -> None:
+        self.delegate.save(identity, epoch=epoch, files=files)
+        if epoch == self.epoch and not self.interrupted:
+            self.interrupted = True
+            raise RuntimeError("simulated process interruption")
+
+    def clear(self) -> None:
+        self.delegate.clear()
+
+
+def _checkpoint_key() -> CandidateExecutionKey:
+    return CandidateExecutionKey(
+        experiment_id="gru-checkpoint-test",
+        candidate_id="gru-residual",
+        candidate_hash="1" * 64,
+        dataset_id="gru-dataset",
+        split_plan_id="2" * 64,
+        split_seed=23,
+        eligibility_hash="3" * 64,
+        position=PredictionPosition.TASK_UPDATE,
+        target=TARGET,
+        condition_id=CONDITION,
+        calibrator_id="none",
+        alpha=0.1,
+        source_provenance_hash="4" * 64,
+    )
 
 
 def _point(
@@ -37,11 +80,7 @@ def _point(
     *,
     missing_usage_attempts: int = 0,
 ) -> PredictionPoint:
-    position = (
-        PredictionPosition.TASK_PRE
-        if step_index == 0
-        else PredictionPosition.TASK_UPDATE
-    )
+    position = PredictionPosition.TASK_PRE if step_index == 0 else PredictionPosition.TASK_UPDATE
     cumulative_input = (0, 20 + sequence_index, 31 + sequence_index)[step_index]
     cumulative_output = (0, 10, 19)[step_index]
     return PredictionPoint(
@@ -206,9 +245,7 @@ print('safe')
     def test_missing_optional_dependency_is_actionable(self) -> None:
         with mock.patch(
             "token_prediction.estimators.gru._load_neural_dependencies",
-            side_effect=OptionalNeuralDependencyError(
-                "install token-prediction[neural]"
-            ),
+            side_effect=OptionalNeuralDependencyError("install token-prediction[neural]"),
         ):
             with self.assertRaisesRegex(
                 OptionalNeuralDependencyError,
@@ -285,6 +322,131 @@ print('safe')
         self.assertEqual(offline_forecasts, shadow_forecasts)
         self.assertTrue(first.no_recurrence)
         self.assertFalse(first.fit_report.parameters["teacher_forcing"])
+
+    @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
+    def test_epoch_checkpoint_resumes_exactly_after_process_interruption(self) -> None:
+        import torch
+
+        estimator = GRUResidualEstimator(
+            transition_dim=8,
+            hidden_dim=8,
+            residual_head_dim=8,
+            max_epochs=4,
+            patience=4,
+        )
+        train = _view(range(4))
+        validation = _view(range(4, 6))
+        uninterrupted = estimator.fit(train, validation, FitContext(23, 1))
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CandidateCheckpointStore(
+                Path(temporary),
+                run_id="gru-resume",
+                run_semantic={"test": "exact-resume"},
+            )
+            checkpoint = store.fit_checkpoint(_checkpoint_key(), 1)
+            interrupting = _InterruptAfterEpoch(checkpoint, 2)
+            with self.assertRaisesRegex(RuntimeError, "simulated process interruption"):
+                estimator.fit(
+                    train,
+                    validation,
+                    FitContext(23, 1, checkpoint=interrupting),
+                )
+            resumed = estimator.fit(
+                train,
+                validation,
+                FitContext(23, 1, checkpoint=checkpoint),
+            )
+
+        self.assertEqual(
+            uninterrupted.fit_report.validation_history,
+            resumed.fit_report.validation_history,
+        )
+        self.assertEqual(uninterrupted.fit_report.best_epoch, resumed.fit_report.best_epoch)
+        for name, tensor in uninterrupted.model.state_dict().items():
+            self.assertTrue(torch.equal(tensor, resumed.model.state_dict()[name]), name)
+        self.assertEqual(
+            _trajectory_forecasts(uninterrupted, _sequence(8)),
+            _trajectory_forecasts(resumed, _sequence(8)),
+        )
+
+    @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
+    def test_batched_rollout_matches_reference_sequence_loss(self) -> None:
+        import torch
+
+        from token_prediction.estimators.gru import (
+            GRUArchitecture,
+            _build_network,
+            _prepare_batch,
+            _prepare_sequences,
+            _rollout_batch_loss,
+            _rollout_loss,
+            _weighted_target_scale,
+        )
+        from token_prediction.estimators.neural_encoder import NeuralFeatureEncoder
+
+        view = _view(range(4))
+        sequences = tuple(view.lifecycle_sequences or ())
+        points = tuple(step.point for sequence in sequences for step in sequence.steps)
+        encoder = NeuralFeatureEncoder.fit(points)
+        architecture = GRUArchitecture(
+            point_input_dim=encoder.schema.output_width,
+            transition_dim=8,
+            hidden_dim=8,
+            residual_head_dim=8,
+        )
+        torch.manual_seed(41)
+        model = _build_network(torch, architecture, device="cpu")
+        target_scale = _weighted_target_scale(view.examples)
+        kwargs = {
+            "architecture": architecture,
+            "target_scale": target_scale,
+            "quantiles": (0.05, 0.5, 0.95),
+            "q50_huber_delta": None,
+            "residual_scale": 1.0,
+            "no_recurrence": False,
+        }
+        reference = _rollout_loss(
+            torch,
+            model,
+            _prepare_sequences(sequences, encoder, torch),
+            **kwargs,
+        )
+        batched = _rollout_batch_loss(
+            torch,
+            model,
+            _prepare_batch(sequences, encoder, torch, device="cpu"),
+            **kwargs,
+        )
+        self.assertAlmostEqual(
+            float(reference.detach()),
+            float(batched.detach()),
+            places=5,
+        )
+
+    @unittest.skipUnless(RUN_CUDA_TESTS, "set TOKEN_PREDICTION_TEST_CUDA=1")
+    def test_cuda_training_is_deterministic_and_freezes_inference_on_cpu(self) -> None:
+        import torch
+
+        self.assertTrue(torch.cuda.is_available(), "CUDA test was requested without CUDA")
+        estimator = GRUResidualEstimator(
+            transition_dim=8,
+            hidden_dim=8,
+            residual_head_dim=8,
+            max_epochs=3,
+            patience=3,
+            training_device="cuda",
+        )
+        context = FitContext(31, 0)
+        first = estimator.fit(_view(range(4)), _view(range(4, 6)), context)
+        second = estimator.fit(_view(range(4)), _view(range(4, 6)), context)
+        self.assertEqual(first.fit_report.parameters["device"], "cuda")
+        self.assertEqual(
+            first.fit_report.validation_history,
+            second.fit_report.validation_history,
+        )
+        for name, tensor in first.model.state_dict().items():
+            self.assertEqual(tensor.device.type, "cpu")
+            self.assertTrue(torch.equal(tensor, second.model.state_dict()[name]), name)
 
     @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
     def test_labels_cannot_enter_seed_or_inference_session(self) -> None:

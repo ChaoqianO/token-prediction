@@ -2,6 +2,7 @@
 
 from .base import (
     EstimatorFactory,
+    FitCheckpoint,
     FitContext,
     FittedEstimator,
     ObservedTransition,
@@ -107,6 +108,7 @@ __all__ = [
     "EncodedColumn",
     "EncoderSchema",
     "FeatureImportanceRecord",
+    "FitCheckpoint",
     "FitContext",
     "FittedEstimator",
     "FittedDeductOnly",
