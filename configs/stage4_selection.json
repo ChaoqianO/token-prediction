@@ -1,0 +1,79 @@
+{
+  "selection_lock_schema_version": 1,
+  "policy_id": "stage4_final_selection_lock_v1",
+  "selection_tag": "stage4-final-selection-v1",
+  "selection_artifact": {
+    "path": "workspace/stage4/selection/s4sel-feb2b40cb2cdf6387e26",
+    "artifact_id": "23d09c228ea9e5c438bfb37f799db96676fa7f815791ad4405bbdae9108e335d",
+    "run_id": "feb2b40cb2cdf6387e26d430",
+    "selection_id": "33e9b3fad0e97c271207994ef4cba5fc98d6078381f3232a5c05f45e3dc736ad",
+    "selection_payload_sha256": "3b8b289170c60df8a47e2458dbc27fbcf0405e81f5b5924a05e2d5442ebec9e8",
+    "selection_code_commit": "ecb242c33d2f7e7fecd49d326541a1860cfd3fa9",
+    "selection_code_tree_sha256": "921067b4c6e33804bf1297e39e3ed440c168f03d6cd19136f22a92c8bd0e4578"
+  },
+  "source_artifacts": [
+    {
+      "key": "stage4_spend_aggregate",
+      "source_name": "spend_aggregate",
+      "stage": "stage4",
+      "path": "workspace/stage4/runs/s4-d4802b015313e00f8fc5",
+      "artifact_id": "854f8019c304f1c6d9bf57fbd7c49f808a83b2d197ac6a55fed44c4385da5867",
+      "results_payload_sha256": "8f0c9c07005823bc158b2f870c05c167615fcba093e75afeb94895385f983950",
+      "run_id": "d4802b015313e00f8fc549e3",
+      "source_commit": "1a5994de859cfcd88528fe7b77cc37167dd8f657",
+      "source_tag": "stage4-artifact-source-v1"
+    },
+    {
+      "key": "stage4_bagen_sokoban",
+      "source_name": "bagen_sokoban",
+      "stage": "stage4",
+      "path": "workspace/stage4/runs/s4-90f52b7baa3f3d17d3f3",
+      "artifact_id": "ba87b8f7ea809d6386a75f0743dbd066edbcb6aed76bc607ec50559a1223805a",
+      "results_payload_sha256": "bcd2f5f4899a59b27a511f8ea9fbcb989722ead93f5ca3220c32697477ffcad6",
+      "run_id": "90f52b7baa3f3d17d3f3f069",
+      "source_commit": "1a5994de859cfcd88528fe7b77cc37167dd8f657",
+      "source_tag": "stage4-artifact-source-v1"
+    },
+    {
+      "key": "stage4_bagen_swebench",
+      "source_name": "bagen_swebench",
+      "stage": "stage4",
+      "path": "workspace/stage4/runs/s4-1adc466729682d4f2b85",
+      "artifact_id": "3fcdd70e9fc23102a672db7fe2ada70a82175ab90666904733313d1497ce6f28",
+      "results_payload_sha256": "cdec8bf1c396334d99bac17dacbd7ceae730a466a9abf16b9949a1223999b8ff",
+      "run_id": "1adc466729682d4f2b857061",
+      "source_commit": "1a5994de859cfcd88528fe7b77cc37167dd8f657",
+      "source_tag": "stage4-artifact-source-v1"
+    },
+    {
+      "key": "stage4_spend_openhands",
+      "source_name": "spend_openhands",
+      "stage": "stage4",
+      "path": "workspace/stage4/runs/s4-6a50dc3d21cb7926ccfb",
+      "artifact_id": "7034f4578c4378fbd77eedbe7ccdb32bf0e7fd6b6410b897a958f3c94f4eedce",
+      "results_payload_sha256": "f2f54887ac5103d1de8bff2a47ad5e90a7456a243a283acd45bea19472ae39eb",
+      "run_id": "6a50dc3d21cb7926ccfba7a6",
+      "source_commit": "1a5994de859cfcd88528fe7b77cc37167dd8f657",
+      "source_tag": "stage4-artifact-source-v1"
+    },
+    {
+      "key": "stage3_spend_openhands",
+      "source_name": "spend_openhands",
+      "stage": "stage3",
+      "path": "workspace/stage3/runs/s3-6c57b8ef3acc736cceea",
+      "artifact_id": "145b6b17ae6b67f07803845c3c4f06c1f321a5e5dad40e63380806f8e07d9f59",
+      "results_payload_sha256": "ec14a98f607576c64687d41d21a3c9e07a22639fa14c68065c769958624ac31c",
+      "run_id": "6c57b8ef3acc736cceea2608",
+      "source_commit": "d3767c135c255d3803195573130f8bb0aefe0d67",
+      "source_tag": "stage3-artifact-source-v1"
+    }
+  ],
+  "protocol": {
+    "selection_policy_id": "stage4_development_only_stability_guard_v1",
+    "ensemble_policy_id": "development_three_seed_five_fold_mean_v1",
+    "final_holdout_evaluation_count": 1,
+    "refit_selected_learned_models": false,
+    "calibration_application_count": 1,
+    "resume_policy_id": "stage4_single_open_resumable_final_holdout_v1"
+  }
+}

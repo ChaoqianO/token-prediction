@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from token_prediction.dataset import (
     PredictionPoint,
@@ -26,6 +29,7 @@ from token_prediction.estimators.lightgbm_bundle import (
     load_lightgbm_bundle,
     save_lightgbm_bundle,
 )
+from token_prediction.estimators import lightgbm_bundle as bundle_module
 
 
 def _point(index: int, *, condition_id: str = "condition-a") -> PredictionPoint:
@@ -219,6 +223,74 @@ class LightGBMBundleTests(unittest.TestCase):
         (self.bundle / "notes.txt").write_text("stale", encoding="utf-8")
         with self.assertRaisesRegex(LightGBMBundleError, "file set"):
             load_lightgbm_bundle(self.bundle)
+
+    def test_root_and_ancestor_directory_symlinks_are_rejected(self) -> None:
+        root_link = self.root / "bundle-link"
+        try:
+            root_link.symlink_to(self.bundle, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlinks are unavailable on this host: {exc}")
+        with self.assertRaisesRegex(LightGBMBundleError, "symlink|reparse"):
+            load_lightgbm_bundle(root_link)
+
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        shutil.copytree(self.bundle, real_parent / "bundle")
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        with self.assertRaisesRegex(LightGBMBundleError, "symlink|reparse"):
+            load_lightgbm_bundle(linked_parent / "bundle")
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction test")
+    def test_root_junction_is_rejected_when_supported(self) -> None:
+        junction = self.root / "bundle-junction"
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(self.bundle)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            self.skipTest("junction creation is unavailable on this host")
+        self.addCleanup(junction.rmdir)
+        with self.assertRaisesRegex(LightGBMBundleError, "symlink|reparse"):
+            load_lightgbm_bundle(junction)
+
+    def test_same_byte_member_swap_during_load_is_rejected(self) -> None:
+        victim = next(self.bundle.glob("model-*.txt"))
+        replacement = self.root / "replacement.txt"
+        replacement.write_bytes(victim.read_bytes())
+        original = bundle_module._parse_fit_report
+
+        def swap_before_native_model_load(
+            *args: object, **kwargs: object
+        ) -> object:
+            report = original(*args, **kwargs)
+            os.replace(replacement, victim)
+            return report
+
+        with mock.patch.object(
+            bundle_module,
+            "_parse_fit_report",
+            side_effect=swap_before_native_model_load,
+        ):
+            with self.assertRaisesRegex(
+                LightGBMBundleError, "changed during load"
+            ):
+                load_lightgbm_bundle(self.bundle)
+
+    def test_bundle_file_allow_list_is_pickle_free(self) -> None:
+        files = lightgbm_bundle_files(self.fitted)
+        self.assertFalse(
+            any(name.endswith((".pkl", ".pickle", ".joblib")) for name in files)
+        )
+        self.assertTrue(
+            all(
+                name in {"manifest.json", "manifest.sha256", "encoder.json"}
+                or name.startswith("model-") and name.endswith(".txt")
+                for name in files
+            )
+        )
 
     def test_save_requires_a_fresh_destination(self) -> None:
         with self.assertRaises(FileExistsError):

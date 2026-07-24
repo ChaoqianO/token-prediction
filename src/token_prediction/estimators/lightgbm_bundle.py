@@ -11,10 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import struct
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -38,6 +41,10 @@ ENCODER_FILENAME = "encoder.json"
 _ESTIMATOR_ID = "lightgbm_quantile"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"(?P<major>[0-9]+)(?:\.|\Z)")
+_MAX_BUNDLE_ENTRIES = 16
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_ENCODER_BYTES = 64 * 1024 * 1024
+_MAX_MODEL_BYTES = 512 * 1024 * 1024
 
 
 class LightGBMBundleError(ValueError):
@@ -357,16 +364,254 @@ def save_lightgbm_bundle(
     return destination
 
 
-def _validated_manifest(directory: Path) -> dict[str, Any]:
-    manifest_path = directory / MANIFEST_FILENAME
-    checksum_path = directory / MANIFEST_HASH_FILENAME
-    for path in (manifest_path, checksum_path):
-        if not path.is_file() or path.is_symlink():
-            raise LightGBMBundleError(f"required regular file is missing: {path.name}")
-    checksum = checksum_path.read_text(encoding="ascii").strip()
+def _is_reparse(metadata: os.stat_result) -> bool:
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & flag)
+
+
+def _reliable_identity(metadata: os.stat_result) -> tuple[int, int] | None:
+    device = int(getattr(metadata, "st_dev", 0))
+    inode = int(getattr(metadata, "st_ino", 0))
+    links = int(getattr(metadata, "st_nlink", 0))
+    if device < 0 or inode <= 0 or links <= 0:
+        return None
+    return device, inode
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    left_identity = _reliable_identity(left)
+    right_identity = _reliable_identity(right)
+    return (
+        stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and left_identity is not None
+        and left_identity == right_identity
+    )
+
+
+def _snapshot(
+    metadata: os.stat_result,
+) -> tuple[int, int | None, tuple[int, int] | None, int, int]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_size) if stat.S_ISREG(metadata.st_mode) else None,
+        _reliable_identity(metadata),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    left_snapshot = _snapshot(left)
+    return left_snapshot[2] is not None and left_snapshot == _snapshot(right)
+
+
+def _require_reliable_identity(
+    metadata: os.stat_result, *, description: str
+) -> os.stat_result:
+    if _reliable_identity(metadata) is None:
+        raise LightGBMBundleError(
+            f"{description} has no reliable filesystem identity"
+        )
+    return metadata
+
+
+def _require_directory(path: Path, *, description: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise LightGBMBundleError(f"cannot inspect {description}") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse(metadata)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise LightGBMBundleError(
+            f"{description} must be a real directory, not a symlink/reparse point"
+        )
+    return _require_reliable_identity(metadata, description=description)
+
+
+def _require_regular_file(path: Path, *, description: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise LightGBMBundleError(f"cannot inspect {description}") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+    ):
+        raise LightGBMBundleError(
+            f"{description} must be a regular non-link file"
+        )
+    return _require_reliable_identity(metadata, description=description)
+
+
+def _read_regular_limited(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    description: str,
+    expected_metadata: os.stat_result,
+) -> bytes:
+    current = _require_regular_file(path, description=description)
+    if not _same_snapshot(current, expected_metadata):
+        raise LightGBMBundleError(f"{description} changed after enumeration")
+    if current.st_size < 0 or current.st_size > maximum_bytes:
+        raise LightGBMBundleError(f"{description} exceeds its safe size limit")
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LightGBMBundleError(
+            f"{description} could not be opened safely"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_reparse(opened)
+            or not _same_identity(opened, current)
+        ):
+            raise LightGBMBundleError(f"{description} changed before it was opened")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read(maximum_bytes + 1)
+        finished = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not _same_snapshot(opened, finished):
+        raise LightGBMBundleError(f"{description} changed while being read")
+    if len(payload) != opened.st_size or len(payload) > maximum_bytes:
+        raise LightGBMBundleError(
+            f"{description} changed while being read or is oversized"
+        )
+    after = _require_regular_file(path, description=description)
+    if not _same_snapshot(after, expected_metadata):
+        raise LightGBMBundleError(f"{description} changed after it was read")
+    return payload
+
+
+@dataclass(frozen=True)
+class _BundleFile:
+    metadata: os.stat_result
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class _BundleTree:
+    ancestors: Mapping[Path, os.stat_result]
+    root: os.stat_result
+    files: Mapping[str, _BundleFile]
+
+
+def _bundle_tree(root: Path) -> _BundleTree:
+    ancestors: dict[Path, os.stat_result] = {}
+    chain = tuple(reversed((root, *root.parents)))
+    for path in chain:
+        description = "bundle root" if path == root else "bundle ancestor"
+        ancestors[path] = _require_directory(path, description=description)
+    root_metadata = ancestors[root]
+    enumerated: dict[str, os.stat_result] = {}
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if len(enumerated) >= _MAX_BUNDLE_ENTRIES:
+                    raise LightGBMBundleError(
+                        "bundle exceeds its safe entry-count limit"
+                    )
+                metadata = entry.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or _is_reparse(metadata)
+                    or not stat.S_ISREG(metadata.st_mode)
+                ):
+                    raise LightGBMBundleError(
+                        f"bundle entry is not a regular non-link file: {entry.name}"
+                    )
+                path_metadata = _require_regular_file(
+                    Path(entry.path), description=f"bundle file {entry.name!r}"
+                )
+                entry_identity = _reliable_identity(metadata)
+                if entry_identity is not None and not _same_identity(
+                    metadata, path_metadata
+                ):
+                    raise LightGBMBundleError(
+                        "bundle file changed after directory enumeration"
+                    )
+                enumerated[entry.name] = path_metadata
+    except OSError as exc:
+        raise LightGBMBundleError("cannot enumerate bundle root") from exc
+
+    files: dict[str, _BundleFile] = {}
+    for filename, metadata in enumerated.items():
+        maximum_bytes = (
+            65
+            if filename == MANIFEST_HASH_FILENAME
+            else _MAX_MANIFEST_BYTES
+            if filename == MANIFEST_FILENAME
+            else _MAX_ENCODER_BYTES
+            if filename == ENCODER_FILENAME
+            else _MAX_MODEL_BYTES
+            if filename.startswith("model-") and filename.endswith(".txt")
+            else _MAX_MANIFEST_BYTES
+        )
+        payload = _read_regular_limited(
+            root / filename,
+            maximum_bytes=maximum_bytes,
+            description=f"bundle file {filename!r}",
+            expected_metadata=metadata,
+        )
+        files[filename] = _BundleFile(metadata, payload)
+    tree = _BundleTree(
+        ancestors=MappingProxyType(ancestors),
+        root=root_metadata,
+        files=MappingProxyType(files),
+    )
+    _verify_bundle_tree(root, tree)
+    return tree
+
+
+def _verify_bundle_tree(root: Path, tree: _BundleTree) -> None:
+    for path, expected in tree.ancestors.items():
+        description = "bundle root" if path == root else "bundle ancestor"
+        actual = _require_directory(path, description=description)
+        if path == root:
+            if not _same_snapshot(actual, expected):
+                raise LightGBMBundleError("bundle root changed during load")
+        elif not _same_identity(actual, expected):
+            raise LightGBMBundleError("bundle ancestor changed during load")
+    try:
+        actual_names = {entry.name for entry in os.scandir(root)}
+    except OSError as exc:
+        raise LightGBMBundleError("cannot re-enumerate bundle root") from exc
+    if actual_names != set(tree.files):
+        raise LightGBMBundleError("bundle file set changed during load")
+    for filename, expected in tree.files.items():
+        actual = _require_regular_file(
+            root / filename, description=f"bundle file {filename!r}"
+        )
+        if not _same_snapshot(actual, expected.metadata):
+            raise LightGBMBundleError("bundle file changed during load")
+
+
+def _validated_manifest(tree: _BundleTree) -> dict[str, Any]:
+    for filename in (MANIFEST_FILENAME, MANIFEST_HASH_FILENAME):
+        if filename not in tree.files:
+            raise LightGBMBundleError(f"required regular file is missing: {filename}")
+    checksum_bytes = tree.files[MANIFEST_HASH_FILENAME].payload
+    if len(checksum_bytes) != 65 or not checksum_bytes.endswith(b"\n"):
+        raise LightGBMBundleError(
+            "manifest checksum must be 64 lowercase hex bytes plus newline"
+        )
+    try:
+        checksum = checksum_bytes[:64].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise LightGBMBundleError("manifest checksum is not ASCII") from exc
     if _SHA256.fullmatch(checksum) is None:
         raise LightGBMBundleError("manifest checksum is malformed")
-    manifest_bytes = manifest_path.read_bytes()
+    manifest_bytes = tree.files[MANIFEST_FILENAME].payload
     if _sha256(manifest_bytes) != checksum:
         raise LightGBMBundleError("manifest checksum mismatch")
     manifest = _parse_json(manifest_bytes, description="bundle manifest")
@@ -510,10 +755,14 @@ def load_lightgbm_bundle(directory: str | Path) -> FittedLightGBMQuantiles:
     LightGBM/NumPy major version, and scope/model inconsistencies are rejected.
     """
 
-    source = Path(directory).expanduser().resolve()
-    if not source.is_dir():
+    source = Path(directory).expanduser().absolute()
+    if not source.exists() and not source.is_symlink():
         raise LightGBMBundleError(f"bundle directory does not exist: {source}")
-    manifest = _validated_manifest(source)
+    tree = _bundle_tree(source)
+    manifest = _validated_manifest(tree)
+    # Manifest parsing is an intentional mutation boundary.  Revalidate before
+    # trusting any filename or scope selected by its contents.
+    _verify_bundle_tree(source, tree)
 
     estimator = _require_mapping(manifest["estimator"], description="estimator")
     _require_exact_keys(estimator, {"id", "version"}, description="estimator")
@@ -600,19 +849,14 @@ def load_lightgbm_bundle(directory: str | Path) -> FittedLightGBMQuantiles:
         ENCODER_FILENAME,
         *(filename for filename, _ in model_records.values()),
     }
-    actual_files = {path.name for path in source.iterdir()}
+    actual_files = set(tree.files)
     if actual_files != expected_files:
         raise LightGBMBundleError(
             "bundle file set does not match manifest; "
             f"missing={sorted(expected_files - actual_files)}, "
             f"extra={sorted(actual_files - expected_files)}"
         )
-    for filename in expected_files:
-        path = source / filename
-        if not path.is_file() or path.is_symlink():
-            raise LightGBMBundleError(f"bundle entry is not a regular file: {filename}")
-
-    encoder_bytes = (source / ENCODER_FILENAME).read_bytes()
+    encoder_bytes = tree.files[ENCODER_FILENAME].payload
     if _sha256(encoder_bytes) != encoder_sha:
         raise LightGBMBundleError("encoder file checksum mismatch")
     encoder_payload = _parse_json(encoder_bytes, description="encoder schema")
@@ -658,7 +902,7 @@ def load_lightgbm_bundle(directory: str | Path) -> FittedLightGBMQuantiles:
     best_iterations: dict[float, int] = {}
     for quantile, identifier in zip(quantiles, identifiers):
         filename, checksum = model_records[identifier]
-        model_bytes = (source / filename).read_bytes()
+        model_bytes = tree.files[filename].payload
         if _sha256(model_bytes) != checksum:
             raise LightGBMBundleError(f"model file checksum mismatch: {filename}")
         try:
@@ -684,6 +928,12 @@ def load_lightgbm_bundle(directory: str | Path) -> FittedLightGBMQuantiles:
             raise LightGBMBundleError("model objective/alpha does not match quantile mapping")
         boosters[quantile] = booster
         best_iterations[quantile] = best_iteration
+
+    # Booster construction can execute native parsing code for long enough for
+    # a concurrent actor to replace a member or the directory.  The returned
+    # model is accepted only if the complete on-disk tree still has the same
+    # identities and metadata as the bytes from which it was constructed.
+    _verify_bundle_tree(source, tree)
 
     return FittedLightGBMQuantiles(
         estimator_id=_ESTIMATOR_ID,
