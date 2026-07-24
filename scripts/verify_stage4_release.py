@@ -1390,16 +1390,11 @@ def _verify_selected_members(
     return len(member_hashes), loaded_bundle_count, empirical_count
 
 
-def _verify_selection_code_binding_from_git(
+def _selection_code_binding_at_commit(
     root: Path,
-    code: Mapping[str, Any],
-) -> None:
-    _exact(
-        code,
-        {"policy_id", "git_commit", "code_tree_sha256", "paths"},
-        description="selection code binding",
-    )
-    commit = _commit(code["git_commit"], description="selection code commit")
+    commit_value: object,
+) -> dict[str, object]:
+    commit = _commit(commit_value, description="selection code commit")
     required = frozenset(
         {
             "scripts/prepare_stage4_selection.py",
@@ -1430,11 +1425,8 @@ def _verify_selection_code_binding_from_git(
             if item
         )
     )
-    if (
-        code["policy_id"] != SELECTION_CODE_POLICY_ID
-        or code["paths"] != list(expected_paths)
-        or not required <= set(expected_paths)
-        or not any(path.startswith("src/token_prediction/") for path in expected_paths)
+    if not required <= set(expected_paths) or not any(
+        path.startswith("src/token_prediction/") for path in expected_paths
     ):
         raise Stage4ReleaseError("selection code path closure differs from Git")
     digest = hashlib.sha256(f"{SELECTION_CODE_POLICY_ID}\0".encode("ascii"))
@@ -1450,7 +1442,27 @@ def _verify_selection_code_binding_from_git(
         digest.update(encoded)
         digest.update(len(payload).to_bytes(8, "big"))
         digest.update(payload)
-    if digest.hexdigest() != code["code_tree_sha256"]:
+    return {
+        "policy_id": SELECTION_CODE_POLICY_ID,
+        "git_commit": commit,
+        "code_tree_sha256": digest.hexdigest(),
+        "paths": list(expected_paths),
+    }
+
+
+def _verify_selection_code_binding_from_git(
+    root: Path,
+    code: Mapping[str, Any],
+) -> None:
+    _exact(
+        code,
+        {"policy_id", "git_commit", "code_tree_sha256", "paths"},
+        description="selection code binding",
+    )
+    actual = _selection_code_binding_at_commit(root, code["git_commit"])
+    if code["policy_id"] != actual["policy_id"] or code["paths"] != actual["paths"]:
+        raise Stage4ReleaseError("selection code path closure differs from Git")
+    if code["code_tree_sha256"] != actual["code_tree_sha256"]:
         raise Stage4ReleaseError("selection code tree differs from committed Git blobs")
 
 

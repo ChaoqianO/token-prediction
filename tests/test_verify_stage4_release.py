@@ -28,6 +28,7 @@ from scripts.verify_stage4_release import (
     _historical_added_path_records,
     _historical_amended_code_binding_at_commit,
     _load_json,
+    _selection_code_binding_at_commit,
     _validate_release_document,
     _verify_final_cell_bindings,
     _verify_ledger,
@@ -520,15 +521,20 @@ class Stage4ReleaseVerifierTests(unittest.TestCase):
         )
 
     def test_selection_code_binding_is_recomputed_from_git_blobs(self) -> None:
-        selection = json.loads(
-            (
-                ROOT
-                / "workspace/stage4/selection/"
-                "s4sel-feb2b40cb2cdf6387e26/selection.json"
-            ).read_text(encoding="utf-8")
+        selection_lock = json.loads(
+            (ROOT / "configs/stage4_selection.json").read_text(encoding="utf-8")
         )
-        _verify_selection_code_binding_from_git(ROOT, selection["code_binding"])
-        changed = copy.deepcopy(selection["code_binding"])
+        locked_artifact = selection_lock["selection_artifact"]
+        binding = _selection_code_binding_at_commit(
+            ROOT,
+            locked_artifact["selection_code_commit"],
+        )
+        self.assertEqual(
+            binding["code_tree_sha256"],
+            locked_artifact["selection_code_tree_sha256"],
+        )
+        _verify_selection_code_binding_from_git(ROOT, binding)
+        changed = copy.deepcopy(binding)
         changed["code_tree_sha256"] = "f" * 64
         with self.assertRaisesRegex(Stage4ReleaseError, "committed Git blobs"):
             _verify_selection_code_binding_from_git(ROOT, changed)
