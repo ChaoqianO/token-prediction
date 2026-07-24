@@ -292,6 +292,24 @@ _EXPECTED_BY_SOURCE = {
         bundle_fold_count,
     ) in _EXPECTED_SOURCE_SCOPE
 }
+_EXPECTED_ELIGIBLE_CONDITIONS = {
+    "spend_aggregate": FROZEN_STAGE4_SOURCE_CONDITIONS[
+        SPEND_AGGREGATE_SOURCE_ID
+    ],
+    "bagen_sokoban": FROZEN_STAGE4_SOURCE_CONDITIONS[
+        BAGEN_SOKOBAN_SOURCE_ID
+    ],
+    "bagen_swebench": frozenset(
+        {
+            "condition:54cb50fce273f0aa2d74",
+            "condition:949ac3b7a342718cd505",
+            "condition:d94078c05d91b0d58aee",
+            "condition:dce86ced00dc11c77205",
+            "condition:f95ae2a5e11682f6b7fc",
+        }
+    ),
+    "spend_openhands": FROZEN_STAGE4_SOURCE_CONDITIONS[SPEND_SOURCE_ID],
+}
 _EXPLICIT_CODE_PATHS = frozenset(
     {
         STAGE4_RUNNER_RELATIVE,
@@ -1734,11 +1752,8 @@ def _expected_candidate_sets(
     source_name: str,
     experiments: Sequence[Mapping[str, Any]],
 ) -> tuple[int, int]:
-    expected_conditions = FROZEN_STAGE4_SOURCE_CONDITIONS[
-        _EXPECTED_BY_SOURCE[source_name]["source_id"]
-    ]
     observed_conditions = {str(item.get("condition_id")) for item in experiments}
-    if observed_conditions != set(expected_conditions):
+    if observed_conditions != set(_EXPECTED_ELIGIBLE_CONDITIONS[source_name]):
         raise Stage4CompletionReleaseError(
             f"Stage 4 completion {source_name} conditions differ"
         )
@@ -1789,7 +1804,7 @@ def _expected_candidate_sets(
             )
         return call_pre_cells, seed_policy_cells
 
-    for condition_id in expected_conditions:
+    for condition_id in sorted(observed_conditions):
         scoped = [
             experiment
             for experiment in experiments

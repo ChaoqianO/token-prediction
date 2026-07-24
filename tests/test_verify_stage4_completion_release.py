@@ -23,6 +23,7 @@ from scripts.verify_stage4_completion_release import (
     _code_binding_at_commit,
     _checkpoint_expectation,
     _expected_artifact_key,
+    _expected_candidate_sets,
     _load_json,
     _require_exact_artifact_payloads,
     _semantic_sha256,
@@ -52,6 +53,84 @@ from token_prediction.stage4_matrix import (
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_COMMIT = "c1ac2484f44ed65705cdd00eba7b70a739a3ac0b"
 SHA256 = "0" * 64
+
+ELIGIBLE_BAGEN_SWE_CONDITIONS = (
+    "condition:54cb50fce273f0aa2d74",
+    "condition:949ac3b7a342718cd505",
+    "condition:d94078c05d91b0d58aee",
+    "condition:dce86ced00dc11c77205",
+    "condition:f95ae2a5e11682f6b7fc",
+)
+
+
+def _swe_candidate_coverage(
+    conditions: tuple[str, ...],
+) -> list[dict[str, object]]:
+    experiments: list[dict[str, object]] = []
+    task_candidate_sets = (
+        (
+            "empirical",
+            "lightgbm_history",
+            "mlp_history",
+            "lightgbm_without_progress",
+            "lightgbm_without_tools_errors",
+            "lightgbm_structured",
+        ),
+        ("lightgbm_history",),
+        ("lightgbm_history",),
+        (
+            "cross_position_deduct_raw_repaired_oof_seed",
+            "cross_position_deduct_point_only_oof_seed",
+        ),
+    )
+    for condition_id in conditions:
+        for candidate_ids in task_candidate_sets:
+            experiments.append(
+                {
+                    "condition_id": condition_id,
+                    "position": "task_update",
+                    "target": "task_provider_accounted_remaining_tokens",
+                    "candidates": [
+                        {
+                            "candidate_id": candidate_id,
+                            "candidate_graph": {
+                                "seed_policy_id": (
+                                    "inner_oof_uncalibrated_repaired_point_only_mean_v1"
+                                    if candidate_id.endswith("point_only_oof_seed")
+                                    else (
+                                        "inner_oof_uncalibrated_repaired_quantile_mean_v1"
+                                        if candidate_id.endswith("raw_repaired_oof_seed")
+                                        else "none"
+                                    )
+                                )
+                            },
+                        }
+                        for candidate_id in candidate_ids
+                    ],
+                }
+            )
+        for target in (
+            "call_billable_total_tokens",
+            "call_billable_output_tokens",
+            "call_final_response_output_tokens",
+        ):
+            experiments.append(
+                {
+                    "condition_id": condition_id,
+                    "position": "call_pre",
+                    "target": target,
+                    "candidates": [
+                        {"candidate_id": candidate_id}
+                        for candidate_id in (
+                            "empirical",
+                            "pre_request_char_message_length",
+                            "lightgbm_history",
+                            "mlp_history",
+                        )
+                    ],
+                }
+            )
+    return experiments
 
 
 def _release() -> dict[str, object]:
@@ -513,6 +592,28 @@ def _aggregate_results() -> dict[str, object]:
 
 
 class Stage4CompletionReleaseVerifierTests(unittest.TestCase):
+    def test_bagen_swe_eligible_conditions_are_exact(self) -> None:
+        self.assertEqual(
+            _expected_candidate_sets(
+                "bagen_swebench",
+                _swe_candidate_coverage(ELIGIBLE_BAGEN_SWE_CONDITIONS),
+            ),
+            (15, 5),
+        )
+
+        substituted = (
+            *ELIGIBLE_BAGEN_SWE_CONDITIONS[:-1],
+            "condition:20f615a22697984db6cc",
+        )
+        with self.assertRaisesRegex(
+            Stage4CompletionReleaseError,
+            "bagen_swebench conditions differ",
+        ):
+            _expected_candidate_sets(
+                "bagen_swebench",
+                _swe_candidate_coverage(substituted),
+            )
+
     def test_shared_development_task_projection_is_required(self) -> None:
         projection = "a" * 64
         records = [
