@@ -17,6 +17,7 @@ from token_prediction.estimators.base import (
 
 
 SEED_POLICY_ID = "inner_oof_uncalibrated_repaired_quantile_mean_v1"
+POINT_ONLY_SEED_POLICY_ID = "inner_oof_uncalibrated_repaired_point_only_mean_v1"
 SEED_POLICY_DOCUMENT = {
     "seed_policy_id": SEED_POLICY_ID,
     "oof_rule": "exactly_one_inner_holdout_component",
@@ -25,14 +26,20 @@ SEED_POLICY_DOCUMENT = {
     "calibration": "none",
     "repair": "non_negative_ordered_before_propagation",
 }
-SEED_POLICY_HASH = hashlib.sha256(
-    json.dumps(
-        SEED_POLICY_DOCUMENT,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-).hexdigest()
+POINT_ONLY_SEED_POLICY_DOCUMENT = {
+    "seed_policy_id": POINT_ONLY_SEED_POLICY_ID,
+    "oof_rule": "exactly_one_inner_holdout_component",
+    "external_rule": "all_inner_components",
+    "ensemble_rule": "arithmetic_mean_of_repaired_raw_point_broadcast",
+    "calibration": "none",
+    "repair": "non_negative_raw_point_broadcast_before_propagation",
+}
+SEED_POLICY_DOCUMENTS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        SEED_POLICY_ID: MappingProxyType(SEED_POLICY_DOCUMENT),
+        POINT_ONLY_SEED_POLICY_ID: MappingProxyType(POINT_ONLY_SEED_POLICY_DOCUMENT),
+    }
+)
 _SHA256 = frozenset("0123456789abcdef")
 
 
@@ -51,6 +58,22 @@ def _semantic_hash(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def seed_policy_document(seed_policy_id: str) -> Mapping[str, str]:
+    try:
+        return SEED_POLICY_DOCUMENTS[seed_policy_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported crossfit seed policy {seed_policy_id!r}") from exc
+
+
+def seed_policy_hash(seed_policy_id: str) -> str:
+    return _semantic_hash(dict(seed_policy_document(seed_policy_id)))
+
+
+SEED_POLICY_HASH = seed_policy_hash(SEED_POLICY_ID)
+POINT_ONLY_SEED_POLICY_HASH = seed_policy_hash(POINT_ONLY_SEED_POLICY_ID)
+SUPPORTED_SEED_POLICY_IDS = frozenset(SEED_POLICY_DOCUMENTS)
 
 
 @dataclass(frozen=True)
@@ -131,6 +154,8 @@ class CrossfitSeedSet:
     inner_split_id: str
     records: tuple[CrossfitSeedRecord, ...]
     by_point_id: Mapping[str, SessionSeed] = field(init=False, repr=False)
+    seed_policy_id: str = field(init=False)
+    seed_policy_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not self.initializer_id.strip() or not self.inner_split_id.strip():
@@ -148,6 +173,18 @@ class CrossfitSeedSet:
             for record in self.records
         ):
             raise ValueError("seed records do not share initializer/split identity")
+        policy_ids = {record.seed.seed_policy_id for record in self.records}
+        policy_hashes = {record.seed.seed_policy_hash for record in self.records}
+        if len(policy_ids) != 1 or len(policy_hashes) != 1:
+            raise ValueError("seed records do not share one seed policy")
+        policy_id = next(iter(policy_ids))
+        policy_hash = next(iter(policy_hashes))
+        if policy_id not in SUPPORTED_SEED_POLICY_IDS:
+            raise ValueError("seed records use an unsupported seed policy")
+        if policy_hash != seed_policy_hash(policy_id):
+            raise ValueError("seed record policy hash does not match its policy")
+        object.__setattr__(self, "seed_policy_id", policy_id)
+        object.__setattr__(self, "seed_policy_hash", policy_hash)
         object.__setattr__(
             self,
             "by_point_id",
@@ -161,8 +198,8 @@ class CrossfitSeedSet:
                 "initializer_id": self.initializer_id,
                 "initializer_hash": self.initializer_hash,
                 "inner_split_id": self.inner_split_id,
-                "seed_policy_id": SEED_POLICY_ID,
-                "seed_policy_hash": SEED_POLICY_HASH,
+                "seed_policy_id": self.seed_policy_id,
+                "seed_policy_hash": self.seed_policy_hash,
                 "records": [
                     record.identity_projection()
                     for record in sorted(self.records, key=lambda item: item.point_id)
@@ -171,9 +208,14 @@ class CrossfitSeedSet:
         )
 
 
-def _seed_forecast(forecast: TokenForecast) -> TokenForecast:
-    """Normalize an initializer forecast to uncalibrated repaired seed semantics."""
+def prepare_seed_forecast(
+    forecast: TokenForecast,
+    *,
+    seed_policy_id: str = SEED_POLICY_ID,
+) -> TokenForecast:
+    """Normalize a raw initializer output according to a frozen seed policy."""
 
+    seed_policy_document(seed_policy_id)
     raw = (forecast.raw_lower, forecast.raw_point, forecast.raw_upper)
     if all(value is not None for value in raw):
         raw_lower, raw_point, raw_upper = (float(value) for value in raw)
@@ -186,6 +228,11 @@ def _seed_forecast(forecast: TokenForecast) -> TokenForecast:
     repaired_point = max(0.0, raw_point)
     repaired_lower = min(max(0.0, raw_lower), repaired_point)
     repaired_upper = max(max(0.0, raw_upper), repaired_point)
+    if seed_policy_id == POINT_ONLY_SEED_POLICY_ID:
+        repaired_lower = repaired_point
+        repaired_upper = repaired_point
+        raw_lower = raw_point
+        raw_upper = raw_point
     return TokenForecast(
         point_id=forecast.point_id,
         target=forecast.target,
@@ -198,10 +245,19 @@ def _seed_forecast(forecast: TokenForecast) -> TokenForecast:
     )
 
 
+def _seed_forecast(forecast: TokenForecast) -> TokenForecast:
+    """Backward-compatible name for the frozen primary seed policy."""
+
+    return prepare_seed_forecast(forecast, seed_policy_id=SEED_POLICY_ID)
+
+
 def ensemble_repaired_forecasts(
     point: PredictionPoint,
     forecasts: Sequence[TokenForecast],
+    *,
+    seed_policy_id: str = SEED_POLICY_ID,
 ) -> TokenForecast:
+    seed_policy_document(seed_policy_id)
     if not forecasts:
         raise ValueError("cannot ensemble an empty initializer forecast set")
     if any(
@@ -215,6 +271,8 @@ def ensemble_repaired_forecasts(
     upper = math.fsum(forecast.upper for forecast in forecasts) / count
     if not 0 <= lower <= center <= upper:
         raise ValueError("repaired initializer quantiles lost ordering during ensemble")
+    if seed_policy_id == POINT_ONLY_SEED_POLICY_ID and not lower == center == upper:
+        raise ValueError("point-only initializer forecasts must remain broadcast")
     # The ensemble consumes already-repaired component forecasts.  Its raw
     # diagnostics intentionally equal that repaired ensemble, proving that no
     # conformal expansion entered the recurrent seed.
@@ -236,6 +294,7 @@ def _predict_component(
     *,
     dataset_id: str,
     input_contract_hash: str,
+    seed_policy_id: str,
 ) -> TokenForecast:
     session = component.fitted.start(
         RunContext(
@@ -252,7 +311,7 @@ def _predict_component(
     forecast = session.predict(point)
     if forecast.point_id != point.point_id or forecast.target != point.target:
         raise ValueError("initializer returned a forecast for the wrong Task-pre point")
-    return _seed_forecast(forecast)
+    return prepare_seed_forecast(forecast, seed_policy_id=seed_policy_id)
 
 
 def generate_crossfit_seeds(
@@ -266,11 +325,13 @@ def generate_crossfit_seeds(
     inner_split_id: str,
     oof_tasks: frozenset[str],
     external_tasks: frozenset[str],
+    seed_policy_id: str = SEED_POLICY_ID,
 ) -> CrossfitSeedSet:
     """Generate leakage-safe OOF and external-ensemble Task-pre seeds."""
 
     if not components:
         raise ValueError("inner initializer component set is empty")
+    policy_hash = seed_policy_hash(seed_policy_id)
     if len({component.inner_fold for component in components}) != len(components):
         raise ValueError("inner initializer folds must be unique")
     _require_sha256(initializer_hash, name="initializer_hash")
@@ -329,6 +390,7 @@ def generate_crossfit_seeds(
                 point,
                 dataset_id=dataset_id,
                 input_contract_hash=input_contract_hash,
+                seed_policy_id=seed_policy_id,
             )
             producer_folds = (component.inner_fold,)
             bundle_hashes = component.bundle_hashes
@@ -342,10 +404,15 @@ def generate_crossfit_seeds(
                     point,
                     dataset_id=dataset_id,
                     input_contract_hash=input_contract_hash,
+                    seed_policy_id=seed_policy_id,
                 )
                 for component in ordered_components
             )
-            forecast = ensemble_repaired_forecasts(point, component_forecasts)
+            forecast = ensemble_repaired_forecasts(
+                point,
+                component_forecasts,
+                seed_policy_id=seed_policy_id,
+            )
             producer_folds = tuple(
                 component.inner_fold for component in ordered_components
             )
@@ -362,8 +429,8 @@ def generate_crossfit_seeds(
             initializer_hash=initializer_hash,
             inner_split_id=inner_split_id,
             component_bundle_hashes=bundle_hashes,
-            seed_policy_id=SEED_POLICY_ID,
-            seed_policy_hash=SEED_POLICY_HASH,
+            seed_policy_id=seed_policy_id,
+            seed_policy_hash=policy_hash,
         )
         records.append(
             CrossfitSeedRecord(
@@ -387,9 +454,17 @@ __all__ = [
     "CrossfitSeedRecord",
     "CrossfitSeedSet",
     "InitializerComponent",
+    "POINT_ONLY_SEED_POLICY_DOCUMENT",
+    "POINT_ONLY_SEED_POLICY_HASH",
+    "POINT_ONLY_SEED_POLICY_ID",
     "SEED_POLICY_DOCUMENT",
+    "SEED_POLICY_DOCUMENTS",
     "SEED_POLICY_HASH",
     "SEED_POLICY_ID",
+    "SUPPORTED_SEED_POLICY_IDS",
     "ensemble_repaired_forecasts",
     "generate_crossfit_seeds",
+    "prepare_seed_forecast",
+    "seed_policy_document",
+    "seed_policy_hash",
 ]

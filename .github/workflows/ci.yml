@@ -45,6 +45,17 @@ jobs:
         run: python scripts/verify_stage3_release.py --tracked-only
       - name: Verify tracked Stage 4 final release and frozen selection
         run: python scripts/verify_stage4_release.py --tracked-only
+      - name: Verify tag-bound tracked Stage 4 completion release controls
+        shell: bash
+        run: |
+          trusted_root="$RUNNER_TEMP/stage4-completion-release-control"
+          mkdir -p "$trusted_root"
+          git archive --format=tar stage4-completion-release-v1 |
+            tar -x -C "$trusted_root"
+          PYTHONPATH="$trusted_root/src:$trusted_root" \
+            python "$trusted_root/scripts/verify_stage4_completion_release.py" \
+              --repository-root "$GITHUB_WORKSPACE" \
+              --tracked-only
       - name: Ruff lint
         run: python -m ruff check src tests scripts
       - name: Target schema and prefix-causality contracts

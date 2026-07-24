@@ -16,6 +16,7 @@ from .comparison import (
 )
 from .budget import BUDGET_METRIC_SUITE_ID, evaluate_budget_scenarios
 from .metrics import (
+    INTERVAL_DIAGNOSTICS_ID,
     METRIC_SUITE_ID,
     ScoredForecast,
     TaskForecastMetrics,
@@ -25,6 +26,7 @@ from .metrics import (
 from .stratification import (
     DEFAULT_PROGRESS_CHECKPOINTS,
     PROGRESS_STRATIFICATION_ID,
+    RUN_DISPERSION_EXTENSION_ID,
     RUN_VARIANCE_ID,
     TERMINATION_STRATIFICATION_ID,
     evaluate_progress_checkpoints,
@@ -44,6 +46,7 @@ from .stage4 import (
 __all__ = [
     "CALIBRATOR_SCHEMA_VERSION",
     "BUDGET_METRIC_SUITE_ID",
+    "INTERVAL_DIAGNOSTICS_ID",
     "CalibrationExample",
     "FittedExpansionCalibrator",
     "FittedCalibrator",
@@ -53,6 +56,7 @@ __all__ = [
     "DEFAULT_PROGRESS_CHECKPOINTS",
     "PairedBootstrapComparison",
     "PROGRESS_STRATIFICATION_ID",
+    "RUN_DISPERSION_EXTENSION_ID",
     "RUN_VARIANCE_ID",
     "ScoredForecast",
     "TaskForecastMetrics",

@@ -65,6 +65,7 @@ class AblationAxis(StrEnum):
     METHOD = "method"
     FEATURE_SET = "feature_set"
     STATE_UPDATE = "state_update"
+    SEED_POLICY = "seed_policy"
     PROBE_INTERVAL = "probe_interval"
     CALIBRATION = "calibration"
 

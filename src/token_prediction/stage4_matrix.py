@@ -10,18 +10,29 @@ from types import MappingProxyType
 from typing import Mapping
 
 from token_prediction.contracts import Observable, SourceCapabilities
-from token_prediction.dataset import PredictionPosition, PredictionTarget
+from token_prediction.crossfit import (
+    POINT_ONLY_SEED_POLICY_ID,
+    SEED_POLICY_ID,
+    seed_policy_hash,
+)
+from token_prediction.dataset import (
+    INNER_FOLD_POLICY_ID,
+    PredictionPosition,
+    PredictionTarget,
+)
 from token_prediction.dataset.capabilities import decide_target_capability
 from token_prediction.development import DevelopmentProtocol
 from token_prediction.experiment import (
     AblationAxis,
     AblationSpec,
+    CandidateGraph,
     CandidateRole,
     CandidateSpec,
     ExperimentSpec,
     validate_ablation_specs,
 )
-from token_prediction.features import FeatureSet
+from token_prediction.features import NO_FEATURES, FeatureSet
+from token_prediction.lifecycle_experiment import TASK_LIFECYCLE_SCHEMA_ID
 from token_prediction.stage2_matrix import (
     BAGEN_SOKOBAN_SOURCE_ID,
     BAGEN_SOURCE_ID,
@@ -42,11 +53,12 @@ from token_prediction.telemetry import (
 )
 
 
-STAGE4_MATRIX_SCHEMA_VERSION = 1
-STAGE4_MATRIX_POLICY_ID = "stage4_single_axis_condition_position_target_matrix_v1"
+STAGE4_MATRIX_SCHEMA_VERSION = 2
+STAGE4_MATRIX_POLICY_ID = "stage4_single_axis_condition_position_target_matrix_v2"
 STAGE4_MIN_DEVELOPMENT_TASKS = 10
 STAGE4_ALPHA = 0.10
 STAGE4_PRIMARY_CALIBRATOR_ID = "task_max_conformal"
+STAGE4_MISSING_MASK_INVARIANT_ID = "explicit_missing_telemetry_masks_required_v1"
 STAGE4_CALL_PRE_TARGETS = (
     PredictionTarget.CALL_BILLABLE_TOTAL_TOKENS,
     PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS,
@@ -77,7 +89,6 @@ _TOOLS_ERRORS_FEATURES = frozenset(
         "failed_api_attempts",
         "completed_tool_calls",
         "failed_tool_calls",
-        "missing_usage_attempts",
         "last_tool_type",
         "last_round_tool_error_count",
         "consecutive_error_rounds",
@@ -202,7 +213,14 @@ def _candidate_document(candidate: CandidateSpec) -> dict[str, object]:
         "role": candidate.role.value,
         "feature_set_id": candidate.feature_set.feature_set_id,
         "feature_set_hash": candidate.feature_set.content_hash,
+        "params": dict(candidate.params),
+        "initializer_params": dict(candidate.initializer_params),
         "graph": candidate.graph.to_dict(),
+        "seed_policy_hash": (
+            seed_policy_hash(candidate.graph.seed_policy_id)
+            if candidate.graph.is_lifecycle
+            else None
+        ),
         "ablation": (
             {
                 "reference_candidate_id": candidate.ablation.reference_candidate_id,
@@ -314,6 +332,55 @@ class Stage4Gate:
 
 
 @dataclass(frozen=True)
+class Stage4SafetyInvariant:
+    invariant_id: str
+    estimator_ids: tuple[str, ...]
+    required_behavior: str
+    prohibited_ablation: str
+    violation_action: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.invariant_id,
+                self.required_behavior,
+                self.prohibited_ablation,
+                self.violation_action,
+            )
+        ):
+            raise ValueError("Stage 4 safety invariant fields are required")
+        if (
+            not self.estimator_ids
+            or self.estimator_ids != tuple(sorted(set(self.estimator_ids)))
+            or any(not estimator_id for estimator_id in self.estimator_ids)
+        ):
+            raise ValueError("Stage 4 safety invariant estimators must be canonical")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "invariant_id": self.invariant_id,
+            "estimator_ids": list(self.estimator_ids),
+            "required_behavior": self.required_behavior,
+            "prohibited_ablation": self.prohibited_ablation,
+            "violation_action": self.violation_action,
+        }
+
+
+def _missing_mask_safety_invariant() -> Stage4SafetyInvariant:
+    return Stage4SafetyInvariant(
+        invariant_id=STAGE4_MISSING_MASK_INVARIANT_ID,
+        estimator_ids=("gru_residual", "independent_mlp"),
+        required_behavior=(
+            "neural_inputs_keep_explicit_missing_indicators_and_history_ablations_keep_"
+            "missing_usage_attempts"
+        ),
+        prohibited_ablation="disable_or_remove_missing_telemetry_masks",
+        violation_action="fail_closed",
+    )
+
+
+@dataclass(frozen=True)
 class Stage4Matrix:
     source_id: str
     development_protocol_id: str
@@ -321,6 +388,7 @@ class Stage4Matrix:
     plans: tuple[Stage4ExperimentPlan, ...]
     gates: tuple[Stage4Gate, ...]
     telemetry_decisions: tuple[TelemetryDecision, ...]
+    safety_invariants: tuple[Stage4SafetyInvariant, ...]
     matrix_id: str
     schema_version: int = STAGE4_MATRIX_SCHEMA_VERSION
     policy_id: str = STAGE4_MATRIX_POLICY_ID
@@ -337,9 +405,29 @@ class Stage4Matrix:
             raise ValueError("Stage 4 plans must use canonical experiment order")
         if len(experiment_ids) != len(set(experiment_ids)):
             raise ValueError("Stage 4 experiment ids must be unique")
+        if "missing_usage_attempts" not in STAGE4_NO_TOOLS_ERRORS_FEATURES.include_features:
+            raise ValueError("Stage 4 telemetry missingness indicator was ablated")
+        if self.safety_invariants != (_missing_mask_safety_invariant(),):
+            raise ValueError("Stage 4 missing-mask safety invariant is not frozen")
         by_id = {plan.spec.experiment_id: plan for plan in self.plans}
         for plan in self.plans:
             validate_ablation_specs(plan.spec.candidates)
+            for candidate in plan.spec.candidates:
+                if candidate.estimator_id not in {
+                    estimator_id
+                    for invariant in self.safety_invariants
+                    for estimator_id in invariant.estimator_ids
+                }:
+                    continue
+                if any(
+                    "missing_mask" in path
+                    for path in (
+                        candidate.ablation.allowed_config_paths
+                        if candidate.ablation is not None
+                        else ()
+                    )
+                ):
+                    raise ValueError("Stage 4 cannot ablate required missing masks")
             if plan.role != Stage4PlanRole.ABLATION:
                 continue
             reference = by_id.get(str(plan.reference_experiment_id))
@@ -377,6 +465,9 @@ class Stage4Matrix:
             "gates": [gate.to_dict() for gate in self.gates],
             "telemetry_decisions": [
                 decision.to_dict() for decision in self.telemetry_decisions
+            ],
+            "safety_invariants": [
+                invariant.to_dict() for invariant in self.safety_invariants
             ],
         }
         if include_matrix_id:
@@ -466,7 +557,9 @@ def _single_history_candidate() -> tuple[CandidateSpec, ...]:
 
 
 def _call_pre_candidates() -> tuple[CandidateSpec, ...]:
-    return (
+    lightgbm_params = _lightgbm_params()
+    mlp_params = _mlp_params()
+    candidates = (
         CandidateSpec(
             "empirical",
             "empirical_quantile",
@@ -478,16 +571,83 @@ def _call_pre_candidates() -> tuple[CandidateSpec, ...]:
             "pre_request_char_message_length",
             "lightgbm_quantile",
             STAGE4_PRE_REQUEST_CHAR_MESSAGE_FEATURES,
-            params=_lightgbm_params(),
+            params=lightgbm_params,
             role=CandidateRole.BASELINE,
         ),
         CandidateSpec(
             "lightgbm_history",
             "lightgbm_quantile",
             STAGE2_HISTORY_FEATURES,
-            params=_lightgbm_params(),
+            params=lightgbm_params,
+        ),
+        CandidateSpec(
+            "mlp_history",
+            "independent_mlp",
+            STAGE2_HISTORY_FEATURES,
+            params=mlp_params,
+            role=CandidateRole.ABLATION,
+            ablation=AblationSpec(
+                reference_candidate_id="lightgbm_history",
+                axis=AblationAxis.METHOD,
+                allowed_config_paths=_method_ablation_paths(
+                    lightgbm_params,
+                    mlp_params,
+                ),
+            ),
         ),
     )
+    validate_ablation_specs(candidates)
+    return candidates
+
+
+def _seed_policy_candidates(
+    *,
+    condition_id: str,
+    input_contract_hash: str,
+) -> tuple[CandidateSpec, ...]:
+    params = {
+        "expected_condition_id": condition_id,
+        "expected_input_contract_hash": input_contract_hash,
+    }
+    initializer_params = {"alpha": STAGE4_ALPHA}
+
+    def graph(seed_policy_id: str) -> CandidateGraph:
+        return CandidateGraph(
+            initializer_estimator_id="empirical_quantile",
+            updater_estimator_id="cross_position_deduct",
+            lifecycle_schema_id=TASK_LIFECYCLE_SCHEMA_ID,
+            seed_policy_id=seed_policy_id,
+            inner_split_policy_id=INNER_FOLD_POLICY_ID,
+        )
+
+    candidates = (
+        CandidateSpec(
+            "cross_position_deduct_raw_repaired_oof_seed",
+            "cross_position_deduct",
+            NO_FEATURES,
+            params=params,
+            initializer_params=initializer_params,
+            graph=graph(SEED_POLICY_ID),
+        ),
+        CandidateSpec(
+            "cross_position_deduct_point_only_oof_seed",
+            "cross_position_deduct",
+            NO_FEATURES,
+            params=params,
+            initializer_params=initializer_params,
+            graph=graph(POINT_ONLY_SEED_POLICY_ID),
+            role=CandidateRole.ABLATION,
+            ablation=AblationSpec(
+                reference_candidate_id=(
+                    "cross_position_deduct_raw_repaired_oof_seed"
+                ),
+                axis=AblationAxis.SEED_POLICY,
+                allowed_config_paths=frozenset({"graph.seed_policy_id"}),
+            ),
+        ),
+    )
+    validate_ablation_specs(candidates)
+    return candidates
 
 
 def _aggregate_candidates() -> tuple[CandidateSpec, ...]:
@@ -768,6 +928,44 @@ def build_stage4_matrix(
                     candidates=_single_history_candidate(),
                 )
             )
+            input_contract_hash = protocol.development_dataset.input_contract_hash
+            if input_contract_hash is None:
+                gates.append(
+                    Stage4Gate(
+                        source_id,
+                        condition_id,
+                        "seed_policy_ablation",
+                        "missing_input_contract_hash",
+                        capabilities.contract_hash,
+                        task_count,
+                        point_count,
+                        task_position,
+                        task_target,
+                    )
+                )
+            else:
+                plans.append(
+                    Stage4ExperimentPlan(
+                        ExperimentSpec(
+                            _experiment_id(
+                                source_id,
+                                condition_id,
+                                task_position,
+                                task_target,
+                                "seed-policy-ablation",
+                            ),
+                            task_position,
+                            task_target,
+                            _seed_policy_candidates(
+                                condition_id=condition_id,
+                                input_contract_hash=input_contract_hash,
+                            ),
+                            alpha=STAGE4_ALPHA,
+                            calibrator_id=STAGE4_PRIMARY_CALIBRATOR_ID,
+                            condition_id=condition_id,
+                        )
+                    )
+                )
 
         for target in STAGE4_CALL_PRE_TARGETS:
             decision = decide_target_capability(
@@ -929,6 +1127,7 @@ def build_stage4_matrix(
             ),
         )
     )
+    safety_invariants = (_missing_mask_safety_invariant(),)
     semantic = {
         "schema_version": STAGE4_MATRIX_SCHEMA_VERSION,
         "policy_id": STAGE4_MATRIX_POLICY_ID,
@@ -939,6 +1138,9 @@ def build_stage4_matrix(
         "plans": [plan.to_dict() for plan in ordered_plans],
         "gates": [gate.to_dict() for gate in ordered_gates],
         "telemetry_decisions": [decision.to_dict() for decision in decisions],
+        "safety_invariants": [
+            invariant.to_dict() for invariant in safety_invariants
+        ],
     }
     return Stage4Matrix(
         source_id=source_id,
@@ -947,6 +1149,7 @@ def build_stage4_matrix(
         plans=ordered_plans,
         gates=ordered_gates,
         telemetry_decisions=decisions,
+        safety_invariants=safety_invariants,
         matrix_id=_canonical_sha256(semantic),
     )
 
@@ -967,6 +1170,7 @@ __all__ = [
     "STAGE4_CALL_PRE_TARGETS",
     "STAGE4_MATRIX_POLICY_ID",
     "STAGE4_MATRIX_SCHEMA_VERSION",
+    "STAGE4_MISSING_MASK_INVARIANT_ID",
     "STAGE4_MIN_DEVELOPMENT_TASKS",
     "STAGE4_PRIMARY_CALIBRATOR_ID",
     "STAGE4_TELEMETRY_SURFACES",
@@ -974,5 +1178,6 @@ __all__ = [
     "Stage4Gate",
     "Stage4Matrix",
     "Stage4PlanRole",
+    "Stage4SafetyInvariant",
     "build_stage4_matrix",
 ]

@@ -10,6 +10,7 @@ from token_prediction.estimators import TokenForecast
 
 
 METRIC_SUITE_ID = "token_prediction_metrics_v2"
+INTERVAL_DIAGNOSTICS_ID = "weighted_interval_tail_and_reserve_v1"
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,8 @@ def evaluate_forecasts(
     if any(weight <= 0 or not math.isfinite(weight) for weight in weights):
         raise ValueError("evaluation weights must be finite and positive")
     truths = [float(row.target_value) for row in rows]
+    if any(not math.isfinite(truth) for truth in truths):
+        raise ValueError("evaluation target values must be finite")
     points = [row.forecast.point for row in rows]
     lowers = [row.forecast.lower for row in rows]
     uppers = [row.forecast.upper for row in rows]
@@ -115,6 +118,18 @@ def evaluate_forecasts(
     covered = [
         float(lower <= truth <= upper)
         for lower, truth, upper in zip(lowers, truths, uppers)
+    ]
+    interval_below_truth = [
+        float(upper < truth)
+        for truth, upper in zip(truths, uppers)
+    ]
+    interval_above_truth = [
+        float(lower > truth)
+        for lower, truth in zip(lowers, truths)
+    ]
+    extra_reserved_tokens = [
+        max(0.0, upper - truth)
+        for truth, upper in zip(truths, uppers)
     ]
     widths = [upper - lower for lower, upper in zip(lowers, uppers)]
     normalized_widths = [width / max(abs(truth), 1.0) for width, truth in zip(widths, truths)]
@@ -162,7 +177,26 @@ def evaluate_forecasts(
             [float(prediction < truth) for prediction, truth in zip(points, truths)],
             weights,
         ),
+        "interval_diagnostics_id": INTERVAL_DIAGNOSTICS_ID,
         "coverage": _weighted_mean(covered, weights),
+        "interval_below_truth_rate": _weighted_mean(
+            interval_below_truth, weights
+        ),
+        "interval_above_truth_rate": _weighted_mean(
+            interval_above_truth, weights
+        ),
+        # This operational alias intentionally equals interval_below_truth_rate:
+        # the actual target exceeds reserved capacity exactly when the complete
+        # forecast interval lies below the realized target.
+        "target_exceeds_upper_rate": _weighted_mean(
+            interval_below_truth, weights
+        ),
+        # Reserved capacity is the forecast upper bound.  Surplus is truncated
+        # at zero and averaged over the complete frozen cohort, so breaches do
+        # not offset capacity that was reserved but unused on other points.
+        "mean_extra_reserved_tokens": _weighted_mean(
+            extra_reserved_tokens, weights
+        ),
         "task_simultaneous_coverage": _task_simultaneous_coverage(rows, covered),
         "interval_score": _weighted_mean(interval_scores, weights),
         "median_interval_width": _weighted_quantile(widths, weights, 0.5),
@@ -198,6 +232,18 @@ def evaluate_forecasts(
             float(lower <= truth <= upper)
             for (lower, _, upper), truth in zip(repaired, truths)
         ]
+        raw_interval_below_truth = [
+            float(upper < truth)
+            for (_, _, upper), truth in zip(repaired, truths)
+        ]
+        raw_interval_above_truth = [
+            float(lower > truth)
+            for (lower, _, _), truth in zip(repaired, truths)
+        ]
+        raw_extra_reserved_tokens = [
+            max(0.0, upper - truth)
+            for (_, _, upper), truth in zip(repaired, truths)
+        ]
         raw_scores = [
             _interval_score(lower, truth, upper, alpha)
             for (lower, _, upper), truth in zip(repaired, truths)
@@ -210,6 +256,18 @@ def evaluate_forecasts(
         metrics.update(
             {
                 "raw_coverage": _weighted_mean(raw_covered, weights),
+                "raw_interval_below_truth_rate": _weighted_mean(
+                    raw_interval_below_truth, weights
+                ),
+                "raw_interval_above_truth_rate": _weighted_mean(
+                    raw_interval_above_truth, weights
+                ),
+                "raw_target_exceeds_upper_rate": _weighted_mean(
+                    raw_interval_below_truth, weights
+                ),
+                "raw_mean_extra_reserved_tokens": _weighted_mean(
+                    raw_extra_reserved_tokens, weights
+                ),
                 "raw_task_simultaneous_coverage": _task_simultaneous_coverage(
                     rows, raw_covered
                 ),

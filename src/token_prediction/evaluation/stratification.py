@@ -21,6 +21,7 @@ from .metrics import ScoredForecast, evaluate_forecasts
 PROGRESS_STRATIFICATION_ID = "lifecycle_progress_checkpoints_v1"
 TERMINATION_STRATIFICATION_ID = "lifecycle_termination_strata_v1"
 RUN_VARIANCE_ID = "same_task_run_mae_variance_v1"
+RUN_DISPERSION_EXTENSION_ID = "same_task_run_mae_iqr_max_minus_min_v1"
 DEFAULT_PROGRESS_CHECKPOINTS = (0.25, 0.50, 0.75)
 
 
@@ -193,13 +194,43 @@ def _weighted_run_mae(run: LifecycleRun) -> float | None:
     if not predictions:
         return None
     weights = [prediction.step.sample_weight for prediction in predictions]
+    if any(weight <= 0 or not math.isfinite(weight) for weight in weights):
+        raise ValueError(
+            "scored lifecycle run weights must be finite and positive"
+        )
+    errors = [
+        abs(prediction.forecast.point - float(prediction.step.label))
+        for prediction in predictions
+    ]
+    if any(not math.isfinite(error) for error in errors):
+        raise ValueError("scored lifecycle run errors must be finite")
     total = sum(weights)
-    if total <= 0:
-        raise ValueError("scored lifecycle run has no positive evaluation weight")
     return sum(
-        weight * abs(prediction.forecast.point - float(prediction.step.label))
-        for prediction, weight in zip(predictions, weights)
+        weight * error
+        for error, weight in zip(errors, weights)
     ) / total
+
+
+def _linear_quantile(values: Sequence[float], q: float) -> float:
+    """Return the deterministic type-7 quantile used for per-task run IQR."""
+
+    if not values:
+        raise ValueError("run dispersion quantile requires at least one value")
+    if not math.isfinite(q) or not 0 <= q <= 1:
+        raise ValueError("run dispersion quantile must be finite and in [0, 1]")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("run dispersion values must be finite")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return float(ordered[lower_index])
+    fraction = position - lower_index
+    return float(
+        ordered[lower_index]
+        + fraction * (ordered[upper_index] - ordered[lower_index])
+    )
 
 
 def evaluate_same_task_run_variance(
@@ -217,13 +248,21 @@ def evaluate_same_task_run_variance(
         scored_runs += 1
         by_task.setdefault(run.sequence.task_id, []).append(run_mae)
     variances = []
+    iqrs = []
+    max_minus_mins = []
     for values in by_task.values():
         if len(values) < 2:
             continue
         mean = sum(values) / len(values)
         variances.append(sum((value - mean) ** 2 for value in values) / len(values))
+        iqrs.append(
+            _linear_quantile(values, 0.75)
+            - _linear_quantile(values, 0.25)
+        )
+        max_minus_mins.append(max(values) - min(values))
     return {
         "run_variance_id": RUN_VARIANCE_ID,
+        "run_dispersion_extension_id": RUN_DISPERSION_EXTENSION_ID,
         "n_tasks": len({run.sequence.task_id for run in resolved}),
         "n_scored_runs": scored_runs,
         "n_repeated_tasks": len(variances),
@@ -233,12 +272,29 @@ def evaluate_same_task_run_variance(
         ),
         "median_within_task_run_mae_variance": median(variances) if variances else 0.0,
         "max_within_task_run_mae_variance": max(variances, default=0.0),
+        "mean_within_task_run_mae_iqr": (
+            sum(iqrs) / len(iqrs) if iqrs else 0.0
+        ),
+        "median_within_task_run_mae_iqr": median(iqrs) if iqrs else 0.0,
+        "max_within_task_run_mae_iqr": max(iqrs, default=0.0),
+        "mean_within_task_run_mae_max_minus_min": (
+            sum(max_minus_mins) / len(max_minus_mins)
+            if max_minus_mins
+            else 0.0
+        ),
+        "median_within_task_run_mae_max_minus_min": (
+            median(max_minus_mins) if max_minus_mins else 0.0
+        ),
+        "max_within_task_run_mae_max_minus_min": max(
+            max_minus_mins, default=0.0
+        ),
     }
 
 
 __all__ = [
     "DEFAULT_PROGRESS_CHECKPOINTS",
     "PROGRESS_STRATIFICATION_ID",
+    "RUN_DISPERSION_EXTENSION_ID",
     "RUN_VARIANCE_ID",
     "TERMINATION_STRATIFICATION_ID",
     "evaluate_progress_checkpoints",

@@ -5,11 +5,15 @@ from dataclasses import dataclass
 
 from token_prediction.crossfit import (
     InitializerComponent,
+    POINT_ONLY_SEED_POLICY_HASH,
+    POINT_ONLY_SEED_POLICY_ID,
     SEED_POLICY_HASH,
     SEED_POLICY_ID,
     _seed_forecast,
     ensemble_repaired_forecasts,
     generate_crossfit_seeds,
+    prepare_seed_forecast,
+    seed_policy_document,
 )
 from token_prediction.dataset import PredictionPoint, PredictionPosition, PredictionTarget
 from token_prediction.estimators.base import ObservedTransition, RunContext, TokenForecast
@@ -195,6 +199,69 @@ class CrossfitTests(unittest.TestCase):
             (seed.raw_lower, seed.raw_point, seed.raw_upper),
             (-2, 8, 12),
         )
+
+    def test_point_only_policy_is_label_free_uncalibrated_and_distinct(self) -> None:
+        point = _point("x")
+        calibrated = TokenForecast(
+            point.point_id,
+            point.target,
+            0,
+            8,
+            30,
+            raw_lower=-2,
+            raw_point=8,
+            raw_upper=12,
+        )
+        seed = prepare_seed_forecast(
+            calibrated,
+            seed_policy_id=POINT_ONLY_SEED_POLICY_ID,
+        )
+        self.assertEqual((seed.lower, seed.point, seed.upper), (8, 8, 8))
+        self.assertEqual(
+            (seed.raw_lower, seed.raw_point, seed.raw_upper),
+            (8, 8, 8),
+        )
+        self.assertEqual(
+            seed_policy_document(POINT_ONLY_SEED_POLICY_ID)["calibration"],
+            "none",
+        )
+
+        points = tuple(_point(task) for task in ("a", "b", "c", "d", "e", "x"))
+        seeds = generate_crossfit_seeds(
+            points,
+            self.components,
+            dataset_id="dataset-v2",
+            input_contract_hash="a" * 64,
+            initializer_id="empirical_quantile",
+            initializer_hash="b" * 64,
+            inner_split_id="outer-0-inner-v1",
+            oof_tasks=frozenset({"a", "b", "c", "d", "e"}),
+            external_tasks=frozenset({"x"}),
+            seed_policy_id=POINT_ONLY_SEED_POLICY_ID,
+        )
+        self.assertEqual(seeds.seed_policy_id, POINT_ONLY_SEED_POLICY_ID)
+        self.assertEqual(seeds.seed_policy_hash, POINT_ONLY_SEED_POLICY_HASH)
+        self.assertTrue(
+            all(
+                record.seed.forecast.lower
+                == record.seed.forecast.point
+                == record.seed.forecast.upper
+                for record in seeds.records
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported crossfit seed policy"):
+            generate_crossfit_seeds(
+                points,
+                self.components,
+                dataset_id="dataset-v2",
+                input_contract_hash="a" * 64,
+                initializer_id="empirical_quantile",
+                initializer_hash="b" * 64,
+                inner_split_id="outer-0-inner-v1",
+                oof_tasks=frozenset({"a", "b", "c", "d", "e"}),
+                external_tasks=frozenset({"x"}),
+                seed_policy_id="unknown",
+            )
 
 
 if __name__ == "__main__":

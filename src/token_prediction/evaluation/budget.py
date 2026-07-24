@@ -29,6 +29,8 @@ def evaluate_budget_scenarios(
     weights = [float(row.sample_weight) for row in resolved]
     if any(weight <= 0 or not math.isfinite(weight) for weight in weights):
         raise ValueError("budget evaluation weights must be finite and positive")
+    if any(not math.isfinite(float(row.target_value)) for row in resolved):
+        raise ValueError("budget evaluation target values must be finite")
     thresholds = tuple(budgets)
     if (
         not thresholds

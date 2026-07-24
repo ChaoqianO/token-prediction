@@ -7,8 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from token_prediction.crossfit import (
-    SEED_POLICY_HASH,
-    SEED_POLICY_ID,
+    SUPPORTED_SEED_POLICY_IDS,
     CrossfitSeedSet,
     InitializerComponent,
     generate_crossfit_seeds,
@@ -781,8 +780,8 @@ def _pack_composite_artifact(
         "inner_task_assignments": [
             {"task_pseudonym": task, "fold": inner_fold} for task, inner_fold in inner_mapping
         ],
-        "seed_policy_id": SEED_POLICY_ID,
-        "seed_policy_hash": SEED_POLICY_HASH,
+        "seed_policy_id": seed_set.seed_policy_id,
+        "seed_policy_hash": seed_set.seed_policy_hash,
         "seed_set_hash": seed_set.content_hash,
         "calibrator_id": calibrator_id,
         "interval_alpha": alpha,
@@ -841,8 +840,8 @@ def _validate_inputs(
         raise ValueError("lifecycle CV requires an initializer/updater candidate graph")
     if candidate.graph.lifecycle_schema_id != TASK_LIFECYCLE_SCHEMA_ID:
         raise ValueError("candidate lifecycle schema does not match the runtime schema")
-    if candidate.graph.seed_policy_id != SEED_POLICY_ID:
-        raise ValueError("candidate seed policy does not match the crossfit runtime")
+    if candidate.graph.seed_policy_id not in SUPPORTED_SEED_POLICY_IDS:
+        raise ValueError("candidate seed policy is not supported by the crossfit runtime")
     if candidate.graph.inner_split_policy_id != INNER_FOLD_POLICY_ID:
         raise ValueError("candidate inner split policy does not match the runtime")
     allowed_updaters = frozenset({"cross_position_deduct", "gru_residual"})
@@ -1103,6 +1102,7 @@ def run_lifecycle_candidate_cv(
             inner_split_id=inner_assignment.assignment_id,
             oof_tasks=outer_tasks["train"],
             external_tasks=external_tasks,
+            seed_policy_id=graph.seed_policy_id,
         )
 
         train_sequences = _partition_sequences(

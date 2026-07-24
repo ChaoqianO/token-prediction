@@ -11,6 +11,7 @@ from tests.test_stage2_matrix import (
 )
 
 from token_prediction.contracts import Observable, SourceCapabilities
+from token_prediction.crossfit import POINT_ONLY_SEED_POLICY_ID, SEED_POLICY_ID
 from token_prediction.dataset import (
     DatasetRow,
     LabelStatus,
@@ -26,6 +27,7 @@ from token_prediction.stage2_matrix import (
 )
 from token_prediction.stage4_matrix import (
     STAGE4_CALL_PRE_TARGETS,
+    STAGE4_MISSING_MASK_INVARIANT_ID,
     Stage4Matrix,
     Stage4PlanRole,
     build_stage4_matrix,
@@ -178,7 +180,7 @@ class Stage4MatrixTests(unittest.TestCase):
             for plan in matrix.plans
             if plan.spec.condition_id == PRIMARY_CONDITION
         )
-        self.assertEqual(len(primary), 6)
+        self.assertEqual(len(primary), 7)
         self.assertEqual(
             {
                 plan.spec.target
@@ -220,7 +222,48 @@ class Stage4MatrixTests(unittest.TestCase):
                 "mlp_history",
             },
         )
+
+        call_pre_plans = tuple(
+            plan
+            for plan in primary
+            if plan.spec.position == PredictionPosition.CALL_PRE
+        )
+        self.assertEqual(len(call_pre_plans), len(STAGE4_CALL_PRE_TARGETS))
+        self.assertEqual(
+            len({plan.spec.experiment_id for plan in call_pre_plans}),
+            len(STAGE4_CALL_PRE_TARGETS),
+        )
+        for plan in call_pre_plans:
+            by_id = {
+                candidate.candidate_id: candidate
+                for candidate in plan.spec.candidates
+            }
+            self.assertEqual(
+                set(by_id),
+                {
+                    "empirical",
+                    "pre_request_char_message_length",
+                    "lightgbm_history",
+                    "mlp_history",
+                },
+            )
+            self.assertEqual(
+                by_id["mlp_history"].ablation.axis,
+                AblationAxis.METHOD,
+            )
+            self.assertEqual(
+                by_id["mlp_history"].ablation.reference_candidate_id,
+                "lightgbm_history",
+            )
+            self.assertEqual(plan.spec.alpha, 0.10)
+            self.assertEqual(plan.spec.calibrator_id, "task_max_conformal")
+            self.assertEqual(plan.spec.condition_id, PRIMARY_CONDITION)
+            validate_ablation_specs(plan.spec.candidates)
         validate_ablation_specs(feature_plan.spec.candidates)
+        self.assertIn(
+            "missing_usage_attempts",
+            candidates["lightgbm_without_tools_errors"].feature_set.include_features,
+        )
         self.assertEqual(
             {
                 candidate.candidate_id: candidate.ablation.axis
@@ -249,6 +292,64 @@ class Stage4MatrixTests(unittest.TestCase):
             ablation.allowed_config_paths,
             frozenset({"calibrator_id"}),
         )
+
+        seed_plan = next(
+            plan
+            for plan in primary
+            if plan.spec.experiment_id.endswith("seed-policy-ablation")
+        )
+        seed_candidates = {
+            candidate.candidate_id: candidate
+            for candidate in seed_plan.spec.candidates
+        }
+        self.assertEqual(
+            set(seed_candidates),
+            {
+                "cross_position_deduct_raw_repaired_oof_seed",
+                "cross_position_deduct_point_only_oof_seed",
+            },
+        )
+        raw_seed = seed_candidates[
+            "cross_position_deduct_raw_repaired_oof_seed"
+        ]
+        point_only_seed = seed_candidates[
+            "cross_position_deduct_point_only_oof_seed"
+        ]
+        self.assertEqual(raw_seed.graph.seed_policy_id, SEED_POLICY_ID)
+        self.assertEqual(
+            point_only_seed.graph.seed_policy_id,
+            POINT_ONLY_SEED_POLICY_ID,
+        )
+        self.assertEqual(
+            point_only_seed.ablation.axis,
+            AblationAxis.SEED_POLICY,
+        )
+        self.assertEqual(
+            point_only_seed.ablation.allowed_config_paths,
+            frozenset({"graph.seed_policy_id"}),
+        )
+        self.assertEqual(raw_seed.params, point_only_seed.params)
+        self.assertEqual(
+            raw_seed.initializer_params,
+            point_only_seed.initializer_params,
+        )
+        self.assertEqual(
+            seed_plan.spec.calibrator_id,
+            "task_max_conformal",
+        )
+        validate_ablation_specs(seed_plan.spec.candidates)
+
+        self.assertEqual(len(matrix.safety_invariants), 1)
+        invariant = matrix.safety_invariants[0]
+        self.assertEqual(
+            invariant.invariant_id,
+            STAGE4_MISSING_MASK_INVARIANT_ID,
+        )
+        self.assertEqual(
+            invariant.estimator_ids,
+            ("gru_residual", "independent_mlp"),
+        )
+        self.assertEqual(invariant.violation_action, "fail_closed")
 
     def test_missing_retrieval_call_update_and_g3_are_explicit_gates(self) -> None:
         matrix = build_stage4_matrix(
@@ -428,8 +529,11 @@ class Stage4MatrixTests(unittest.TestCase):
                 plans=matrix.plans,
                 gates=matrix.gates,
                 telemetry_decisions=matrix.telemetry_decisions,
+                safety_invariants=matrix.safety_invariants,
                 matrix_id="0" * 64,
             )
+        with self.assertRaisesRegex(ValueError, "missing-mask safety invariant"):
+            replace(matrix, safety_invariants=())
         with self.assertRaisesRegex(ValueError, "capabilities differ"):
             build_stage4_matrix(
                 protocol,
