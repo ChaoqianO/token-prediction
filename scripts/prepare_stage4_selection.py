@@ -640,10 +640,11 @@ def _fold_members(
                 "condition_id": experiment["condition_id"],
                 "position": experiment["position"],
                 "target": experiment["target"],
-                "fold": fold,
                 "split_plan_id": split_plan_id,
                 "calibrator_id": experiment["calibrator_id"],
             }
+            if bundle_kind == "lightgbm":
+                expected_provenance["fold"] = fold
             if any(provenance.get(key) != value for key, value in expected_provenance.items()):
                 raise Stage4SelectionError("selected fold provenance differs from experiment")
             bundle_tree_sha256, bundle_files = _member_file_projection(
