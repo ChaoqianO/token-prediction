@@ -266,6 +266,7 @@ EXPECTED_INNER_FOLDS = 5
 MAX_RELEASE_JSON_BYTES = 2 * 1024 * 1024
 MAX_PARENT_RELEASE_BYTES = 2 * 1024 * 1024
 MAX_RESULTS_JSON_BYTES = 32 * 1024 * 1024
+MAX_CHECKPOINT_JSON_BYTES = 128 * 1024 * 1024
 MAX_REPORT_BYTES = 4 * 1024 * 1024
 MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 MAX_BUNDLE_FILE_COUNT = 10_000
@@ -2583,7 +2584,7 @@ def _checkpoint_expectation(
         )
     wrapper = _load_json(
         checkpoint / "candidate_result.json",
-        maximum_bytes=MAX_RESULTS_JSON_BYTES,
+        maximum_bytes=MAX_CHECKPOINT_JSON_BYTES,
         description="Stage 4 completion candidate checkpoint",
     )
     wrapper = _exact(
