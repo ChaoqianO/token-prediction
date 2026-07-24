@@ -1627,6 +1627,68 @@ def _existing_final_summary(
     )
 
 
+def _validate_existing_final_publication(
+    root: Path,
+    lock: SelectionLockContext,
+    *,
+    output: Path,
+    checkpoint: Path,
+    ledger_path: Path,
+    run_id: str,
+) -> FinalSummary:
+    """Accept an existing artifact only after its publication fully closed."""
+
+    selection_id = str(lock.selection["selection_id"])
+    summary = _existing_final_summary(
+        output,
+        run_id=run_id,
+        selection_id=selection_id,
+    )
+    tombstone_path = _final_tombstone_path(root, selection_id)
+    if (
+        not tombstone_path.is_file()
+        or _is_link_or_reparse(tombstone_path)
+        or not ledger_path.is_file()
+        or _is_link_or_reparse(ledger_path)
+    ):
+        raise Stage4FinalError(
+            "existing final artifact lacks its resumable ledger or tombstone"
+        )
+    tombstone = _load_json(tombstone_path, description="final tombstone")
+    _validate_tombstone(
+        tombstone,
+        selection_id=selection_id,
+        selection_commit=lock.selection_commit,
+        run_id=run_id,
+    )
+    ledger = _load_or_create_ledger(
+        ledger_path,
+        run_id=run_id,
+        selection_id=selection_id,
+    )
+    expected_cells = sorted(str(cell["cell_id"]) for cell in lock.selection["cells"])
+    if (
+        ledger["status"] != "published"
+        or ledger["final_artifact_id"] != summary.artifact_id
+        or ledger["completed_cell_ids"] != expected_cells
+        or len(expected_cells) != len(set(expected_cells))
+        or tombstone["status"] != "published"
+        or tombstone["final_artifact_id"] != summary.artifact_id
+    ):
+        raise Stage4FinalError(
+            "existing final artifact publication is incomplete; "
+            "final labels remain closed"
+        )
+
+    # The declared set is complete, so validation cannot enter the source loader.
+    validated_cells = _evaluate_missing_cells(root, lock, checkpoint, ledger_path)
+    if [str(cell["cell_id"]) for cell in validated_cells] != [
+        str(cell["cell_id"]) for cell in lock.selection["cells"]
+    ]:
+        raise Stage4FinalError("existing final checkpoint order differs from selection")
+    return summary
+
+
 def run_stage4_final(
     *,
     repository_root: str | Path,
@@ -1707,10 +1769,13 @@ def _run_stage4_final_locked(
     checkpoint = checkpoint_parent / run_id
     ledger_path = checkpoint / "ledger.json"
     if output.exists():
-        return _existing_final_summary(
-            output,
+        return _validate_existing_final_publication(
+            root,
+            lock,
+            output=output,
+            checkpoint=checkpoint,
+            ledger_path=ledger_path,
             run_id=run_id,
-            selection_id=str(lock.selection["selection_id"]),
         )
     tombstone_path = _open_final_tombstone(
         root,

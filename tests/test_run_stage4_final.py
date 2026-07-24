@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.prepare_stage4_selection import SOURCE_ARTIFACTS
 from scripts.run_stage4_final import (
@@ -17,6 +19,7 @@ from scripts.run_stage4_final import (
     FINAL_RUN_POLICY_ID,
     FINAL_SCORE_PROJECTION_ID,
     FINAL_STAGE_NAME,
+    FinalSummary,
     SELECTION_LOCK_POLICY_ID,
     SELECTION_LOCK_SCHEMA_VERSION,
     SELECTION_TAG,
@@ -27,6 +30,7 @@ from scripts.run_stage4_final import (
     _evaluate_missing_cells,
     _open_final_tombstone,
     _publish_final_tombstone,
+    _validate_existing_final_publication,
     _require_canonical_final_arguments,
     _verify_checkpoint_selection_binding,
     _validate_selection_lock_document,
@@ -126,6 +130,49 @@ def _final_results() -> dict[str, object]:
     return base
 
 
+def _publication_lock(cell_id: str) -> SelectionLockContext:
+    return SelectionLockContext(
+        path=DEFAULT_SELECTION_LOCK,
+        sha256="b" * 64,
+        document={},
+        selection_root=Path("."),
+        selection_manifest_id="c" * 64,
+        selection={
+            "selection_id": "a" * 64,
+            "cells": [{"cell_id": cell_id}],
+        },
+        selection_commit="d" * 40,
+    )
+
+
+def _write_publication_ledger(
+    path: Path,
+    *,
+    run_id: str,
+    cell_id: str,
+    status: str,
+    final_artifact_id: str | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "ledger_schema_version": 1,
+                "run_policy_id": FINAL_RUN_POLICY_ID,
+                "run_id": run_id,
+                "selection_id": "a" * 64,
+                "status": status,
+                "completed_cell_ids": [cell_id],
+                "final_artifact_id": final_artifact_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 class Stage4FinalTests(unittest.TestCase):
     def test_final_paths_are_fixed_and_alternate_roots_are_rejected(self) -> None:
         _require_canonical_final_arguments(
@@ -203,6 +250,193 @@ class Stage4FinalTests(unittest.TestCase):
                     run_id=run_id,
                     ledger_path=ledger,
                 )
+
+    def test_existing_artifact_accepts_only_fully_published_state(self) -> None:
+        cell_id = "e" * 64
+        run_id = "f" * 24
+        artifact_id = "1" * 64
+        lock = _publication_lock(cell_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / DEFAULT_CHECKPOINT_ROOT / run_id
+            ledger = checkpoint / "ledger.json"
+            tombstone = _open_final_tombstone(
+                root,
+                selection_id="a" * 64,
+                selection_commit="d" * 40,
+                run_id=run_id,
+                ledger_path=ledger,
+            )
+            _write_publication_ledger(
+                ledger,
+                run_id=run_id,
+                cell_id=cell_id,
+                status="published",
+                final_artifact_id=artifact_id,
+            )
+            _publish_final_tombstone(
+                tombstone,
+                selection_id="a" * 64,
+                selection_commit="d" * 40,
+                run_id=run_id,
+                final_artifact_id=artifact_id,
+            )
+            ledger_before = ledger.read_bytes()
+            tombstone_before = tombstone.read_bytes()
+            summary = FinalSummary(
+                run_id=run_id,
+                selection_id="a" * 64,
+                output_dir=root / "final",
+                artifact_id=artifact_id,
+                results_payload_sha256="2" * 64,
+                cell_count=1,
+                prediction_count=1,
+                final_holdout_evaluated=True,
+            )
+            with (
+                patch(
+                    "scripts.run_stage4_final._existing_final_summary",
+                    return_value=summary,
+                ),
+                patch(
+                    "scripts.run_stage4_final._evaluate_missing_cells",
+                    return_value=[{"cell_id": cell_id}],
+                ) as evaluate,
+            ):
+                validated = _validate_existing_final_publication(
+                    root,
+                    lock,
+                    output=summary.output_dir,
+                    checkpoint=checkpoint,
+                    ledger_path=ledger,
+                    run_id=run_id,
+                )
+                repeated = _validate_existing_final_publication(
+                    root,
+                    lock,
+                    output=summary.output_dir,
+                    checkpoint=checkpoint,
+                    ledger_path=ledger,
+                    run_id=run_id,
+                )
+            self.assertEqual(validated, summary)
+            self.assertEqual(repeated, summary)
+            self.assertEqual(evaluate.call_count, 2)
+            self.assertEqual(ledger.read_bytes(), ledger_before)
+            self.assertEqual(tombstone.read_bytes(), tombstone_before)
+
+    def test_existing_artifact_rejects_open_tombstone(self) -> None:
+        cell_id = "e" * 64
+        run_id = "f" * 24
+        artifact_id = "1" * 64
+        lock = _publication_lock(cell_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / DEFAULT_CHECKPOINT_ROOT / run_id
+            ledger = checkpoint / "ledger.json"
+            _open_final_tombstone(
+                root,
+                selection_id="a" * 64,
+                selection_commit="d" * 40,
+                run_id=run_id,
+                ledger_path=ledger,
+            )
+            _write_publication_ledger(
+                ledger,
+                run_id=run_id,
+                cell_id=cell_id,
+                status="published",
+                final_artifact_id=artifact_id,
+            )
+            summary = FinalSummary(
+                run_id=run_id,
+                selection_id="a" * 64,
+                output_dir=root / "final",
+                artifact_id=artifact_id,
+                results_payload_sha256="2" * 64,
+                cell_count=1,
+                prediction_count=1,
+                final_holdout_evaluated=True,
+            )
+            with (
+                patch(
+                    "scripts.run_stage4_final._existing_final_summary",
+                    return_value=summary,
+                ),
+                patch("scripts.run_stage4_final._evaluate_missing_cells") as evaluate,
+            ):
+                with self.assertRaisesRegex(Stage4FinalError, "publication is incomplete"):
+                    _validate_existing_final_publication(
+                        root,
+                        lock,
+                        output=summary.output_dir,
+                        checkpoint=checkpoint,
+                        ledger_path=ledger,
+                        run_id=run_id,
+                    )
+            evaluate.assert_not_called()
+
+    def test_existing_artifact_never_reopens_incomplete_final_cells(self) -> None:
+        cell_id = "e" * 64
+        run_id = "f" * 24
+        lock = _publication_lock(cell_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / DEFAULT_CHECKPOINT_ROOT / run_id
+            ledger = checkpoint / "ledger.json"
+            tombstone = _open_final_tombstone(
+                root,
+                selection_id="a" * 64,
+                selection_commit="d" * 40,
+                run_id=run_id,
+                ledger_path=ledger,
+            )
+            _write_publication_ledger(
+                ledger,
+                run_id=run_id,
+                cell_id=cell_id,
+                status="published",
+                final_artifact_id="1" * 64,
+            )
+            _publish_final_tombstone(
+                tombstone,
+                selection_id="a" * 64,
+                selection_commit="d" * 40,
+                run_id=run_id,
+                final_artifact_id="1" * 64,
+            )
+            value = json.loads(ledger.read_text(encoding="utf-8"))
+            value["completed_cell_ids"] = []
+            ledger.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            summary = FinalSummary(
+                run_id=run_id,
+                selection_id="a" * 64,
+                output_dir=root / "final",
+                artifact_id="1" * 64,
+                results_payload_sha256="2" * 64,
+                cell_count=1,
+                prediction_count=1,
+                final_holdout_evaluated=True,
+            )
+            with (
+                patch(
+                    "scripts.run_stage4_final._existing_final_summary",
+                    return_value=summary,
+                ),
+                patch(
+                    "scripts.run_stage4_final._evaluate_missing_cells",
+                ) as evaluate,
+            ):
+                with self.assertRaisesRegex(Stage4FinalError, "final labels remain closed"):
+                    _validate_existing_final_publication(
+                        root,
+                        lock,
+                        output=summary.output_dir,
+                        checkpoint=checkpoint,
+                        ledger_path=ledger,
+                        run_id=run_id,
+                    )
+            evaluate.assert_not_called()
 
     def test_final_code_closure_contains_all_executed_loaders_and_controls(self) -> None:
         self.assertTrue(
