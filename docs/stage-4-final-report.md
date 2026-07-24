@@ -239,9 +239,9 @@ The released runner now rejects alternate roots, uses a fixed cross-process
 lock and persistent tombstone, checks ledger/checkpoint agreement, binds the
 full tracked execution closure, and refuses execution after the tracked
 release exists. GitHub ruleset `19652329` additionally blocks update and
-deletion of the four Stage 2–4 artifact/selection tags and the final release
-tag with no bypass actors, so remote immutability is enforced rather than
-merely checked after drift.
+deletion of the four Stage 2-4 source/selection tags and the final release tag
+with no bypass actors, so remote immutability is enforced rather than merely
+checked after drift.
 
 Public final results contain only run-local task pseudonyms. No raw task,
 trajectory, run, or instance identity is present. Private source archives,
