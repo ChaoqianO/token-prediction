@@ -2,8 +2,9 @@
 
 The verifier has two deliberately separate modes:
 
-* ``--tracked-only`` closes the tracked lock/report, the immutable source
-  commit and code tree, and the already-frozen parent final release.
+* ``--tracked-only`` byte-binds the tracked lock/report/release tooling/CI to
+  the fixed completion release-control tag, then closes the immutable source
+  commits and the already-frozen parent final release.
 * full verification additionally verifies all four development artifacts,
   checks the exact experiment/candidate matrix, and independently loads every
   declared LightGBM, Independent MLP, and lifecycle bundle.
@@ -24,7 +25,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from token_prediction.contracts import SourceDescriptor
-from token_prediction.development import STAGE_SPLIT_SEEDS
+from token_prediction.checkpoint import _result_from_dict
+from token_prediction.development import (
+    STAGE_SPLIT_SEEDS,
+    TASK_PSEUDONYM_POLICY_ID as DEVELOPMENT_TASK_PSEUDONYM_POLICY_ID,
+)
+from token_prediction.evaluation import METRIC_SUITE_ID
 from token_prediction.estimators.lightgbm_bundle import load_lightgbm_bundle
 from token_prediction.estimators.neural_bundle import load_neural_bundle
 from token_prediction.evaluation.stratification import (
@@ -35,18 +41,28 @@ from token_prediction.evaluation.stratification import (
 )
 from token_prediction.lifecycle_bundle import load_lifecycle_bundle
 from token_prediction.lineage import verify_artifact
+from token_prediction.features import NO_FEATURES
 from token_prediction.stage2_matrix import (
     BAGEN_SOKOBAN_SOURCE_ID,
     BAGEN_SOURCE_ID,
+    SPEND_AGGREGATE_STRUCTURED_FEATURES,
+    SPEND_AGGREGATE_TASK_CHARS,
     SPEND_AGGREGATE_SOURCE_ID,
     SPEND_SOURCE_ID,
+    STAGE2_HISTORY_FEATURES,
+    STAGE2_STRUCTURED_FEATURES,
 )
 from token_prediction.stage4_matrix import (
     FROZEN_STAGE4_SOURCE_CONDITIONS,
     STAGE4_CALL_PRE_TARGETS,
+    STAGE4_G3_FEATURES,
     STAGE4_MATRIX_POLICY_ID,
     STAGE4_MATRIX_SCHEMA_VERSION,
     STAGE4_MISSING_MASK_INVARIANT_ID,
+    STAGE4_NO_PROGRESS_FEATURES,
+    STAGE4_NO_TOOLS_ERRORS_FEATURES,
+    STAGE4_PRE_REQUEST_CHAR_MESSAGE_FEATURES,
+    STAGE4_RETRIEVAL_HISTORY_FEATURES,
 )
 
 if __package__:
@@ -65,10 +81,14 @@ if __package__:
     )
     from scripts.run_stage4_experiments import (
         STAGE4_ARTIFACT_SCHEMA_VERSION,
+        STAGE4_ARTIFACT_LAYOUT_ID,
         STAGE4_RUNNER_RELATIVE,
         STAGE4_STAGE_NAME,
+        STAGE4_TASK_PSEUDONYM_POLICY_ID,
         Stage4ExperimentError,
         _framed_code_hash,
+        cohort_projection_sha256,
+        prediction_projection_sha256,
         verify_stage4_results_document,
     )
     from scripts.verify_stage4_release import (
@@ -76,6 +96,14 @@ if __package__:
         Stage4ReleaseError,
         _regular_file as _release_regular_file,
         _validate_release_document as _validate_parent_release_document,
+    )
+    from scripts.summarize_stage4_completion import (
+        ArtifactReference,
+        CompletionSummaryError,
+        build_completion_summary,
+        load_completion_diagnostics_artifact,
+        load_development_artifact,
+        render_markdown,
     )
 else:  # pragma: no cover - direct production CLI invocation
     from run_data_foundation_baseline import (
@@ -93,10 +121,14 @@ else:  # pragma: no cover - direct production CLI invocation
     )
     from run_stage4_experiments import (
         STAGE4_ARTIFACT_SCHEMA_VERSION,
+        STAGE4_ARTIFACT_LAYOUT_ID,
         STAGE4_RUNNER_RELATIVE,
         STAGE4_STAGE_NAME,
+        STAGE4_TASK_PSEUDONYM_POLICY_ID,
         Stage4ExperimentError,
         _framed_code_hash,
+        cohort_projection_sha256,
+        prediction_projection_sha256,
         verify_stage4_results_document,
     )
     from verify_stage4_release import (
@@ -105,18 +137,36 @@ else:  # pragma: no cover - direct production CLI invocation
         _regular_file as _release_regular_file,
         _validate_release_document as _validate_parent_release_document,
     )
+    from summarize_stage4_completion import (
+        ArtifactReference,
+        CompletionSummaryError,
+        build_completion_summary,
+        load_completion_diagnostics_artifact,
+        load_development_artifact,
+        render_markdown,
+    )
 
 
 DEFAULT_RELEASE_LOCK = "configs/stage4_completion_release.json"
 DEFAULT_REPORT = "docs/stage-4-completion-supplement.md"
 PARENT_RELEASE_LOCK = "configs/stage4_release.json"
-RELEASE_SCHEMA_VERSION = 1
+COMPLETION_RELEASE_TAG = "stage4-completion-release-v1"
+RELEASE_CONTROL_PATHS = (
+    ".github/workflows/ci.yml",
+    DEFAULT_RELEASE_LOCK,
+    DEFAULT_REPORT,
+    "scripts/freeze_stage4_completion.py",
+    "scripts/verify_stage4_completion_release.py",
+    "scripts/verify_stage4_release.py",
+)
+RELEASE_SCHEMA_VERSION = 2
 RELEASE_STAGE_NAME = "stage4_development_completion_supplement"
 RELEASE_POLICY_ID = "stage4_development_only_completion_release_v1"
 SOURCE_CODE_POLICY_ID = "stage4_completion_source_code_tree_v1"
 SOURCE_TAG = "stage4-completion-source-v1"
 DIAGNOSTICS_SOURCE_TAG = "stage4-completion-diagnostics-source-v1"
 DIAGNOSTICS_RUNNER_RELATIVE = "scripts/run_stage4_completion_diagnostics.py"
+DIAGNOSTICS_SUMMARIZER_RELATIVE = "scripts/summarize_stage4_completion.py"
 PARENT_FINAL_TAG = "stage4-final-release-v1"
 PARENT_FINAL_ARTIFACT_ID = (
     "a1f41e7a91d48677fea7b869835a297b5b6073f43d074ba295c727d6e6167287"
@@ -138,9 +188,76 @@ EXPECTED_DIAGNOSTICS_CANDIDATE_COUNT = 2
 EXPECTED_DIAGNOSTICS_CANDIDATE_CELL_COUNT = 14
 EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT = 42
 EXPECTED_DIAGNOSTICS_BUNDLE_COUNT = 210
-DIAGNOSTICS_RESULTS_SCHEMA_VERSION = 1
+DIAGNOSTICS_RESULTS_SCHEMA_VERSION = 2
 DIAGNOSTICS_STAGE_NAME = "stage4_completion_diagnostics"
-DIAGNOSTICS_POLICY_ID = "stage4_completion_development_lifecycle_replay_v1"
+DIAGNOSTICS_POLICY_ID = "stage4_completion_artifact_checkpoint_only_v2"
+DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON = (
+    "no_presealed_development_lifecycle_projection_v1"
+)
+DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS = [
+    "progress",
+    "run_variance_iqr_max_minus_min",
+    "termination",
+]
+_DIAGNOSTIC_RECORD_KEYS = {
+    "source_name",
+    "condition_id",
+    "experiment_id",
+    "candidate_id",
+    "candidate_hash",
+    "split_seed",
+    "split_plan_id",
+    "bundle_folds",
+    "bundle_projection_sha256",
+    "checkpoint_parity",
+    "lifecycle_metrics",
+}
+_CHECKPOINT_PARITY_KEYS = {
+    "status",
+    "checkpoint_artifact_id",
+    "checkpoint_result_sha256",
+    "prediction_count",
+    "expected_prediction_count",
+    "prediction_projection_sha256",
+    "expected_prediction_projection_sha256",
+    "cohort_projection_sha256",
+    "expected_cohort_projection_sha256",
+    "aggregate_metrics_projection_sha256",
+    "expected_aggregate_metrics_projection_sha256",
+    "development_cohort_status",
+    "development_task_count",
+    "development_task_projection_sha256",
+}
+_LIFECYCLE_METRICS_KEYS = {
+    "status",
+    "reason_code",
+    "labels_present",
+    "lifecycle_sequences_present",
+    "unavailable_metrics",
+    "historical_stage3_reference",
+}
+_DIAGNOSTICS_COVERAGE = {
+    "bound_source_artifact_count": EXPECTED_DIAGNOSTICS_BOUND_SOURCE_COUNT,
+    "lifecycle_source_count": EXPECTED_DIAGNOSTICS_LIFECYCLE_SOURCE_COUNT,
+    "lifecycle_condition_count": (
+        EXPECTED_DIAGNOSTICS_LIFECYCLE_CONDITION_COUNT
+    ),
+    "lifecycle_candidate_count": EXPECTED_DIAGNOSTICS_CANDIDATE_COUNT,
+    "lifecycle_candidate_cell_count": (
+        EXPECTED_DIAGNOSTICS_CANDIDATE_CELL_COUNT
+    ),
+    "lifecycle_candidate_seed_count": (
+        EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+    ),
+    "lifecycle_bundle_count": EXPECTED_DIAGNOSTICS_BUNDLE_COUNT,
+    "checkpoint_verified_candidate_seed_count": (
+        EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+    ),
+    "lifecycle_replayed_candidate_seed_count": 0,
+    "lifecycle_metrics_unavailable_candidate_seed_count": (
+        EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+    ),
+}
 EXPECTED_FINAL_EVALUATION_COUNT = 1
 EXPECTED_FINAL_PREDICTION_COUNT = 86_335
 EXPECTED_OUTER_FOLDS = 5
@@ -186,6 +303,12 @@ _EXPLICIT_CODE_PATHS = frozenset(
         STAGE2_AUXILIARY_MANIFEST_RELATIVE,
     }
 )
+_DIAGNOSTICS_DIRECT_CODE_PATHS = frozenset(
+    {
+        DIAGNOSTICS_RUNNER_RELATIVE,
+        DIAGNOSTICS_SUMMARIZER_RELATIVE,
+    }
+)
 _MISSING_MASK_INVARIANT = {
     "invariant_id": STAGE4_MISSING_MASK_INVARIANT_ID,
     "estimator_ids": ["gru_residual", "independent_mlp"],
@@ -214,6 +337,22 @@ _SEED_POLICY_CANDIDATES = (
     "cross_position_deduct_raw_repaired_oof_seed",
     "cross_position_deduct_point_only_oof_seed",
 )
+_FROZEN_FEATURE_SETS = (
+    NO_FEATURES,
+    STAGE2_STRUCTURED_FEATURES,
+    STAGE2_HISTORY_FEATURES,
+    SPEND_AGGREGATE_STRUCTURED_FEATURES,
+    SPEND_AGGREGATE_TASK_CHARS,
+    STAGE4_NO_PROGRESS_FEATURES,
+    STAGE4_NO_TOOLS_ERRORS_FEATURES,
+    STAGE4_PRE_REQUEST_CHAR_MESSAGE_FEATURES,
+    STAGE4_RETRIEVAL_HISTORY_FEATURES,
+    STAGE4_G3_FEATURES,
+)
+_EXPECTED_FEATURE_HASHES = {
+    feature_set.feature_set_id: feature_set.content_hash
+    for feature_set in _FROZEN_FEATURE_SETS
+}
 _INTERVAL_METRIC_FIELDS = {
     "interval_diagnostics_id",
     "interval_below_truth_rate",
@@ -447,6 +586,7 @@ def _validate_release_document(value: Mapping[str, Any]) -> None:
             "release_schema_version",
             "stage_name",
             "policy_id",
+            "release_control",
             "source_binding",
             "parent_final_release",
             "artifacts",
@@ -463,6 +603,16 @@ def _validate_release_document(value: Mapping[str, Any]) -> None:
     ):
         raise Stage4CompletionReleaseError(
             "Stage 4 completion release identity is invalid"
+        )
+
+    release_control = _exact(
+        value["release_control"],
+        {"release_tag"},
+        description="Stage 4 completion release control",
+    )
+    if release_control["release_tag"] != COMPLETION_RELEASE_TAG:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion release-control tag is invalid"
         )
 
     source = _exact(
@@ -674,68 +824,13 @@ def _validate_release_document(value: Mapping[str, Any]) -> None:
         )
     diagnostics_coverage = _exact(
         diagnostics["coverage"],
-        {
-            "bound_source_artifact_count",
-            "lifecycle_source_count",
-            "lifecycle_condition_count",
-            "lifecycle_candidate_count",
-            "lifecycle_candidate_cell_count",
-            "lifecycle_candidate_seed_count",
-            "lifecycle_bundle_count",
-            "replayed_run_count",
-            "scored_run_count",
-            "scored_boundary_count",
-            "unscored_context_boundary_count",
-        },
+        set(_DIAGNOSTICS_COVERAGE),
         description="Stage 4 completion diagnostics coverage",
     )
-    expected_diagnostics_coverage = {
-        "bound_source_artifact_count": EXPECTED_DIAGNOSTICS_BOUND_SOURCE_COUNT,
-        "lifecycle_source_count": EXPECTED_DIAGNOSTICS_LIFECYCLE_SOURCE_COUNT,
-        "lifecycle_condition_count": (
-            EXPECTED_DIAGNOSTICS_LIFECYCLE_CONDITION_COUNT
-        ),
-        "lifecycle_candidate_count": EXPECTED_DIAGNOSTICS_CANDIDATE_COUNT,
-        "lifecycle_candidate_cell_count": (
-            EXPECTED_DIAGNOSTICS_CANDIDATE_CELL_COUNT
-        ),
-        "lifecycle_candidate_seed_count": (
-            EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
-        ),
-        "lifecycle_bundle_count": EXPECTED_DIAGNOSTICS_BUNDLE_COUNT,
-    }
-    if any(
-        diagnostics_coverage.get(key) != expected
-        for key, expected in expected_diagnostics_coverage.items()
-    ):
+    if dict(diagnostics_coverage) != _DIAGNOSTICS_COVERAGE:
         raise Stage4CompletionReleaseError(
-            "Stage 4 completion diagnostics fixed coverage differs"
+            "Stage 4 completion checkpoint-only diagnostics coverage differs"
         )
-    replayed = _integer(
-        diagnostics_coverage["replayed_run_count"],
-        description="Stage 4 completion diagnostics replayed run count",
-        minimum=1,
-    )
-    scored = _integer(
-        diagnostics_coverage["scored_run_count"],
-        description="Stage 4 completion diagnostics scored run count",
-        minimum=1,
-    )
-    if scored > replayed:
-        raise Stage4CompletionReleaseError(
-            "Stage 4 completion diagnostics scored runs exceed replayed runs"
-        )
-    _integer(
-        diagnostics_coverage["scored_boundary_count"],
-        description="Stage 4 completion diagnostics scored boundary count",
-        minimum=1,
-    )
-    _integer(
-        diagnostics_coverage["unscored_context_boundary_count"],
-        description=(
-            "Stage 4 completion diagnostics unscored context boundary count"
-        ),
-    )
 
     protocol = _exact(
         value["protocol"],
@@ -757,6 +852,9 @@ def _validate_release_document(value: Mapping[str, Any]) -> None:
             "diagnostics_candidate_cell_count",
             "diagnostics_candidate_seed_count",
             "diagnostics_bundle_count",
+            "diagnostics_checkpoint_verified_candidate_seed_count",
+            "diagnostics_lifecycle_replayed_candidate_seed_count",
+            "diagnostics_lifecycle_metrics_unavailable_candidate_seed_count",
             "split_seeds",
             "outer_folds",
             "inner_folds",
@@ -799,6 +897,13 @@ def _validate_release_document(value: Mapping[str, Any]) -> None:
             EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
         ),
         "diagnostics_bundle_count": EXPECTED_DIAGNOSTICS_BUNDLE_COUNT,
+        "diagnostics_checkpoint_verified_candidate_seed_count": (
+            EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+        ),
+        "diagnostics_lifecycle_replayed_candidate_seed_count": 0,
+        "diagnostics_lifecycle_metrics_unavailable_candidate_seed_count": (
+            EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+        ),
         "split_seeds": list(STAGE_SPLIT_SEEDS),
         "outer_folds": EXPECTED_OUTER_FOLDS,
         "inner_folds": EXPECTED_INNER_FOLDS,
@@ -887,6 +992,55 @@ def _code_binding_at_commit(root: Path, commit: str) -> Mapping[str, object]:
     }
 
 
+def _diagnostics_code_paths_at_commit(
+    root: Path,
+    commit: str,
+) -> tuple[str, ...]:
+    """Derive the exact replay closure from the immutable diagnostics commit."""
+
+    raw = _git(
+        root,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        commit,
+        "--",
+        "src/token_prediction",
+        *sorted(_EXPLICIT_CODE_PATHS | _DIAGNOSTICS_DIRECT_CODE_PATHS),
+    )
+    paths: list[str] = []
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        try:
+            relative = item.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise Stage4CompletionReleaseError(
+                "Git returned a non-UTF-8 diagnostics code path"
+            ) from exc
+        relative = _relative(
+            relative,
+            description="Stage 4 completion diagnostics historical code path",
+        )
+        if relative in (
+            _EXPLICIT_CODE_PATHS | _DIAGNOSTICS_DIRECT_CODE_PATHS
+        ) or (
+            relative.startswith("src/token_prediction/")
+            and relative.endswith(".py")
+        ):
+            paths.append(relative)
+    resolved = tuple(sorted(set(paths)))
+    required = _EXPLICIT_CODE_PATHS | _DIAGNOSTICS_DIRECT_CODE_PATHS
+    if not required <= set(resolved) or not any(
+        path.startswith("src/token_prediction/") for path in resolved
+    ):
+        raise Stage4CompletionReleaseError(
+            "diagnostics commit lacks its complete execution closure"
+        )
+    return resolved
+
+
 def _verify_diagnostics_code_binding(
     root: Path,
     value: Mapping[str, Any],
@@ -895,15 +1049,10 @@ def _verify_diagnostics_code_binding(
 ) -> Mapping[str, object]:
     commit = str(value["git_commit"])
     paths = tuple(str(path) for path in value["code_paths"])
-    required = {
-        DIAGNOSTICS_RUNNER_RELATIVE,
-        "src/token_prediction/evaluation/stratification.py",
-        "src/token_prediction/lifecycle_bundle.py",
-        "src/token_prediction/lifecycle.py",
-    }
-    if not required <= set(paths):
+    expected_paths = _diagnostics_code_paths_at_commit(root, commit)
+    if paths != expected_paths:
         raise Stage4CompletionReleaseError(
-            "Stage 4 completion diagnostics code closure is incomplete"
+            "Stage 4 completion diagnostics code closure differs from its tag"
         )
     tagged = (
         _git(
@@ -1043,16 +1192,104 @@ def _verify_parent_release(
     return parent
 
 
+def _release_control_size_limit(relative: str) -> int:
+    if relative == DEFAULT_RELEASE_LOCK:
+        return MAX_RELEASE_JSON_BYTES
+    if relative == DEFAULT_REPORT:
+        return MAX_REPORT_BYTES
+    return MAX_BUNDLE_FILE_BYTES
+
+
+def _verify_release_control_tag(
+    root: Path,
+    release: Mapping[str, Any],
+    *,
+    release_relative: str,
+) -> str:
+    """Byte-bind the formal release controls to the fixed protected tag."""
+
+    if release_relative != DEFAULT_RELEASE_LOCK:
+        raise Stage4CompletionReleaseError(
+            "tracked-only verification requires the formal completion lock"
+        )
+    tag = str(release["release_control"]["release_tag"])
+    if tag != COMPLETION_RELEASE_TAG:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion release-control tag identity differs"
+        )
+    try:
+        tagged_commit = (
+            _git(
+                root,
+                "rev-parse",
+                "--verify",
+                f"refs/tags/{tag}^{{commit}}",
+            )
+            .decode("ascii")
+            .strip()
+        )
+    except (Stage4CompletionReleaseError, UnicodeError) as exc:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion release-control tag is missing or invalid"
+        ) from exc
+    _commit(
+        tagged_commit,
+        description="Stage 4 completion release-control tag commit",
+    )
+    for relative in RELEASE_CONTROL_PATHS:
+        maximum_bytes = _release_control_size_limit(relative)
+        try:
+            tagged_payload = _git(
+                root,
+                "show",
+                f"{tagged_commit}:{relative}",
+                maximum_bytes=maximum_bytes,
+            )
+        except Stage4CompletionReleaseError as exc:
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion release-control tag omits "
+                f"{relative}"
+            ) from exc
+        current_payload = _regular_file(
+            _path(
+                root,
+                relative,
+                description="Stage 4 completion release control",
+            ),
+            maximum_bytes=maximum_bytes,
+            description=f"Stage 4 completion release control {relative}",
+        )
+        if current_payload != tagged_payload:
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion release-control tag moved or current "
+                f"bytes differ for {relative}"
+            )
+    return tagged_commit
+
+
 def _verify_tracked_bindings(
     root: Path,
     release: Mapping[str, Any],
     *,
     release_relative: str,
     require_git_clean: bool,
+    require_release_control_tag: bool,
 ) -> Mapping[str, object]:
     report_relative = str(release["report"]["path"])
     parent_relative = str(release["parent_final_release"]["lock_path"])
-    controls = (release_relative, report_relative, parent_relative)
+    if require_release_control_tag:
+        if (
+            release_relative != DEFAULT_RELEASE_LOCK
+            or report_relative != DEFAULT_REPORT
+        ):
+            raise Stage4CompletionReleaseError(
+                "tracked-only verification requires formal completion controls"
+            )
+        controls = tuple(
+            dict.fromkeys((*RELEASE_CONTROL_PATHS, parent_relative))
+        )
+    else:
+        controls = (release_relative, report_relative, parent_relative)
     tracked = {
         item.decode("utf-8", errors="strict")
         for item in _git(root, "ls-files", "-z", "--", *controls).split(b"\0")
@@ -1073,6 +1310,12 @@ def _verify_tracked_bindings(
     ):
         raise Stage4CompletionReleaseError(
             "Stage 4 completion release controls must be clean at HEAD"
+        )
+    if require_release_control_tag:
+        _verify_release_control_tag(
+            root,
+            release,
+            release_relative=release_relative,
         )
 
     source = release["source_binding"]
@@ -1118,6 +1361,81 @@ def _verify_tracked_bindings(
     return code
 
 
+def _canonical_report_payload(
+    root: Path,
+    release: Mapping[str, Any],
+) -> bytes:
+    try:
+        artifacts = tuple(
+            load_development_artifact(
+                ArtifactReference(
+                    path=_path(
+                        root,
+                        item["path"],
+                        description=(
+                            "Stage 4 completion report source artifact"
+                        ),
+                    ),
+                    expected_artifact_id=str(item["artifact_id"]),
+                    expected_results_payload_sha256=str(
+                        item["results_payload_sha256"]
+                    ),
+                )
+            )
+            for item in release["artifacts"]
+        )
+        diagnostics = load_completion_diagnostics_artifact(
+            release["diagnostics_artifact"]["path"],
+            repo_root=root,
+            diagnostics_root=(
+                root
+                / "workspace"
+                / "stage4"
+                / "completion_diagnostics"
+            ),
+        )
+        if (
+            diagnostics.artifact_id
+            != release["diagnostics_artifact"]["artifact_id"]
+            or diagnostics.results_payload_sha256
+            != release["diagnostics_artifact"]["results_payload_sha256"]
+        ):
+            raise Stage4CompletionReleaseError(
+                "canonical report diagnostics binding differs"
+            )
+        summary = build_completion_summary(
+            artifacts,
+            diagnostics=diagnostics,
+        )
+        return (render_markdown(summary) + "\n").encode("utf-8")
+    except Stage4CompletionReleaseError:
+        raise
+    except (CompletionSummaryError, OSError, TypeError, ValueError) as exc:
+        raise Stage4CompletionReleaseError(
+            "canonical completion report cannot be reconstructed"
+        ) from exc
+
+
+def _verify_report_semantics(
+    root: Path,
+    release: Mapping[str, Any],
+) -> None:
+    expected = _canonical_report_payload(root, release)
+    actual = _regular_file(
+        _path(
+            root,
+            release["report"]["path"],
+            description="Stage 4 completion report",
+        ),
+        maximum_bytes=MAX_REPORT_BYTES,
+        description="Stage 4 completion report",
+    )
+    if actual != expected:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion report differs from canonical artifact summary"
+        )
+
+
 def _artifact_key(value: object, *, prefix: str, description: str) -> str:
     text = _text(value, description=description)
     if (
@@ -1129,6 +1447,96 @@ def _artifact_key(value: object, *, prefix: str, description: str) -> str:
             f"{description} is not a compact artifact key"
         )
     return text
+
+
+def _expected_artifact_key(kind: str, identity: str) -> str:
+    if kind not in {"e", "c"} or not identity:
+        raise Stage4CompletionReleaseError("invalid artifact-key identity")
+    digest = hashlib.sha256(
+        f"{STAGE4_ARTIFACT_LAYOUT_ID}\0{kind}\0{identity}".encode("utf-8")
+    ).hexdigest()
+    return f"{kind}_{digest[:16]}"
+
+
+def _verify_plan_candidate_hash(
+    value: object,
+    *,
+    description: str,
+) -> Mapping[str, Any]:
+    candidate = _exact(
+        value,
+        {
+            "candidate_id",
+            "candidate_hash",
+            "estimator_id",
+            "role",
+            "feature_set_id",
+            "feature_set_hash",
+            "params",
+            "initializer_params",
+            "graph",
+            "seed_policy_hash",
+            "ablation",
+        },
+        description=description,
+    )
+    feature_set_id = _text(
+        candidate["feature_set_id"],
+        description=f"{description} feature set id",
+    )
+    expected_feature_hash = _EXPECTED_FEATURE_HASHES.get(feature_set_id)
+    if (
+        expected_feature_hash is None
+        or _sha256(
+            candidate["feature_set_hash"],
+            description=f"{description} feature set hash",
+        )
+        != expected_feature_hash
+    ):
+        raise Stage4CompletionReleaseError(
+            f"{description} feature set hash is not the frozen implementation"
+        )
+    params = candidate["params"]
+    initializer_params = candidate["initializer_params"]
+    graph = _exact(
+        candidate["graph"],
+        {
+            "initializer_estimator_id",
+            "updater_estimator_id",
+            "lifecycle_schema_id",
+            "seed_policy_id",
+            "inner_split_policy_id",
+        },
+        description=f"{description} graph",
+    )
+    if not isinstance(params, Mapping) or not isinstance(
+        initializer_params,
+        Mapping,
+    ):
+        raise Stage4CompletionReleaseError(
+            f"{description} parameters must be JSON objects"
+        )
+    expected_candidate_hash = _semantic_sha256(
+        {
+            "estimator_id": candidate["estimator_id"],
+            "feature_set_hash": expected_feature_hash,
+            "params": dict(params),
+            "initializer_params": dict(initializer_params),
+            "graph": dict(graph),
+        }
+    )
+    if (
+        _sha256(
+            candidate["candidate_hash"],
+            description=f"{description} candidate hash",
+        )
+        != expected_candidate_hash
+        or graph["updater_estimator_id"] != candidate["estimator_id"]
+    ):
+        raise Stage4CompletionReleaseError(
+            f"{description} candidate hash or graph does not close"
+        )
+    return candidate
 
 
 def _candidate_projection(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1197,12 +1605,37 @@ def _verify_matrix_binding(
         raise Stage4CompletionReleaseError(
             "Stage 4 completion matrix must be an object"
         )
+    expected_matrix_keys = {
+        "schema_version",
+        "policy_id",
+        "source_id",
+        "development_protocol_id",
+        "capability_contract_hash",
+        "minimum_development_tasks",
+        "plans",
+        "gates",
+        "telemetry_decisions",
+        "safety_invariants",
+        "matrix_id",
+    }
+    if set(matrix) != expected_matrix_keys:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion matrix keys differ"
+        )
+    matrix_semantic = dict(matrix)
+    matrix_id = _sha256(
+        matrix_semantic.pop("matrix_id"),
+        description="Stage 4 completion matrix id",
+    )
     if (
         matrix.get("schema_version") != STAGE4_MATRIX_SCHEMA_VERSION
         or matrix.get("policy_id") != STAGE4_MATRIX_POLICY_ID
         or matrix.get("source_id") != results["source"]["source_id"]
-        or matrix.get("matrix_id") != results["summary"].get("matrix_id")
-        and "matrix_id" in results["summary"]
+        or _semantic_sha256(matrix_semantic) != matrix_id
+        or (
+            "matrix_id" in results["summary"]
+            and matrix_id != results["summary"]["matrix_id"]
+        )
     ):
         raise Stage4CompletionReleaseError(
             "Stage 4 completion matrix identity differs"
@@ -1275,7 +1708,20 @@ def _verify_matrix_binding(
             raise Stage4CompletionReleaseError(
                 "Stage 4 completion candidates must be lists"
             )
-        if [_plan_candidate_projection(item) for item in plan_candidates] != [
+        verified_plan_candidates = [
+            _verify_plan_candidate_hash(
+                item,
+                description=(
+                    f"Stage 4 completion {experiment_id} matrix candidate "
+                    f"{index}"
+                ),
+            )
+            for index, item in enumerate(plan_candidates)
+        ]
+        if [
+            _plan_candidate_projection(item)
+            for item in verified_plan_candidates
+        ] != [
             _candidate_projection(item) for item in result_candidates
         ]:
             raise Stage4CompletionReleaseError(
@@ -1449,11 +1895,18 @@ def _verify_result_coverage(
     call_pre_mlp_folds = 0
     seed_policy_folds = 0
     for experiment in experiments:
-        _artifact_key(
+        experiment_artifact_key = _artifact_key(
             experiment.get("artifact_key"),
             prefix="e",
             description="Stage 4 completion experiment artifact key",
         )
+        if experiment_artifact_key != _expected_artifact_key(
+            "e",
+            str(experiment["experiment_id"]),
+        ):
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion experiment artifact key does not close"
+            )
         candidates = experiment.get("candidates")
         if not isinstance(candidates, list):
             raise Stage4CompletionReleaseError(
@@ -1464,15 +1917,22 @@ def _verify_result_coverage(
                 raise Stage4CompletionReleaseError(
                     "Stage 4 completion candidate is invalid"
                 )
-            _artifact_key(
+            candidate_artifact_key = _artifact_key(
                 candidate.get("artifact_key"),
                 prefix="c",
                 description="Stage 4 completion candidate artifact key",
             )
-            _sha256(
+            candidate_hash = _sha256(
                 candidate.get("candidate_hash"),
                 description="Stage 4 completion candidate hash",
             )
+            if candidate_artifact_key != _expected_artifact_key(
+                "c",
+                candidate_hash,
+            ):
+                raise Stage4CompletionReleaseError(
+                    "Stage 4 completion candidate artifact key does not close"
+                )
             seed_results = candidate.get("seed_results")
             if not isinstance(seed_results, list) or [
                 result.get("split_seed")
@@ -1601,6 +2061,22 @@ def _bundle_mapping(directory: Path) -> Mapping[str, bytes]:
     return files
 
 
+def _require_exact_artifact_payloads(
+    manifest_files: Mapping[str, str],
+    expected_files: set[str],
+    *,
+    description: str,
+) -> None:
+    observed = set(manifest_files)
+    if observed != expected_files:
+        missing = sorted(expected_files - observed)
+        extra = sorted(observed - expected_files)
+        raise Stage4CompletionReleaseError(
+            f"{description} payload topology differs; "
+            f"missing={missing}, extra={extra}"
+        )
+
+
 def _verify_fold_provenance(
     fold_root: Path,
     *,
@@ -1639,6 +2115,53 @@ def _verify_fold_provenance(
         )
     graph = candidate["candidate_graph"]
     lifecycle = graph["initializer_estimator_id"] != "none"
+    if not lifecycle:
+        point_keys = {
+            "bundle_role",
+            "calibrator_id",
+            "candidate_graph",
+            "candidate_hash",
+            "candidate_id",
+            "capability_contract_hash",
+            "code_hash",
+            "condition_id",
+            "dataset_id",
+            "dataset_schema_version",
+            "eligibility_hash",
+            "feature_schema_version",
+            "feature_set_hash",
+            "fold",
+            "input_contract_hash",
+            "interval_alpha",
+            "position",
+            "source_descriptor_hash",
+            "split_plan_id",
+            "target",
+        }
+        if provenance.get("source_descriptor") is not None:
+            point_keys.add("source_descriptor")
+        if set(provenance) != point_keys or provenance.get(
+            "bundle_role"
+        ) != "point_model":
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion point-model provenance keys differ"
+            )
+        for key in (
+            "capability_contract_hash",
+            "eligibility_hash",
+            "input_contract_hash",
+            "source_descriptor_hash",
+        ):
+            _sha256(
+                provenance.get(key),
+                description=f"Stage 4 completion provenance {key}",
+            )
+        for key in ("dataset_schema_version", "feature_schema_version"):
+            _integer(
+                provenance.get(key),
+                description=f"Stage 4 completion provenance {key}",
+                minimum=1,
+            )
     fold_field = "outer_fold" if lifecycle else "fold"
     if provenance.get(fold_field) != fold:
         raise Stage4CompletionReleaseError(
@@ -1676,8 +2199,11 @@ def _verify_fold_provenance(
 def _load_declared_bundles(
     artifact_root: Path,
     results: Mapping[str, Any],
+    *,
+    manifest_files: Mapping[str, str] | None = None,
 ) -> int:
     count = 0
+    expected_files = {"results.json"}
     for experiment in results["experiments"]:
         experiment_key = _artifact_key(
             experiment["artifact_key"],
@@ -1715,9 +2241,44 @@ def _load_declared_bundles(
                         fold=fold,
                     )
                     bundle = fold_root / "bundle"
+                    fold_relative = (
+                        f"fold_artifacts/{experiment_key}/{candidate_key}/"
+                        f"seed_{seed}/fold_{fold}"
+                    )
+                    if lifecycle:
+                        sidecars = {
+                            "calibrator.json",
+                            "provenance.json",
+                        }
+                    elif candidate["estimator_id"] == "independent_mlp":
+                        sidecars = {
+                            "calibrator.json",
+                            "encoder.json",
+                            "fit_report.json",
+                            "provenance.json",
+                        }
+                    elif candidate["estimator_id"] == "lightgbm_quantile":
+                        sidecars = {
+                            "calibrator.json",
+                            "encoder.json",
+                            "feature_importance.jsonl",
+                            "fit_report.json",
+                            "provenance.json",
+                            "q05.model.txt",
+                            "q50.model.txt",
+                            "q95.model.txt",
+                        }
+                    else:
+                        raise Stage4CompletionReleaseError(
+                            "Stage 4 completion bundle estimator is unsupported"
+                        )
+                    expected_files.update(
+                        f"{fold_relative}/{name}" for name in sidecars
+                    )
+                    bundle_files = _bundle_mapping(bundle)
                     try:
                         if lifecycle:
-                            loaded = load_lifecycle_bundle(_bundle_mapping(bundle))
+                            loaded = load_lifecycle_bundle(bundle_files)
                             if dict(loaded.manifest) != dict(provenance):
                                 raise Stage4CompletionReleaseError(
                                     "Stage 4 completion lifecycle provenance differs"
@@ -1729,7 +2290,41 @@ def _load_declared_bundles(
                                     "Stage 4 completion MLP provenance differs"
                                 )
                         elif candidate["estimator_id"] == "lightgbm_quantile":
-                            load_lightgbm_bundle(bundle)
+                            loaded = load_lightgbm_bundle(bundle)
+                            root_encoder = _load_json(
+                                fold_root / "encoder.json",
+                                maximum_bytes=MAX_PROVENANCE_BYTES,
+                                description=(
+                                    "Stage 4 completion LightGBM fold encoder"
+                                ),
+                            )
+                            root_fit_report = _load_json(
+                                fold_root / "fit_report.json",
+                                maximum_bytes=MAX_PROVENANCE_BYTES,
+                                description=(
+                                    "Stage 4 completion LightGBM fit report"
+                                ),
+                            )
+                            if (
+                                loaded.dataset_id != provenance["dataset_id"]
+                                or loaded.position.value
+                                != provenance["position"]
+                                or loaded.target.value != provenance["target"]
+                                or loaded.allowed_condition_ids
+                                != (provenance["condition_id"],)
+                                or dict(root_encoder)
+                                != loaded.encoder.to_dict()
+                                or root_fit_report.get(
+                                    "encoder_schema_hash"
+                                )
+                                != loaded.encoder.schema.content_hash
+                                or loaded.fit_report.encoder_schema_hash
+                                != loaded.encoder.schema.content_hash
+                            ):
+                                raise Stage4CompletionReleaseError(
+                                    "Stage 4 completion LightGBM loaded scope "
+                                    "or encoder differs"
+                                )
                         else:
                             raise Stage4CompletionReleaseError(
                                 "Stage 4 completion bundle estimator is unsupported"
@@ -1740,7 +2335,17 @@ def _load_declared_bundles(
                         raise Stage4CompletionReleaseError(
                             "Stage 4 completion bundle failed independent loading"
                         ) from exc
+                    expected_files.update(
+                        f"{fold_relative}/bundle/{name}"
+                        for name in bundle_files
+                    )
                     count += 1
+    if manifest_files is not None:
+        _require_exact_artifact_payloads(
+            manifest_files,
+            expected_files,
+            description="Stage 4 completion artifact",
+        )
     return count
 
 
@@ -1760,6 +2365,37 @@ def _semantic_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _training_run_semantic_sha256(
+    metadata: Mapping[str, Any],
+    *,
+    expected_run_id: object,
+    expected_results_payload_sha256: object,
+    description: str,
+) -> str:
+    run_id = _text(expected_run_id, description=f"{description} run id")
+    payload_sha256 = _sha256(
+        expected_results_payload_sha256,
+        description=f"{description} results payload",
+    )
+    semantic = metadata.get("run_semantic")
+    if (
+        set(metadata)
+        != {"run_id", "run_semantic", "results_payload_sha256"}
+        or metadata.get("run_id") != run_id
+        or metadata.get("results_payload_sha256") != payload_sha256
+        or not isinstance(semantic, Mapping)
+    ):
+        raise Stage4CompletionReleaseError(
+            f"{description} manifest metadata differs"
+        )
+    semantic_sha256 = _semantic_sha256(dict(semantic))
+    if run_id != semantic_sha256[:24]:
+        raise Stage4CompletionReleaseError(
+            f"{description} run semantic SHA-256 differs"
+        )
+    return semantic_sha256
+
+
 def _diagnostic_identity(value: Mapping[str, Any]) -> tuple[object, ...]:
     return (
         value.get("source_name"),
@@ -1776,10 +2412,366 @@ def _inventory_identity(value: Mapping[str, Any]) -> tuple[object, ...]:
     return (*_diagnostic_identity(value), value.get("fold"))
 
 
+def _verify_shared_development_task_projection(
+    diagnostics: Sequence[Mapping[str, Any]],
+) -> None:
+    cells: dict[tuple[object, object, object], list[Mapping[str, Any]]] = {}
+    for record in diagnostics:
+        key = (
+            record.get("source_name"),
+            record.get("condition_id"),
+            record.get("experiment_id"),
+        )
+        cells.setdefault(key, []).append(record)
+    for cell in cells.values():
+        if (
+            len(cell) != len(_SEED_POLICY_CANDIDATES) * len(STAGE_SPLIT_SEEDS)
+            or {record.get("candidate_id") for record in cell}
+            != set(_SEED_POLICY_CANDIDATES)
+            or {record.get("split_seed") for record in cell}
+            != set(STAGE_SPLIT_SEEDS)
+        ):
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion development task identity cell topology differs"
+            )
+        parities = [
+            record.get("checkpoint_parity")
+            for record in cell
+            if isinstance(record.get("checkpoint_parity"), Mapping)
+        ]
+        if len(parities) != len(cell):
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion development task identity parity is invalid"
+            )
+        task_counts = {parity.get("development_task_count") for parity in parities}
+        task_projections = {
+            parity.get("development_task_projection_sha256") for parity in parities
+        }
+        if len(task_counts) != 1 or len(task_projections) != 1:
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion split-independent development task identity "
+                "projection differs within a semantic cell"
+            )
+
+
+def _seed_aggregate_projection(
+    seed_result: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    metrics = seed_result.get("metrics")
+    fold_metrics = seed_result.get("fold_metrics")
+    task_metrics = seed_result.get("task_metrics")
+    if (
+        not isinstance(metrics, Mapping)
+        or not isinstance(fold_metrics, Mapping)
+        or not isinstance(task_metrics, list)
+        or any(not isinstance(item, Mapping) for item in task_metrics)
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion finalized seed metrics are invalid"
+        )
+    return {
+        "metrics": dict(metrics),
+        "fold_metrics": dict(fold_metrics),
+        "task_metric_policy_id": STAGE4_TASK_PSEUDONYM_POLICY_ID,
+        "task_metrics": [dict(item) for item in task_metrics],
+    }
+
+
+def _checkpoint_expectation(
+    root: Path,
+    *,
+    results: Mapping[str, Any],
+    experiment: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    seed_result: Mapping[str, Any],
+    source_provenance_hash: str,
+    source_run_semantic_sha256: str,
+) -> Mapping[str, Any]:
+    comparability = seed_result.get("comparability_key")
+    split_seed = seed_result.get("split_seed")
+    source_run_semantic_sha256 = _sha256(
+        source_run_semantic_sha256,
+        description="Stage 4 completion source run semantic",
+    )
+    if (
+        not isinstance(comparability, list)
+        or len(comparability) != 9
+        or isinstance(split_seed, bool)
+        or not isinstance(split_seed, int)
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint comparability key is invalid"
+        )
+    execution_key = {
+        "experiment_id": experiment["experiment_id"],
+        "candidate_id": candidate["candidate_id"],
+        "candidate_hash": candidate["candidate_hash"],
+        "dataset_id": comparability[0],
+        "split_plan_id": seed_result["split_plan_id"],
+        "split_seed": split_seed,
+        "eligibility_hash": comparability[2],
+        "position": experiment["position"],
+        "target": experiment["target"],
+        "condition_id": experiment["condition_id"],
+        "calibrator_id": experiment["calibrator_id"],
+        "alpha": experiment["alpha"],
+        "source_provenance_hash": source_provenance_hash,
+    }
+    expected_comparability = [
+        execution_key["dataset_id"],
+        execution_key["split_plan_id"],
+        execution_key["eligibility_hash"],
+        execution_key["position"],
+        execution_key["target"],
+        execution_key["condition_id"],
+        execution_key["calibrator_id"],
+        str(execution_key["alpha"]),
+        METRIC_SUITE_ID,
+    ]
+    if comparability != expected_comparability:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint comparability key differs from "
+            "the execution identity"
+        )
+    execution_hash = _semantic_sha256(execution_key)
+    run_id = _text(
+        results.get("run_id"),
+        description="Stage 4 completion checkpoint run id",
+    )
+    checkpoint = _path(
+        root,
+        (
+            f"workspace/stage4/checkpoints/{run_id}/candidates/"
+            f"{execution_hash}"
+        ),
+        description="Stage 4 completion candidate checkpoint",
+    )
+    try:
+        manifest = verify_artifact(checkpoint)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion candidate checkpoint verification failed"
+        ) from exc
+    expected_checkpoint_metadata = {
+        "candidate_execution_hash": execution_hash,
+        "run_id": run_id,
+        "run_semantic_sha256": source_run_semantic_sha256,
+    }
+    if (
+        manifest.stage_name != "development_candidate_checkpoint"
+        or manifest.schema_version != 1
+        or set(manifest.files) != {"candidate_result.json"}
+        or dict(manifest.metadata) != expected_checkpoint_metadata
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion candidate checkpoint identity differs"
+        )
+    wrapper = _load_json(
+        checkpoint / "candidate_result.json",
+        maximum_bytes=MAX_RESULTS_JSON_BYTES,
+        description="Stage 4 completion candidate checkpoint",
+    )
+    wrapper = _exact(
+        wrapper,
+        {
+            "checkpoint_schema_version",
+            "execution_key",
+            "result",
+            "result_sha256",
+        },
+        description="Stage 4 completion candidate checkpoint",
+    )
+    if (
+        wrapper["checkpoint_schema_version"] != 1
+        or wrapper["execution_key"] != execution_key
+        or not isinstance(wrapper["result"], Mapping)
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion candidate checkpoint schema differs"
+        )
+    result_document = dict(wrapper["result"])
+    result_sha256 = _sha256(
+        wrapper["result_sha256"],
+        description="Stage 4 completion checkpoint result",
+    )
+    if _semantic_sha256(result_document) != result_sha256:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint result checksum differs"
+        )
+    try:
+        checkpoint_result = _result_from_dict(result_document)
+    except Exception as exc:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint result cannot be reconstructed"
+        ) from exc
+    expected_identity = {
+        "candidate_id": candidate["candidate_id"],
+        "candidate_hash": candidate["candidate_hash"],
+        "dataset_id": comparability[0],
+        "split_plan_id": seed_result["split_plan_id"],
+        "eligibility_hash": comparability[2],
+        "position": experiment["position"],
+        "target": experiment["target"],
+        "condition_id": experiment["condition_id"],
+        "calibrator_id": experiment["calibrator_id"],
+        "alpha": experiment["alpha"],
+    }
+    observed_identity = {
+        "candidate_id": checkpoint_result.candidate_id,
+        "candidate_hash": checkpoint_result.candidate_hash,
+        "dataset_id": checkpoint_result.dataset_id,
+        "split_plan_id": checkpoint_result.split_plan_id,
+        "eligibility_hash": checkpoint_result.eligibility_hash,
+        "position": checkpoint_result.position.value,
+        "target": checkpoint_result.target.value,
+        "condition_id": checkpoint_result.condition_id,
+        "calibrator_id": checkpoint_result.calibrator_id,
+        "alpha": checkpoint_result.alpha,
+    }
+    if observed_identity != expected_identity:
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint result scope differs"
+        )
+    prediction_count = len(checkpoint_result.predictions)
+    prediction_projection = prediction_projection_sha256(checkpoint_result)
+    cohort_projection = cohort_projection_sha256(checkpoint_result)
+    expected_count = _integer(
+        seed_result.get("prediction_count"),
+        description="Stage 4 completion finalized prediction count",
+        minimum=1,
+    )
+    expected_prediction = _sha256(
+        seed_result.get("prediction_projection_sha256"),
+        description="Stage 4 completion finalized prediction projection",
+    )
+    expected_cohort = _sha256(
+        seed_result.get("cohort_projection_sha256"),
+        description="Stage 4 completion finalized cohort projection",
+    )
+    checkpoint_task_metrics = sorted(
+        (
+            {
+                "task_pseudonym": hashlib.sha256(
+                    (
+                        f"{STAGE4_TASK_PSEUDONYM_POLICY_ID}\0"
+                        f"{checkpoint_result.split_plan_id}\0{task_id}"
+                    ).encode()
+                ).hexdigest(),
+                **dict(metrics),
+            }
+            for task_id, metrics in checkpoint_result.task_metrics.items()
+        ),
+        key=lambda item: str(item["task_pseudonym"]),
+    )
+    checkpoint_aggregate = {
+        "metrics": dict(checkpoint_result.metrics),
+        "fold_metrics": {
+            str(fold): dict(metrics)
+            for fold, metrics in checkpoint_result.fold_metrics.items()
+        },
+        "task_metric_policy_id": STAGE4_TASK_PSEUDONYM_POLICY_ID,
+        "task_metrics": checkpoint_task_metrics,
+    }
+    expected_aggregate = _seed_aggregate_projection(seed_result)
+    aggregate_projection = _semantic_sha256(checkpoint_aggregate)
+    expected_aggregate_projection = _semantic_sha256(expected_aggregate)
+    if (
+        prediction_count != expected_count
+        or prediction_projection != expected_prediction
+        or cohort_projection != expected_cohort
+        or aggregate_projection != expected_aggregate_projection
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint differs from its finalized seed"
+        )
+    protocol = results.get("development_protocol")
+    if not isinstance(protocol, Mapping):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion development protocol is invalid"
+        )
+    permanent_holdout = protocol.get("permanent_holdout")
+    if not isinstance(permanent_holdout, Mapping) or not isinstance(
+        permanent_holdout.get("assignments"),
+        list,
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion permanent holdout assignments are invalid"
+        )
+    assignments: dict[str, str] = {}
+    for raw in permanent_holdout["assignments"]:
+        assignment = _exact(
+            raw,
+            {"task_pseudonym", "cohort"},
+            description="Stage 4 completion holdout assignment",
+        )
+        task_pseudonym = _sha256(
+            assignment["task_pseudonym"],
+            description="Stage 4 completion holdout task pseudonym",
+        )
+        cohort = _text(
+            assignment["cohort"],
+            description="Stage 4 completion holdout cohort",
+        )
+        if task_pseudonym in assignments or cohort not in {
+            "development",
+            "final_holdout",
+        }:
+            raise Stage4CompletionReleaseError(
+                "Stage 4 completion holdout assignment differs"
+            )
+        assignments[task_pseudonym] = cohort
+    task_pseudonyms = sorted(
+        {
+            hashlib.sha256(
+                (
+                    f"{DEVELOPMENT_TASK_PSEUDONYM_POLICY_ID}\0"
+                    f"{record.task_id}"
+                ).encode()
+            ).hexdigest()
+            for record in checkpoint_result.predictions
+        }
+    )
+    if not task_pseudonyms or any(
+        assignments.get(task_pseudonym) != "development"
+        for task_pseudonym in task_pseudonyms
+    ):
+        raise Stage4CompletionReleaseError(
+            "Stage 4 completion checkpoint contains final or unassigned tasks"
+        )
+    development_projection = _semantic_sha256(
+        [
+            {
+                "task_pseudonym": task_pseudonym,
+                "cohort": assignments[task_pseudonym],
+            }
+            for task_pseudonym in task_pseudonyms
+        ]
+    )
+    return {
+        "status": "exact",
+        "checkpoint_artifact_id": manifest.artifact_id,
+        "checkpoint_result_sha256": result_sha256,
+        "prediction_count": prediction_count,
+        "expected_prediction_count": expected_count,
+        "prediction_projection_sha256": prediction_projection,
+        "expected_prediction_projection_sha256": expected_prediction,
+        "cohort_projection_sha256": cohort_projection,
+        "expected_cohort_projection_sha256": expected_cohort,
+        "aggregate_metrics_projection_sha256": aggregate_projection,
+        "expected_aggregate_metrics_projection_sha256": (
+            expected_aggregate_projection
+        ),
+        "development_cohort_status": "development_only",
+        "development_task_count": len(task_pseudonyms),
+        "development_task_projection_sha256": development_projection,
+    }
+
+
 def _expected_diagnostics_scope(
     root: Path,
     release: Mapping[str, Any],
     training_results: Mapping[str, Mapping[str, Any]],
+    training_run_semantic_sha256_by_source: Mapping[str, str],
 ) -> tuple[
     dict[tuple[object, ...], Mapping[str, Any]],
     dict[tuple[object, ...], Mapping[str, Any]],
@@ -1792,6 +2784,12 @@ def _expected_diagnostics_scope(
     for source_name, results in training_results.items():
         if source_name == "spend_aggregate":
             continue
+        source_run_semantic_sha256 = _sha256(
+            training_run_semantic_sha256_by_source.get(source_name),
+            description=(
+                f"Stage 4 completion {source_name} source run semantic"
+            ),
+        )
         artifact_root = _path(
             root,
             locks[source_name]["path"],
@@ -1818,7 +2816,7 @@ def _expected_diagnostics_scope(
                         raise Stage4CompletionReleaseError(
                             "Stage 4 completion diagnostic identity collided"
                         )
-                    expected_diagnostics[identity] = base
+                    source_provenance_hashes: set[str] = set()
                     for fold in range(EXPECTED_OUTER_FOLDS):
                         bundle_relative = (
                             f"fold_artifacts/{experiment_key}/{candidate_key}/"
@@ -1831,6 +2829,34 @@ def _expected_diagnostics_scope(
                             raise Stage4CompletionReleaseError(
                                 "Stage 4 completion lifecycle bundle lacks manifest"
                             )
+                        try:
+                            loaded_bundle = load_lifecycle_bundle(bundle)
+                        except Exception as exc:
+                            raise Stage4CompletionReleaseError(
+                                "Stage 4 completion lifecycle bundle failed "
+                                "independent safe loading"
+                            ) from exc
+                        bundle_manifest = loaded_bundle.manifest
+                        source_provenance_hashes.add(
+                            _semantic_sha256(
+                                {
+                                    "source_descriptor": bundle_manifest.get(
+                                        "source_descriptor"
+                                    ),
+                                    "source_descriptor_hash": (
+                                        bundle_manifest.get(
+                                            "source_descriptor_hash"
+                                        )
+                                    ),
+                                    "code_hash": bundle_manifest.get(
+                                        "code_hash"
+                                    ),
+                                    "runtime_versions": results.get(
+                                        "runtime_versions"
+                                    ),
+                                }
+                            )
+                        )
                         inventory = {
                             **base,
                             "fold": fold,
@@ -1847,6 +2873,27 @@ def _expected_diagnostics_scope(
                                 "Stage 4 completion bundle inventory collided"
                             )
                         expected_inventory[inventory_identity] = inventory
+                    if len(source_provenance_hashes) != 1:
+                        raise Stage4CompletionReleaseError(
+                            "Stage 4 completion lifecycle bundles disagree on "
+                            "source provenance"
+                        )
+                    expected_diagnostics[identity] = {
+                        **base,
+                        "_checkpoint_parity": _checkpoint_expectation(
+                            root,
+                            results=results,
+                            experiment=experiment,
+                            candidate=candidate,
+                            seed_result=seed_result,
+                            source_provenance_hash=next(
+                                iter(source_provenance_hashes)
+                            ),
+                            source_run_semantic_sha256=(
+                                source_run_semantic_sha256
+                            ),
+                        ),
+                    }
     if (
         len(expected_diagnostics) != EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
         or len(expected_inventory) != EXPECTED_DIAGNOSTICS_BUNDLE_COUNT
@@ -2044,6 +3091,7 @@ def _verify_diagnostics_artifact(
     root: Path,
     release: Mapping[str, Any],
     training_results: Mapping[str, Mapping[str, Any]],
+    training_run_semantic_sha256_by_source: Mapping[str, str],
 ) -> tuple[int, int]:
     locked = release["diagnostics_artifact"]
     artifact_root = _path(
@@ -2066,11 +3114,12 @@ def _verify_diagnostics_artifact(
         manifest.artifact_id != locked["artifact_id"]
         or manifest.stage_name != DIAGNOSTICS_STAGE_NAME
         or manifest.schema_version != DIAGNOSTICS_RESULTS_SCHEMA_VERSION
+        or set(manifest.files) != {"results.json"}
         or hashlib.sha256(manifest_payload).hexdigest()
         != locked["manifest_sha256"]
     ):
         raise Stage4CompletionReleaseError(
-            "Stage 4 completion diagnostics manifest binding differs"
+            "Stage 4 completion diagnostics manifest binding or topology differs"
         )
     results = _load_json(
         artifact_root / "results.json",
@@ -2182,7 +3231,7 @@ def _verify_diagnostics_artifact(
         expected_status = (
             "not_applicable_no_lifecycle"
             if source_name == "spend_aggregate"
-            else "complete"
+            else "unavailable_no_presealed_replay_projection"
         )
         expected = {
             "source_name": source_name,
@@ -2218,6 +3267,7 @@ def _verify_diagnostics_artifact(
         root,
         release,
         training_results,
+        training_run_semantic_sha256_by_source,
     )
 
     inventory = results["bundle_inventory"]
@@ -2273,28 +3323,12 @@ def _verify_diagnostics_artifact(
             "Stage 4 completion diagnostic record count differs"
         )
     observed_diagnostics: set[tuple[object, ...]] = set()
-    replayed_runs = 0
-    scored_runs = 0
-    scored_boundaries = 0
-    unscored_context_boundaries = 0
+    checkpoint_verified = 0
+    lifecycle_unavailable = 0
     for item in diagnostics:
         record = _exact(
             item,
-            {
-                "source_name",
-                "condition_id",
-                "experiment_id",
-                "candidate_id",
-                "candidate_hash",
-                "split_seed",
-                "split_plan_id",
-                "bundle_folds",
-                "bundle_projection_sha256",
-                "reload_parity",
-                "progress",
-                "termination",
-                "run_variance",
-            },
+            _DIAGNOSTIC_RECORD_KEYS,
             description="Stage 4 completion diagnostic record",
         )
         identity = _diagnostic_identity(record)
@@ -2326,65 +3360,84 @@ def _verify_diagnostics_artifact(
                 "Stage 4 completion diagnostic bundle projection differs"
             )
         parity = _exact(
-            record["reload_parity"],
-            {
-                "status",
-                "scored_prediction_count",
-                "expected_prediction_count",
-                "prediction_projection_sha256",
-                "expected_prediction_projection_sha256",
-            },
-            description="Stage 4 completion diagnostic reload parity",
+            record["checkpoint_parity"],
+            _CHECKPOINT_PARITY_KEYS,
+            description="Stage 4 completion checkpoint parity",
         )
+        expected_parity = expected_diagnostics[identity][
+            "_checkpoint_parity"
+        ]
+        for key in _CHECKPOINT_PARITY_KEYS - {
+            "status",
+            "development_cohort_status",
+            "prediction_count",
+            "expected_prediction_count",
+            "development_task_count",
+        }:
+            _sha256(
+                parity[key],
+                description=f"Stage 4 completion checkpoint {key}",
+            )
         if (
-            parity["status"] != "exact"
+            dict(parity) != dict(expected_parity)
+            or parity["status"] != "exact"
+            or parity["development_cohort_status"] != "development_only"
             or _integer(
-                parity["scored_prediction_count"],
-                description="Stage 4 completion replay prediction count",
+                parity["prediction_count"],
+                description="Stage 4 completion checkpoint prediction count",
                 minimum=1,
             )
             != _integer(
                 parity["expected_prediction_count"],
-                description="Stage 4 completion expected prediction count",
+                description=(
+                    "Stage 4 completion expected checkpoint prediction count"
+                ),
                 minimum=1,
             )
-            or _sha256(
-                parity["prediction_projection_sha256"],
-                description="Stage 4 completion replay prediction projection",
+            or _integer(
+                parity["development_task_count"],
+                description="Stage 4 completion development task count",
+                minimum=1,
             )
-            != _sha256(
-                parity["expected_prediction_projection_sha256"],
-                description="Stage 4 completion expected prediction projection",
-            )
+            <= 0
         ):
             raise Stage4CompletionReleaseError(
-                "Stage 4 completion diagnostic reload parity differs"
+                "Stage 4 completion checkpoint parity differs from the "
+                "training seed and independently reopened checkpoint"
             )
-        scored_boundaries += int(parity["scored_prediction_count"])
-        record_runs = _verify_progress_diagnostics(record["progress"])
-        context_count, termination_scored, termination_runs = (
-            _verify_termination_diagnostics(record["termination"])
+        lifecycle = _exact(
+            record["lifecycle_metrics"],
+            _LIFECYCLE_METRICS_KEYS,
+            description="Stage 4 completion lifecycle metric availability",
         )
         if (
-            termination_scored != int(parity["scored_prediction_count"])
-            or termination_runs != record_runs
+            lifecycle["status"] != "unavailable"
+            or lifecycle["reason_code"]
+            != DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON
+            or lifecycle["labels_present"] is not False
+            or lifecycle["lifecycle_sequences_present"] is not False
+            or lifecycle["unavailable_metrics"]
+            != DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS
+            or lifecycle["historical_stage3_reference"] is not None
         ):
             raise Stage4CompletionReleaseError(
-                "Stage 4 completion termination/reload coverage differs"
+                "Stage 4 completion lifecycle-unavailable declaration differs"
             )
-        replayed_runs += record_runs
-        unscored_context_boundaries += context_count
-        scored_runs += _verify_run_dispersion(record["run_variance"])
+        checkpoint_verified += 1
+        lifecycle_unavailable += 1
     if set(expected_diagnostics) != observed_diagnostics:
         raise Stage4CompletionReleaseError(
             "Stage 4 completion diagnostics are incomplete"
         )
+    _verify_shared_development_task_projection(diagnostics)
     if (
-        coverage["replayed_run_count"] != replayed_runs
-        or coverage["scored_run_count"] != scored_runs
-        or coverage["scored_boundary_count"] != scored_boundaries
-        or coverage["unscored_context_boundary_count"]
-        != unscored_context_boundaries
+        coverage["checkpoint_verified_candidate_seed_count"]
+        != checkpoint_verified
+        or coverage["lifecycle_replayed_candidate_seed_count"] != 0
+        or coverage[
+            "lifecycle_metrics_unavailable_candidate_seed_count"
+        ]
+        != lifecycle_unavailable
     ):
         raise Stage4CompletionReleaseError(
             "Stage 4 completion diagnostic dynamic coverage does not close"
@@ -2470,7 +3523,7 @@ def _verify_artifact(
     release: Mapping[str, Any],
     artifact_lock: Mapping[str, Any],
     code_binding: Mapping[str, object],
-) -> tuple[_Coverage, int, Mapping[str, Any]]:
+) -> tuple[_Coverage, int, Mapping[str, Any], str]:
     source_name = str(artifact_lock["source_name"])
     artifact_root = _path(
         root,
@@ -2537,11 +3590,14 @@ def _verify_artifact(
             f"Stage 4 completion {source_name} source/code/matrix differs"
         )
     semantic = manifest.metadata.get("run_semantic")
+    run_semantic_sha256 = _training_run_semantic_sha256(
+        manifest.metadata,
+        expected_run_id=artifact_lock["run_id"],
+        expected_results_payload_sha256=payload_hash,
+        description=f"Stage 4 completion {source_name}",
+    )
     if (
-        set(manifest.metadata)
-        != {"run_id", "run_semantic", "results_payload_sha256"}
-        or manifest.metadata.get("run_id") != artifact_lock["run_id"]
-        or not isinstance(semantic, Mapping)
+        not isinstance(semantic, Mapping)
         or semantic.get("source_name") != source_name
         or semantic.get("source_id") != artifact_lock["source_id"]
         or semantic.get("matrix_id") != artifact_lock["matrix_id"]
@@ -2565,12 +3621,16 @@ def _verify_artifact(
             f"Stage 4 completion {source_name} summary differs"
         )
     coverage = _verify_result_coverage(results, source_name=source_name)
-    loaded = _load_declared_bundles(artifact_root, results)
+    loaded = _load_declared_bundles(
+        artifact_root,
+        results,
+        manifest_files=manifest.files,
+    )
     if loaded != coverage.reloadable_bundle_fold_count:
         raise Stage4CompletionReleaseError(
             f"Stage 4 completion {source_name} independently loaded count differs"
         )
-    return coverage, loaded, results
+    return coverage, loaded, results, run_semantic_sha256
 
 
 def verify_stage4_completion_release(
@@ -2612,6 +3672,7 @@ def verify_stage4_completion_release(
         release,
         release_relative=release_relative,
         require_git_clean=require_git_clean,
+        require_release_control_tag=tracked_only,
     )
     if tracked_only:
         return Stage4CompletionReleaseVerification(
@@ -2626,9 +3687,9 @@ def verify_stage4_completion_release(
             verified_diagnostics_artifact_count=0,
             verified_diagnostics_record_count=0,
             verified_diagnostics_bundle_count=0,
-            call_pre_mlp_cell_count=EXPECTED_CALL_PRE_MLP_CELL_COUNT,
+            call_pre_mlp_cell_count=0,
             call_pre_mlp_bundle_count=0,
-            seed_policy_cell_count=EXPECTED_SEED_POLICY_CELL_COUNT,
+            seed_policy_cell_count=0,
             seed_policy_bundle_count=0,
             parent_final_holdout_evaluation_count=(
                 EXPECTED_FINAL_EVALUATION_COUNT
@@ -2643,8 +3704,14 @@ def verify_stage4_completion_release(
     coverage = _Coverage()
     loaded_count = 0
     training_results: dict[str, Mapping[str, Any]] = {}
+    training_run_semantic_sha256_by_source: dict[str, str] = {}
     for artifact in release["artifacts"]:
-        artifact_coverage, loaded, results = _verify_artifact(
+        (
+            artifact_coverage,
+            loaded,
+            results,
+            run_semantic_sha256,
+        ) = _verify_artifact(
             root,
             release,
             artifact,
@@ -2652,7 +3719,11 @@ def verify_stage4_completion_release(
         )
         coverage = coverage.plus(artifact_coverage)
         loaded_count += loaded
-        training_results[str(artifact["source_name"])] = results
+        source_name = str(artifact["source_name"])
+        training_results[source_name] = results
+        training_run_semantic_sha256_by_source[source_name] = (
+            run_semantic_sha256
+        )
     protocol = release["protocol"]
     expected_totals = {
         "experiment_count": protocol["experiment_count"],
@@ -2680,6 +3751,7 @@ def verify_stage4_completion_release(
         root,
         release,
         training_results,
+        training_run_semantic_sha256_by_source,
     )
     if (
         diagnostic_records != protocol["diagnostics_candidate_seed_count"]
@@ -2688,6 +3760,7 @@ def verify_stage4_completion_release(
         raise Stage4CompletionReleaseError(
             "Stage 4 completion diagnostics totals differ from protocol"
         )
+    _verify_report_semantics(root, release)
     return Stage4CompletionReleaseVerification(
         lock_path=release_relative,
         report_path=str(release["report"]["path"]),
@@ -2723,7 +3796,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tracked-only",
         action="store_true",
-        help="verify only tracked locks, report, source code, and parent final lock",
+        help=(
+            "verify the tag-bound tracked release controls, source code, "
+            "and parent final lock"
+        ),
     )
     parser.add_argument(
         "--allow-dirty",

@@ -7,7 +7,7 @@ part of the corresponding release locks.  Stage numbering is mapped in
 
 All four delivery PRs targeted `main`, used squash merge after the required
 Python 3.11/3.12 quality and wheel checks were green, and were handled by the
-repository's configured merge automation.  The current `main` commit is
+repository's configured merge automation.  The parent Stage 4 baseline is
 `32712610eb0a6305bcd808d1977af6ee5f3237dd`; CI run `30062597198` completed
 successfully for that exact commit.
 

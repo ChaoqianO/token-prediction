@@ -1,10 +1,12 @@
-"""Publish immutable development-only lifecycle diagnostics for Stage 4.
+"""Publish immutable, final-safe Stage 4 completion diagnostics.
 
-This runner never trains or mutates a source artifact.  It verifies four
-immutable Stage 4 development artifacts, reconstructs their frozen development
-protocols, safely loads every seed-policy lifecycle bundle, replays each outer
-test fold, proves exact scored-prediction parity, and publishes aggregate-only
-diagnostics as a separate immutable artifact.
+The final holdout has already been opened exactly once.  This runner therefore
+has no raw-source code path: it verifies immutable Stage 4 development
+artifacts, their candidate checkpoints, and every seed-policy lifecycle bundle.
+The checkpoints contain forecasts and aggregate development metrics, but not
+labels or lifecycle sequences.  Forecast/cohort/aggregate parity is recomputed
+exactly; label-dependent lifecycle extensions are recorded as unavailable
+instead of reopening a mixed raw payload or fabricating values.
 """
 
 from __future__ import annotations
@@ -19,26 +21,16 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
-from token_prediction.dataset import (
-    PredictionPosition,
-    PredictionTarget,
-    build_lifecycle_slice,
-)
+from token_prediction.dataset import PredictionPosition, PredictionTarget
 from token_prediction.development import (
     STAGE_SPLIT_SEEDS,
-    DevelopmentProtocol,
-    build_development_protocol,
+    TASK_PSEUDONYM_POLICY_ID as DEVELOPMENT_TASK_PSEUDONYM_POLICY_ID,
 )
-from token_prediction.evaluation import (
-    METRIC_SUITE_ID,
-    evaluate_progress_checkpoints,
-    evaluate_same_task_run_variance,
-    evaluate_termination_strata,
-)
+from token_prediction.evaluation import METRIC_SUITE_ID
+from token_prediction.estimators.base import TokenForecast
 from token_prediction.experiment import CandidateResult, PredictionRecord
 from token_prediction.lifecycle_bundle import load_lifecycle_bundle
 from token_prediction.lineage import publish_artifact, verify_artifact
-from token_prediction.stage4_matrix import Stage4Matrix, build_stage4_matrix
 
 if __package__:
     from scripts.run_data_foundation_baseline import (
@@ -46,15 +38,9 @@ if __package__:
         _is_link_or_reparse,
         _repo_path,
         _safe_relative,
-        load_lock_context,
-    )
-    from scripts.run_stage2_experiments import (
-        SOURCE_NAMES,
-        Stage2LoadedSource,
-        _verify_source_inputs,
-        load_stage2_source,
     )
     from scripts.run_stage4_experiments import (
+        STAGE4_TASK_PSEUDONYM_POLICY_ID,
         _artifact_key,
         _assert_aggregate_safe,
         _framed_code_hash,
@@ -75,7 +61,6 @@ if __package__:
         _required_string,
         _semantic_sha256,
         load_development_artifact,
-        resolve_artifact_references,
     )
 else:  # pragma: no cover - direct production CLI invocation
     from run_data_foundation_baseline import (
@@ -83,15 +68,9 @@ else:  # pragma: no cover - direct production CLI invocation
         _is_link_or_reparse,
         _repo_path,
         _safe_relative,
-        load_lock_context,
-    )
-    from run_stage2_experiments import (
-        SOURCE_NAMES,
-        Stage2LoadedSource,
-        _verify_source_inputs,
-        load_stage2_source,
     )
     from run_stage4_experiments import (
+        STAGE4_TASK_PSEUDONYM_POLICY_ID,
         _artifact_key,
         _assert_aggregate_safe,
         _framed_code_hash,
@@ -112,14 +91,13 @@ else:  # pragma: no cover - direct production CLI invocation
         _required_string,
         _semantic_sha256,
         load_development_artifact,
-        resolve_artifact_references,
     )
 
 
-RESULTS_SCHEMA_VERSION = 1
-ARTIFACT_SCHEMA_VERSION = 1
+RESULTS_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 2
 STAGE_NAME = "stage4_completion_diagnostics"
-POLICY_ID = "stage4_completion_development_lifecycle_replay_v1"
+POLICY_ID = "stage4_completion_artifact_checkpoint_only_v2"
 DEFAULT_OUTPUT_ROOT = "workspace/stage4/completion_diagnostics"
 ALLOWED_OUTPUT_ROOT = PurePosixPath(DEFAULT_OUTPUT_ROOT)
 OUTPUT_KEY_HEX_LENGTH = 20
@@ -127,6 +105,25 @@ EXPECTED_SOURCE_COMMIT = "c1ac2484f44ed65705cdd00eba7b70a739a3ac0b"
 EXPECTED_SOURCE_CODE_TREE_SHA256 = (
     "6418545afa08a39df1797486e4c845063c2de13b29f20c81500933fad2201757"
 )
+SOURCE_STAGE_NAME = "stage4_development_source"
+SOURCE_ARTIFACT_SCHEMA_VERSION = 1
+SOURCE_RUN_SEMANTIC_KEYS = {
+    "results_schema_version",
+    "run_policy_id",
+    "checkpoint_policy_id",
+    "source_name",
+    "source_id",
+    "revision",
+    "raw_artifact_sha256",
+    "data_foundation_baseline_lock_sha256",
+    "base_dataset_id",
+    "derived_dataset_id",
+    "development_protocol_id",
+    "matrix_id",
+    "git_commit",
+    "code_tree_sha256",
+    "runtime_versions",
+}
 DIAGNOSTICS_SOURCE_TAG = "stage4-completion-diagnostics-source-v1"
 DIAGNOSTICS_DIRECT_CODE_PATHS = frozenset(
     {
@@ -148,6 +145,45 @@ EXPECTED_LIFECYCLE_SOURCES = frozenset(
     {"bagen_sokoban", "bagen_swebench", "spend_openhands"}
 )
 EXPECTED_POINT_ONLY_SOURCES = frozenset({"spend_aggregate"})
+EXPECTED_SOURCE_NAMES = EXPECTED_LIFECYCLE_SOURCES | EXPECTED_POINT_ONLY_SOURCES
+EXPECTED_SOURCE_ARTIFACT_IDENTITIES = {
+    "bagen_sokoban": {
+        "run_id": "5eb71975b60aad8d844cdb99",
+        "artifact_id": (
+            "0cc652b52b32c7d636320023152e8d685dab8c7a5c39f677667aecf8e39d4747"
+        ),
+        "results_payload_sha256": (
+            "1ef254633fce24b57a4f4c20a1e3d06c195a7bfb3ab3a9a415171bebe21ca245"
+        ),
+    },
+    "bagen_swebench": {
+        "run_id": "321ab0f381a0030e7026bb91",
+        "artifact_id": (
+            "ebfd502aee73272f393bfa5582d826dd81ec67771ca60f03e643b28ab61648e9"
+        ),
+        "results_payload_sha256": (
+            "f7dec1f6415d8be0fbdd6ae509789bdfd6fa918f01b6f0facb953ab4a16627a4"
+        ),
+    },
+    "spend_aggregate": {
+        "run_id": "f9120ade982bc74f8e86755f",
+        "artifact_id": (
+            "0b2224c79923b99fadf6c5a95e65ff4514123008ea1e72ba97d07b1a59e734e5"
+        ),
+        "results_payload_sha256": (
+            "29b5a3873aee063f1cc7def1183f93395770c35d85c72fa261f260e30511b506"
+        ),
+    },
+    "spend_openhands": {
+        "run_id": "00732b02ba8b15727b8d113d",
+        "artifact_id": (
+            "0d68ea3f1a5f30f24eefae900ed02cfe058077d6fa08e582a9a49b837b9d0eed"
+        ),
+        "results_payload_sha256": (
+            "1fc60f15c676665800c2f2ace1da68159892ef9665051414306755c646532cde"
+        ),
+    },
+}
 SOURCE_ARTIFACT_KEYS = {
     "source_name",
     "source_id",
@@ -182,17 +218,60 @@ DIAGNOSTIC_KEYS = {
     "split_plan_id",
     "bundle_folds",
     "bundle_projection_sha256",
-    "reload_parity",
-    "progress",
-    "termination",
-    "run_variance",
+    "checkpoint_parity",
+    "lifecycle_metrics",
 }
-RELOAD_PARITY_KEYS = {
+CHECKPOINT_PARITY_KEYS = {
     "status",
-    "scored_prediction_count",
+    "checkpoint_artifact_id",
+    "checkpoint_result_sha256",
+    "prediction_count",
     "expected_prediction_count",
     "prediction_projection_sha256",
     "expected_prediction_projection_sha256",
+    "cohort_projection_sha256",
+    "expected_cohort_projection_sha256",
+    "aggregate_metrics_projection_sha256",
+    "expected_aggregate_metrics_projection_sha256",
+    "development_cohort_status",
+    "development_task_count",
+    "development_task_projection_sha256",
+}
+CHECKPOINT_RESULT_KEYS = {
+    "candidate_id",
+    "candidate_hash",
+    "dataset_id",
+    "split_plan_id",
+    "eligibility_hash",
+    "position",
+    "target",
+    "condition_id",
+    "calibrator_id",
+    "alpha",
+    "metric_suite_id",
+    "predictions",
+    "metrics",
+    "fold_metrics",
+    "task_metrics",
+    "fold_artifacts",
+}
+CHECKPOINT_FOLD_ARTIFACT_KEYS = {
+    "fold",
+    "encoder",
+    "fit_report",
+    "feature_importance",
+    "model_strings",
+    "bundle_files",
+    "calibrator",
+    "provenance",
+}
+LIFECYCLE_METRICS_KEYS = {
+    "status",
+    "reason_code",
+    "labels_present",
+    "lifecycle_sequences_present",
+    "unavailable_metrics",
+    "historical_stage3_reference",
 }
 COVERAGE_KEYS = {
     "bound_source_artifact_count",
@@ -202,11 +281,18 @@ COVERAGE_KEYS = {
     "lifecycle_candidate_cell_count",
     "lifecycle_candidate_seed_count",
     "lifecycle_bundle_count",
-    "replayed_run_count",
-    "scored_run_count",
-    "scored_boundary_count",
-    "unscored_context_boundary_count",
+    "checkpoint_verified_candidate_seed_count",
+    "lifecycle_replayed_candidate_seed_count",
+    "lifecycle_metrics_unavailable_candidate_seed_count",
 }
+LIFECYCLE_UNAVAILABLE_REASON = (
+    "no_presealed_development_lifecycle_projection_v1"
+)
+UNAVAILABLE_LIFECYCLE_METRICS = [
+    "progress",
+    "run_variance_iqr_max_minus_min",
+    "termination",
+]
 RESULTS_KEYS = {
     "results_schema_version",
     "stage_name",
@@ -220,12 +306,6 @@ RESULTS_KEYS = {
     "final_holdout",
     "results_payload_sha256",
 }
-RUN_VARIANCE_ID = "same_task_run_mae_variance_v1"
-RUN_DISPERSION_EXTENSION_ID = "same_task_run_mae_iqr_max_minus_min_v1"
-PROGRESS_ID = "lifecycle_progress_checkpoints_v1"
-TERMINATION_ID = "lifecycle_termination_strata_v1"
-
-
 class Stage4CompletionDiagnosticsError(RuntimeError):
     """The diagnostics supplement cannot be produced safely."""
 
@@ -247,13 +327,9 @@ class VerifiedSourceArtifact:
 
 
 @dataclass(frozen=True)
-class ReplayedDiagnostic:
+class AuditedDiagnostic:
     document: Mapping[str, object]
     inventory: tuple[Mapping[str, object], ...]
-    run_count: int
-    scored_run_count: int
-    scored_boundary_count: int
-    unscored_context_boundary_count: int
 
 
 def _runner_sha256() -> str:
@@ -293,6 +369,124 @@ def _safe_output_parent(root: Path, value: str) -> Path:
             "completion diagnostics output root is linked"
         )
     return parent
+
+
+def _absolute_lexical(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _assert_plain_lexical_ancestry(
+    path: Path,
+    *,
+    label: str,
+    require_exists: bool = True,
+) -> Path:
+    """Reject a link/reparse point in the lexical path before resolving it."""
+
+    lexical = _absolute_lexical(path)
+    chain = [lexical, *lexical.parents]
+    for current in reversed(chain):
+        if current.exists() or _is_link_or_reparse(current):
+            if _is_link_or_reparse(current):
+                raise Stage4CompletionDiagnosticsError(
+                    f"{label} traverses a symlink, junction, or reparse point"
+                )
+    if require_exists and not lexical.exists():
+        raise Stage4CompletionDiagnosticsError(f"{label} does not exist")
+    return lexical
+
+
+def _direct_artifact_references(
+    root: Path,
+    artifact_inputs: Sequence[str | os.PathLike[str]],
+) -> tuple[ArtifactReference, ...]:
+    """Authorize canonical development artifacts before any payload read."""
+
+    if not artifact_inputs:
+        raise Stage4CompletionDiagnosticsError(
+            "at least one Stage 4 development artifact is required"
+        )
+    try:
+        runs_root = _repo_path(
+            root,
+            "workspace/stage4/runs",
+            label="Stage 4 development runs root",
+        )
+    except Exception as exc:
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 development runs root traverses a symlink, junction, "
+            "or reparse point"
+        ) from exc
+    runs_root = _assert_plain_lexical_ancestry(
+        runs_root,
+        label="Stage 4 development runs root",
+    )
+    references: list[ArtifactReference] = []
+    seen: set[Path] = set()
+    for raw in artifact_inputs:
+        raw_text = os.fspath(raw)
+        raw_parts = raw_text.replace("\\", "/").split("/")
+        supplied = Path(raw_text)
+        if (
+            not raw_text
+            or raw_text != raw_text.strip()
+            or "\x00" in raw_text
+            or any(part in {".", ".."} for part in raw_parts)
+            or (not supplied.is_absolute() and "\\" in raw_text)
+        ):
+            raise Stage4CompletionDiagnosticsError(
+                "Stage 4 artifact input path is not canonical"
+            )
+        if not supplied.is_absolute():
+            supplied = root / supplied
+        supplied = _absolute_lexical(supplied)
+        if supplied.name == "results.json":
+            artifact_path = supplied.parent
+            results_path = supplied
+        else:
+            if supplied.suffix.casefold() == ".json":
+                raise Stage4CompletionDiagnosticsError(
+                    "release-lock and arbitrary JSON artifact inputs are forbidden"
+                )
+            artifact_path = supplied
+            results_path = artifact_path / "results.json"
+        artifact_path = _assert_plain_lexical_ancestry(
+            artifact_path,
+            label="Stage 4 development artifact",
+        )
+        if artifact_path.parent != runs_root:
+            raise Stage4CompletionDiagnosticsError(
+                "artifact must be one canonical directory directly below "
+                "workspace/stage4/runs"
+            )
+        key = artifact_path.name
+        if (
+            len(key) != 23
+            or not key.startswith("s4-")
+            or any(character not in "0123456789abcdef" for character in key[3:])
+        ):
+            raise Stage4CompletionDiagnosticsError(
+                "Stage 4 development artifact directory name is not canonical"
+            )
+        if not artifact_path.is_dir():
+            raise Stage4CompletionDiagnosticsError(
+                "Stage 4 development artifact must be a directory"
+            )
+        _assert_plain_lexical_ancestry(
+            results_path,
+            label="Stage 4 development results",
+        )
+        if not results_path.is_file():
+            raise Stage4CompletionDiagnosticsError(
+                "Stage 4 development results.json is missing"
+            )
+        if artifact_path in seen:
+            raise Stage4CompletionDiagnosticsError(
+                "duplicate Stage 4 development artifact input"
+            )
+        seen.add(artifact_path)
+        references.append(ArtifactReference(artifact_path))
+    return tuple(references)
 
 
 def _output_key(run_id: str) -> str:
@@ -458,6 +652,144 @@ def capture_diagnostics_code_binding(root: Path) -> dict[str, object]:
     }
 
 
+def _source_run_identity(
+    artifact: VerifiedSourceArtifact,
+) -> tuple[str, str, Mapping[str, object]]:
+    manifest = artifact.artifact_manifest
+    metadata = _mapping(
+        manifest.metadata,
+        name="Stage 4 source artifact metadata",
+    )
+    if set(metadata) != {
+        "run_id",
+        "run_semantic",
+        "results_payload_sha256",
+    }:
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source artifact metadata scope differs"
+        )
+    run_semantic = _mapping(
+        metadata.get("run_semantic"),
+        name="Stage 4 source run semantic",
+    )
+    run_semantic_sha256 = _semantic_sha256(run_semantic)
+    run_id = _required_string(
+        metadata.get("run_id"),
+        name="Stage 4 source run id",
+    )
+    if (
+        len(run_id) != 24
+        or any(character not in "0123456789abcdef" for character in run_id)
+        or run_id != run_semantic_sha256[:24]
+        or artifact.loaded.document.get("run_id") != run_id
+        or metadata.get("results_payload_sha256")
+        != artifact.loaded.results_payload_sha256
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source run semantic identity does not close"
+        )
+    return run_id, run_semantic_sha256, run_semantic
+
+
+def _verify_source_manifest_scope(artifact: VerifiedSourceArtifact) -> None:
+    manifest = artifact.artifact_manifest
+    if (
+        manifest.stage_name != SOURCE_STAGE_NAME
+        or manifest.schema_version != SOURCE_ARTIFACT_SCHEMA_VERSION
+        or "results.json" not in manifest.files
+        or any(
+            relative != "results.json"
+            and not relative.startswith("fold_artifacts/")
+            for relative in manifest.files
+        )
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source artifact manifest scope differs"
+        )
+    _run_id, _run_semantic_sha256, run_semantic = _source_run_identity(artifact)
+    if set(run_semantic) != SOURCE_RUN_SEMANTIC_KEYS:
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source run semantic schema differs"
+        )
+    results = artifact.loaded.document
+    source = _mapping(results.get("source"), name="Stage 4 source")
+    dataset = _mapping(results.get("dataset"), name="Stage 4 dataset")
+    matrix = _mapping(results.get("matrix"), name="Stage 4 matrix")
+    protocol = _mapping(
+        results.get("development_protocol"),
+        name="Stage 4 development protocol",
+    )
+    code_binding = _mapping(
+        results.get("code_binding"),
+        name="Stage 4 code binding",
+    )
+    expected = {
+        "results_schema_version": results.get("results_schema_version"),
+        "source_name": source.get("source_name"),
+        "source_id": source.get("source_id"),
+        "revision": source.get("revision"),
+        "raw_artifact_sha256": source.get("raw_artifact_sha256"),
+        "base_dataset_id": dataset.get("base_dataset_id"),
+        "derived_dataset_id": dataset.get("derived_dataset_id"),
+        "development_protocol_id": protocol.get("protocol_id"),
+        "matrix_id": matrix.get("matrix_id"),
+        "git_commit": code_binding.get("git_commit"),
+        "code_tree_sha256": code_binding.get("code_tree_sha256"),
+        "runtime_versions": results.get("runtime_versions"),
+    }
+    if any(run_semantic.get(key) != value for key, value in expected.items()):
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source run semantic differs from its results"
+        )
+    for key in (
+        "raw_artifact_sha256",
+        "data_foundation_baseline_lock_sha256",
+        "development_protocol_id",
+        "matrix_id",
+        "code_tree_sha256",
+    ):
+        _required_sha256(
+            run_semantic.get(key),
+            name=f"Stage 4 source run semantic {key}",
+        )
+    for key in ("run_policy_id", "checkpoint_policy_id"):
+        _required_string(
+            run_semantic.get(key),
+            name=f"Stage 4 source run semantic {key}",
+        )
+    for key in ("base_dataset_id", "derived_dataset_id"):
+        _required_string(
+            run_semantic.get(key),
+            name=f"Stage 4 source run semantic {key}",
+        )
+    if (
+        run_semantic.get("git_commit") != EXPECTED_SOURCE_COMMIT
+        or run_semantic.get("code_tree_sha256")
+        != EXPECTED_SOURCE_CODE_TREE_SHA256
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source run semantic code binding differs"
+        )
+
+
+def _verify_pinned_source_identity(
+    artifact: VerifiedSourceArtifact,
+    *,
+    source_name: str,
+) -> None:
+    expected = EXPECTED_SOURCE_ARTIFACT_IDENTITIES.get(source_name)
+    if expected is None or {
+        "run_id": artifact.loaded.document.get("run_id"),
+        "artifact_id": artifact.loaded.artifact_id,
+        "results_payload_sha256": artifact.loaded.results_payload_sha256,
+    } != expected or artifact.loaded.path.name != (
+        "s4-" + str(expected["run_id"])[:20]
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "Stage 4 source artifact differs from the frozen completion identity"
+        )
+
+
 def _verify_source_artifacts(
     references: Sequence[ArtifactReference],
 ) -> tuple[VerifiedSourceArtifact, ...]:
@@ -478,7 +810,9 @@ def _verify_source_artifacts(
             raise Stage4CompletionDiagnosticsError(
                 "artifact manifest and aggregate loader identities differ"
             )
-        verified.append(VerifiedSourceArtifact(loaded, artifact_manifest))
+        artifact = VerifiedSourceArtifact(loaded, artifact_manifest)
+        _verify_source_manifest_scope(artifact)
+        verified.append(artifact)
     by_source: dict[str, VerifiedSourceArtifact] = {}
     for artifact in verified:
         source = _mapping(
@@ -491,8 +825,12 @@ def _verify_source_artifacts(
             raise Stage4CompletionDiagnosticsError(
                 "duplicate Stage 4 source artifact"
             )
+        _verify_pinned_source_identity(
+            artifact,
+            source_name=source_name,
+        )
         by_source[source_name] = artifact
-    if set(by_source) != set(SOURCE_NAMES):
+    if set(by_source) != EXPECTED_SOURCE_NAMES:
         raise Stage4CompletionDiagnosticsError(
             "Stage 4 artifacts do not cover the four frozen sources"
         )
@@ -572,93 +910,586 @@ def _bundle_files(path: Path) -> tuple[Path, ...]:
 
 def _bundle_projection(inventory: Sequence[Mapping[str, object]]) -> str:
     projection = [
-        {
-            "fold": item["fold"],
-            "bundle_manifest_sha256": item["bundle_manifest_sha256"],
-            "bundle_file_count": item["bundle_file_count"],
-        }
+        {key: item[key] for key in sorted(BUNDLE_INVENTORY_KEYS)}
         for item in sorted(inventory, key=lambda value: int(value["fold"]))
     ]
     return _semantic_sha256(projection)
 
 
-def _prediction_result(
+def _finite_number(value: object, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise Stage4CompletionDiagnosticsError(f"{name} must be numeric")
+    resolved = float(value)
+    if not (-float("inf") < resolved < float("inf")):
+        raise Stage4CompletionDiagnosticsError(f"{name} must be finite")
+    return resolved
+
+
+def _strict_json_object(payload: str, *, name: str) -> Mapping[str, object]:
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise Stage4CompletionDiagnosticsError(
+                    f"{name} contains a duplicate JSON key"
+                )
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            payload,
+            object_pairs_hook=unique,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                Stage4CompletionDiagnosticsError(
+                    f"{name} contains non-finite JSON constant {constant}"
+                )
+            ),
+        )
+    except json.JSONDecodeError as exc:
+        raise Stage4CompletionDiagnosticsError(
+            f"{name} is not valid JSON"
+        ) from exc
+    return _mapping(value, name=name)
+
+
+def _checkpoint_prediction_record(
+    value: object,
     *,
     candidate_id: str,
-    candidate_hash: str,
-    seed_result: Mapping[str, object],
-    experiment: Mapping[str, object],
-    records: Sequence[PredictionRecord],
-) -> CandidateResult:
-    comparability = _list(
-        seed_result.get("comparability_key"), name="candidate comparability key"
-    )
-    if len(comparability) != 9:
+) -> PredictionRecord:
+    item = _mapping(value, name="candidate checkpoint prediction")
+    if set(item) != {
+        "candidate_id",
+        "point_id",
+        "task_id",
+        "trajectory_id",
+        "condition_id",
+        "fold",
+        "target",
+        "forecast",
+        "sample_weight",
+    }:
         raise Stage4CompletionDiagnosticsError(
-            "candidate comparability key length differs"
+            "candidate checkpoint prediction schema differs"
         )
-    try:
-        position = PredictionPosition(
-            _required_string(experiment.get("position"), name="experiment position")
-        )
-        target = PredictionTarget(
-            _required_string(experiment.get("target"), name="experiment target")
-        )
-    except ValueError as exc:
+    if item.get("candidate_id") != candidate_id:
         raise Stage4CompletionDiagnosticsError(
-            "experiment position or target is invalid"
-        ) from exc
-    split_plan_id = _required_sha256(
-        seed_result.get("split_plan_id"), name="candidate split plan id"
+            "candidate checkpoint prediction identity differs"
+        )
+    forecast_document = _mapping(
+        item.get("forecast"), name="candidate checkpoint forecast"
     )
+    if set(forecast_document) != {
+        "point_id",
+        "target",
+        "lower",
+        "point",
+        "upper",
+        "latency_ms",
+        "overhead_input_tokens",
+        "overhead_output_tokens",
+        "raw_lower",
+        "raw_point",
+        "raw_upper",
+    }:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint forecast schema differs"
+        )
+    point_id = _required_string(item.get("point_id"), name="checkpoint point id")
+    target_text = _required_string(item.get("target"), name="checkpoint target")
     if (
-        comparability[1] != split_plan_id
-        or comparability[3] != position.value
-        or comparability[4] != target.value
-        or comparability[5] != experiment.get("condition_id")
-        or comparability[6] != experiment.get("calibrator_id")
-        or comparability[7] != str(experiment.get("alpha"))
-        or comparability[8] != METRIC_SUITE_ID
+        forecast_document.get("point_id") != point_id
+        or forecast_document.get("target") != target_text
     ):
         raise Stage4CompletionDiagnosticsError(
-            "candidate comparability key differs from the experiment"
+            "candidate checkpoint forecast scope differs"
         )
-    return CandidateResult(
+    raw_values: list[float | None] = []
+    for name in ("raw_lower", "raw_point", "raw_upper"):
+        raw = forecast_document.get(name)
+        raw_values.append(
+            None
+            if raw is None
+            else _finite_number(raw, name=f"checkpoint forecast {name}")
+        )
+    if any(value is None for value in raw_values) != all(
+        value is None for value in raw_values
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint raw forecast is partial"
+        )
+    fold = item.get("fold")
+    for name in ("overhead_input_tokens", "overhead_output_tokens"):
+        overhead = forecast_document.get(name)
+        if (
+            isinstance(overhead, bool)
+            or not isinstance(overhead, int)
+            or overhead < 0
+        ):
+            raise Stage4CompletionDiagnosticsError(
+                f"candidate checkpoint {name} is invalid"
+            )
+    if isinstance(fold, bool) or not isinstance(fold, int) or fold not in range(5):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint prediction fold is invalid"
+        )
+    try:
+        target = PredictionTarget(target_text)
+        forecast = TokenForecast(
+            point_id=point_id,
+            target=target,
+            lower=_finite_number(
+                forecast_document.get("lower"), name="checkpoint forecast lower"
+            ),
+            point=_finite_number(
+                forecast_document.get("point"), name="checkpoint forecast point"
+            ),
+            upper=_finite_number(
+                forecast_document.get("upper"), name="checkpoint forecast upper"
+            ),
+            latency_ms=_finite_number(
+                forecast_document.get("latency_ms"),
+                name="checkpoint forecast latency",
+            ),
+            overhead_input_tokens=int(forecast_document["overhead_input_tokens"]),
+            overhead_output_tokens=int(
+                forecast_document["overhead_output_tokens"]
+            ),
+            raw_lower=raw_values[0],
+            raw_point=raw_values[1],
+            raw_upper=raw_values[2],
+        )
+    except (TypeError, ValueError) as exc:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint forecast is invalid"
+        ) from exc
+    return PredictionRecord(
         candidate_id=candidate_id,
-        candidate_hash=candidate_hash,
-        dataset_id=_required_string(comparability[0], name="candidate dataset id"),
-        split_plan_id=split_plan_id,
-        eligibility_hash=_required_sha256(
-            comparability[2], name="candidate eligibility hash"
+        point_id=point_id,
+        task_id=_required_string(item.get("task_id"), name="checkpoint task id"),
+        trajectory_id=_required_string(
+            item.get("trajectory_id"), name="checkpoint trajectory id"
         ),
-        position=position,
-        target=target,
         condition_id=_required_string(
-            experiment.get("condition_id"), name="experiment condition"
+            item.get("condition_id"), name="checkpoint condition"
         ),
-        calibrator_id=_required_string(
-            experiment.get("calibrator_id"), name="experiment calibrator"
+        fold=fold,
+        target=target,
+        forecast=forecast,
+        sample_weight=_finite_number(
+            item.get("sample_weight"), name="checkpoint sample weight"
         ),
-        alpha=float(experiment["alpha"]),
-        metric_suite_id=METRIC_SUITE_ID,
-        predictions=tuple(records),
-        metrics={},
     )
 
 
-def _replay_candidate_seed(
+def _task_metric_projection(
+    result: CandidateResult,
+) -> list[dict[str, object]]:
+    return sorted(
+        (
+            {
+                "task_pseudonym": hashlib.sha256(
+                    (
+                        f"{STAGE4_TASK_PSEUDONYM_POLICY_ID}\0"
+                        f"{result.split_plan_id}\0{task_id}"
+                    ).encode()
+                ).hexdigest(),
+                **dict(metrics),
+            }
+            for task_id, metrics in result.task_metrics.items()
+        ),
+        key=lambda item: str(item["task_pseudonym"]),
+    )
+
+
+def _aggregate_metrics_projection(
+    *,
+    metrics: Mapping[str, object],
+    fold_metrics: Mapping[str, object],
+    task_metrics: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        "metrics": dict(metrics),
+        "fold_metrics": dict(fold_metrics),
+        "task_metric_policy_id": STAGE4_TASK_PSEUDONYM_POLICY_ID,
+        "task_metrics": [dict(item) for item in task_metrics],
+    }
+
+
+def _checkpoint_parity(
     *,
     root: Path,
     artifact: VerifiedSourceArtifact,
-    loaded_source: Stage2LoadedSource,
-    protocol: DevelopmentProtocol,
     experiment: Mapping[str, object],
     candidate: Mapping[str, object],
     split_seed: int,
     seed_result: Mapping[str, object],
-) -> ReplayedDiagnostic:
+    source_provenance_hash: str,
+) -> dict[str, object]:
+    candidate_id = _required_string(
+        candidate.get("candidate_id"), name="checkpoint candidate id"
+    )
+    candidate_hash = _required_sha256(
+        candidate.get("candidate_hash"), name="checkpoint candidate hash"
+    )
+    comparability = _list(
+        seed_result.get("comparability_key"), name="checkpoint comparability key"
+    )
+    if len(comparability) != 9:
+        raise Stage4CompletionDiagnosticsError(
+            "checkpoint comparability key length differs"
+        )
+    execution_key = {
+        "experiment_id": _required_string(
+            experiment.get("experiment_id"), name="checkpoint experiment id"
+        ),
+        "candidate_id": candidate_id,
+        "candidate_hash": candidate_hash,
+        "dataset_id": _required_string(
+            comparability[0], name="checkpoint dataset id"
+        ),
+        "split_plan_id": _required_sha256(
+            seed_result.get("split_plan_id"), name="checkpoint split plan id"
+        ),
+        "split_seed": split_seed,
+        "eligibility_hash": _required_sha256(
+            comparability[2], name="checkpoint eligibility hash"
+        ),
+        "position": _required_string(
+            experiment.get("position"), name="checkpoint position"
+        ),
+        "target": _required_string(
+            experiment.get("target"), name="checkpoint target"
+        ),
+        "condition_id": _required_string(
+            experiment.get("condition_id"), name="checkpoint condition"
+        ),
+        "calibrator_id": _required_string(
+            experiment.get("calibrator_id"), name="checkpoint calibrator"
+        ),
+        "alpha": _finite_number(
+            experiment.get("alpha"), name="checkpoint alpha"
+        ),
+        "source_provenance_hash": _required_sha256(
+            source_provenance_hash, name="checkpoint source provenance hash"
+        ),
+    }
+    expected_comparability = [
+        execution_key["dataset_id"],
+        execution_key["split_plan_id"],
+        execution_key["eligibility_hash"],
+        execution_key["position"],
+        execution_key["target"],
+        execution_key["condition_id"],
+        execution_key["calibrator_id"],
+        str(execution_key["alpha"]),
+        METRIC_SUITE_ID,
+    ]
+    if comparability != expected_comparability:
+        raise Stage4CompletionDiagnosticsError(
+            "checkpoint comparability key differs from the execution identity"
+        )
+    execution_hash = _semantic_sha256(execution_key)
+    run_id, run_semantic_sha256, _run_semantic = _source_run_identity(artifact)
+    checkpoint = _repo_path(
+        root,
+        (
+            f"workspace/stage4/checkpoints/{run_id}/candidates/"
+            f"{execution_hash}"
+        ),
+        label="candidate checkpoint",
+    )
+    if _is_link_or_reparse(checkpoint) or not checkpoint.is_dir():
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint is missing or unsafe"
+        )
+    try:
+        manifest = verify_artifact(checkpoint)
+    except Exception as exc:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint artifact failed verification"
+        ) from exc
+    if (
+        manifest.stage_name != "development_candidate_checkpoint"
+        or manifest.schema_version != 1
+        or set(manifest.files) != {"candidate_result.json"}
+        or manifest.metadata
+        != {
+            "candidate_execution_hash": execution_hash,
+            "run_id": run_id,
+            "run_semantic_sha256": run_semantic_sha256,
+        }
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint artifact identity differs"
+        )
+    try:
+        document = _strict_json_object(
+            (checkpoint / "candidate_result.json").read_text(encoding="utf-8"),
+            name="candidate checkpoint document",
+        )
+    except (OSError, UnicodeError, Stage4CompletionDiagnosticsError) as exc:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint document is invalid"
+        ) from exc
+    wrapper = _mapping(document, name="candidate checkpoint document")
+    if set(wrapper) != {
+        "checkpoint_schema_version",
+        "execution_key",
+        "result",
+        "result_sha256",
+    } or wrapper.get("checkpoint_schema_version") != 1:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint document schema differs"
+        )
+    if _mapping(wrapper.get("execution_key"), name="checkpoint execution key") != (
+        execution_key
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint execution key differs"
+        )
+    result_document = _mapping(
+        wrapper.get("result"), name="candidate checkpoint result"
+    )
+    if set(result_document) != CHECKPOINT_RESULT_KEYS:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint result schema differs"
+        )
+    fold_artifacts = [
+        _mapping(item, name="candidate checkpoint fold artifact")
+        for item in _list(
+            result_document.get("fold_artifacts"),
+            name="candidate checkpoint fold artifacts",
+        )
+    ]
+    if (
+        len(fold_artifacts) != 5
+        or any(set(item) != CHECKPOINT_FOLD_ARTIFACT_KEYS for item in fold_artifacts)
+        or [item.get("fold") for item in fold_artifacts] != list(range(5))
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint fold artifact schema differs"
+        )
+    result_sha256 = _required_sha256(
+        wrapper.get("result_sha256"), name="candidate checkpoint result SHA-256"
+    )
+    if _semantic_sha256(result_document) != result_sha256:
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint result checksum does not close"
+        )
+    for key, expected in (
+        ("candidate_id", candidate_id),
+        ("candidate_hash", candidate_hash),
+        ("dataset_id", execution_key["dataset_id"]),
+        ("split_plan_id", execution_key["split_plan_id"]),
+        ("eligibility_hash", execution_key["eligibility_hash"]),
+        ("position", execution_key["position"]),
+        ("target", execution_key["target"]),
+        ("condition_id", execution_key["condition_id"]),
+        ("calibrator_id", execution_key["calibrator_id"]),
+        ("alpha", execution_key["alpha"]),
+        ("metric_suite_id", METRIC_SUITE_ID),
+    ):
+        if result_document.get(key) != expected:
+            raise Stage4CompletionDiagnosticsError(
+                f"candidate checkpoint result {key} differs"
+            )
+    records = tuple(
+        _checkpoint_prediction_record(item, candidate_id=candidate_id)
+        for item in _list(
+            result_document.get("predictions"),
+            name="candidate checkpoint predictions",
+        )
+    )
+    fold_metrics_document = _mapping(
+        result_document.get("fold_metrics"),
+        name="candidate checkpoint fold metrics",
+    )
+    task_metrics_document = _mapping(
+        result_document.get("task_metrics"),
+        name="candidate checkpoint task metrics",
+    )
+    result = CandidateResult(
+        candidate_id=candidate_id,
+        candidate_hash=candidate_hash,
+        dataset_id=str(execution_key["dataset_id"]),
+        split_plan_id=str(execution_key["split_plan_id"]),
+        eligibility_hash=str(execution_key["eligibility_hash"]),
+        position=PredictionPosition(str(execution_key["position"])),
+        target=PredictionTarget(str(execution_key["target"])),
+        condition_id=str(execution_key["condition_id"]),
+        calibrator_id=str(execution_key["calibrator_id"]),
+        alpha=float(execution_key["alpha"]),
+        metric_suite_id=METRIC_SUITE_ID,
+        predictions=records,
+        metrics=dict(
+            _mapping(
+                result_document.get("metrics"),
+                name="candidate checkpoint metrics",
+            )
+        ),
+        fold_metrics={
+            int(key): dict(_mapping(value, name="checkpoint fold metric"))
+            for key, value in fold_metrics_document.items()
+            if isinstance(key, str) and key.isdecimal()
+        },
+        task_metrics={
+            str(key): dict(_mapping(value, name="checkpoint task metric"))
+            for key, value in task_metrics_document.items()
+        },
+    )
+    observed_aggregate = _aggregate_metrics_projection(
+        metrics=result.metrics,
+        fold_metrics={
+            str(fold): dict(metrics)
+            for fold, metrics in result.fold_metrics.items()
+        },
+        task_metrics=_task_metric_projection(result),
+    )
+    expected_aggregate = _aggregate_metrics_projection(
+        metrics=_mapping(
+            seed_result.get("metrics"), name="finalized seed metrics"
+        ),
+        fold_metrics=_mapping(
+            seed_result.get("fold_metrics"), name="finalized seed fold metrics"
+        ),
+        task_metrics=[
+            _mapping(item, name="finalized seed task metric")
+            for item in _list(
+                seed_result.get("task_metrics"),
+                name="finalized seed task metrics",
+            )
+        ],
+    )
+    observed_prediction = prediction_projection_sha256(result)
+    observed_cohort = cohort_projection_sha256(result)
+    expected_prediction = _required_sha256(
+        seed_result.get("prediction_projection_sha256"),
+        name="finalized prediction projection SHA-256",
+    )
+    expected_cohort = _required_sha256(
+        seed_result.get("cohort_projection_sha256"),
+        name="finalized cohort projection SHA-256",
+    )
+    expected_count = seed_result.get("prediction_count")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count <= 0
+        or len(records) != expected_count
+        or observed_prediction != expected_prediction
+        or observed_cohort != expected_cohort
+        or observed_aggregate != expected_aggregate
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint differs from its finalized seed result"
+        )
+    protocol = _mapping(
+        artifact.loaded.document.get("development_protocol"),
+        name="checkpoint development protocol",
+    )
+    holdout = _mapping(
+        protocol.get("permanent_holdout"),
+        name="checkpoint permanent holdout",
+    )
+    assignment_rows = [
+        _mapping(item, name="checkpoint holdout assignment")
+        for item in _list(
+            holdout.get("assignments"),
+            name="checkpoint holdout assignments",
+        )
+    ]
+    assignments: dict[str, str] = {}
+    for item in assignment_rows:
+        if set(item) != {"task_pseudonym", "cohort"}:
+            raise Stage4CompletionDiagnosticsError(
+                "checkpoint holdout assignment schema differs"
+            )
+        pseudonym = _required_sha256(
+            item.get("task_pseudonym"),
+            name="checkpoint holdout task pseudonym",
+        )
+        cohort = _required_string(
+            item.get("cohort"), name="checkpoint holdout cohort"
+        )
+        if pseudonym in assignments or cohort not in {
+            "development",
+            "final_holdout",
+        }:
+            raise Stage4CompletionDiagnosticsError(
+                "checkpoint holdout assignments are invalid"
+            )
+        assignments[pseudonym] = cohort
+    task_pseudonyms = sorted(
+        {
+            hashlib.sha256(
+                (
+                    f"{DEVELOPMENT_TASK_PSEUDONYM_POLICY_ID}\0"
+                    f"{record.task_id}"
+                ).encode()
+            ).hexdigest()
+            for record in records
+        }
+    )
+    if not task_pseudonyms or any(
+        assignments.get(pseudonym) != "development"
+        for pseudonym in task_pseudonyms
+    ):
+        raise Stage4CompletionDiagnosticsError(
+            "candidate checkpoint contains a final or unassigned task"
+        )
+    aggregate_sha256 = _semantic_sha256(observed_aggregate)
+    return {
+        "status": "exact",
+        "checkpoint_artifact_id": manifest.artifact_id,
+        "checkpoint_result_sha256": result_sha256,
+        "prediction_count": len(records),
+        "expected_prediction_count": expected_count,
+        "prediction_projection_sha256": observed_prediction,
+        "expected_prediction_projection_sha256": expected_prediction,
+        "cohort_projection_sha256": observed_cohort,
+        "expected_cohort_projection_sha256": expected_cohort,
+        "aggregate_metrics_projection_sha256": aggregate_sha256,
+        "expected_aggregate_metrics_projection_sha256": _semantic_sha256(
+            expected_aggregate
+        ),
+        "development_cohort_status": "development_only",
+        "development_task_count": len(task_pseudonyms),
+        "development_task_projection_sha256": _semantic_sha256(
+            [
+                {
+                    "task_pseudonym": pseudonym,
+                    "cohort": assignments[pseudonym],
+                }
+                for pseudonym in task_pseudonyms
+            ]
+        ),
+    }
+
+
+def _audit_candidate_seed_without_raw(
+    *,
+    root: Path,
+    artifact: VerifiedSourceArtifact,
+    experiment: Mapping[str, object],
+    candidate: Mapping[str, object],
+    split_seed: int,
+    seed_result: Mapping[str, object],
+) -> AuditedDiagnostic:
+    """Verify frozen forecasts/bundles without reconstructing source rows."""
+
     source_document = _mapping(
         artifact.loaded.document.get("source"), name="Stage 4 source"
+    )
+    dataset_document = _mapping(
+        artifact.loaded.document.get("dataset"), name="Stage 4 dataset"
+    )
+    runtime_versions = dict(
+        _mapping(
+            artifact.loaded.document.get("runtime_versions"),
+            name="Stage 4 runtime versions",
+        )
     )
     source_name = _required_string(
         source_document.get("source_name"), name="Stage 4 source name"
@@ -675,74 +1506,35 @@ def _replay_candidate_seed(
     candidate_hash = _required_sha256(
         candidate.get("candidate_hash"), name="lifecycle candidate hash"
     )
-    if seed_result.get("candidate_id") != candidate_id or seed_result.get(
-        "candidate_hash"
-    ) != candidate_hash:
-        raise Stage4CompletionDiagnosticsError(
-            "candidate seed result identity differs"
-        )
-    split_plan = next(
-        (plan for plan in protocol.outer_plans if plan.seed == split_seed),
-        None,
-    )
-    if split_plan is None:
-        raise Stage4CompletionDiagnosticsError(
-            "diagnostic split plan is missing"
-        )
     split_plan_id = _required_sha256(
         seed_result.get("split_plan_id"), name="candidate split plan id"
     )
-    if split_plan.split_plan_id != split_plan_id:
-        raise Stage4CompletionDiagnosticsError(
-            "reconstructed split plan differs from the artifact"
-        )
-    try:
-        target = PredictionTarget(
-            _required_string(experiment.get("target"), name="lifecycle target")
-        )
-    except ValueError as exc:
-        raise Stage4CompletionDiagnosticsError("lifecycle target is invalid") from exc
-    lifecycle_slice = build_lifecycle_slice(
-        protocol.development_dataset,
-        target=target,
-        condition_id=condition_id,
-    )
     if (
-        {sequence.task_id for sequence in lifecycle_slice.sequences}
-        & protocol.final_holdout_tasks
+        seed_result.get("candidate_id") != candidate_id
+        or seed_result.get("candidate_hash") != candidate_hash
     ):
         raise Stage4CompletionDiagnosticsError(
-            "lifecycle slice includes final-holdout tasks"
+            "candidate seed result identity differs"
         )
     experiment_key = _safe_compact_key(
-        experiment.get("artifact_key"), prefix="e", name="experiment artifact key"
+        experiment.get("artifact_key"),
+        prefix="e",
+        name="experiment artifact key",
     )
     candidate_key = _safe_compact_key(
-        candidate.get("artifact_key"), prefix="c", name="candidate artifact key"
+        candidate.get("artifact_key"),
+        prefix="c",
+        name="candidate artifact key",
     )
-    if experiment_key != _artifact_key("e", experiment_id) or candidate_key != (
-        _artifact_key("c", candidate_hash)
+    if (
+        experiment_key != _artifact_key("e", experiment_id)
+        or candidate_key != _artifact_key("c", candidate_hash)
     ):
         raise Stage4CompletionDiagnosticsError(
             "compact fold artifact keys do not close"
         )
-    source_provenance = {
-        "source_descriptor": loaded_source.source_lock.descriptor.to_dict(),
-        "source_descriptor_hash": (
-            loaded_source.source_lock.descriptor.descriptor_hash
-        ),
-        "code_hash": EXPECTED_SOURCE_CODE_TREE_SHA256,
-        "runtime_versions": dict(
-            _mapping(
-                artifact.loaded.document.get("runtime_versions"),
-                name="Stage 4 runtime versions",
-            )
-        ),
-    }
     inventory: list[Mapping[str, object]] = []
-    records: list[PredictionRecord] = []
-    runs = []
-    seen_sequences: set[str] = set()
+    provenance_hashes: set[str] = set()
     for fold in range(5):
         relative = (
             PurePosixPath("fold_artifacts")
@@ -763,10 +1555,7 @@ def _replay_candidate_seed(
             manifest_path.read_bytes()
         ).hexdigest()
         try:
-            bundle = load_lifecycle_bundle(
-                bundle_path,
-                expected_source_provenance=source_provenance,
-            )
+            bundle = load_lifecycle_bundle(bundle_path)
         except Exception as exc:
             raise Stage4CompletionDiagnosticsError(
                 "lifecycle bundle failed safe loading"
@@ -778,53 +1567,37 @@ def _replay_candidate_seed(
             or manifest.get("outer_fold") != fold
             or manifest.get("split_plan_id") != split_plan_id
             or manifest.get("dataset_id")
-            != protocol.development_dataset.dataset_id
+            != dataset_document.get("development_dataset_id")
             or manifest.get("condition_id") != condition_id
-            or manifest.get("target") != target.value
+            or manifest.get("position") != experiment.get("position")
+            or manifest.get("target") != experiment.get("target")
             or manifest.get("code_hash") != EXPECTED_SOURCE_CODE_TREE_SHA256
+            or manifest.get("source_descriptor_hash")
+            != source_document.get("source_descriptor_hash")
+            or manifest.get("capability_contract_hash")
+            != source_document.get("capability_contract_hash")
+            or manifest.get("runtime_versions") != runtime_versions
         ):
             raise Stage4CompletionDiagnosticsError(
                 "loaded lifecycle bundle scope differs"
             )
-        test_tasks = split_plan.partition(fold).test_tasks
-        sequences = tuple(
-            sequence
-            for sequence in lifecycle_slice.sequences
-            if sequence.task_id in test_tasks
-        )
-        if not sequences or {sequence.task_id for sequence in sequences} & (
-            protocol.final_holdout_tasks
-        ):
-            raise Stage4CompletionDiagnosticsError(
-                "diagnostic fold sequence cohort is invalid"
-            )
-        fold_runs = bundle.run_calibrated(sequences)
-        if len(fold_runs) != len(sequences):
-            raise Stage4CompletionDiagnosticsError(
-                "lifecycle replay run count differs"
-            )
-        for run in fold_runs:
-            if run.sequence.trajectory_id in seen_sequences:
-                raise Stage4CompletionDiagnosticsError(
-                    "lifecycle replay repeated a trajectory"
+        source_provenance = {
+            "source_descriptor": dict(
+                _mapping(
+                    manifest.get("source_descriptor"),
+                    name="bundle source descriptor",
                 )
-            seen_sequences.add(run.sequence.trajectory_id)
-            for prediction in run.scored_predictions:
-                point = prediction.step.point
-                records.append(
-                    PredictionRecord(
-                        candidate_id=candidate_id,
-                        point_id=point.point_id,
-                        task_id=point.task_id,
-                        trajectory_id=point.trajectory_id,
-                        condition_id=point.condition_id,
-                        fold=fold,
-                        target=target,
-                        forecast=prediction.forecast,
-                        sample_weight=prediction.step.sample_weight,
-                    )
-                )
-        runs.extend(fold_runs)
+            ),
+            "source_descriptor_hash": _required_sha256(
+                manifest.get("source_descriptor_hash"),
+                name="bundle source descriptor hash",
+            ),
+            "code_hash": _required_sha256(
+                manifest.get("code_hash"), name="bundle code hash"
+            ),
+            "runtime_versions": runtime_versions,
+        }
+        provenance_hashes.add(_semantic_sha256(source_provenance))
         inventory.append(
             {
                 "source_name": source_name,
@@ -841,52 +1614,19 @@ def _replay_candidate_seed(
                 "load_status": "safe_loaded",
             }
         )
-    if len(seen_sequences) != len(lifecycle_slice.sequences):
+    if len(provenance_hashes) != 1:
         raise Stage4CompletionDiagnosticsError(
-            "five diagnostic folds do not cover the lifecycle slice"
+            "candidate lifecycle bundles disagree on source provenance"
         )
-    if len({record.point_id for record in records}) != len(records):
-        raise Stage4CompletionDiagnosticsError(
-            "lifecycle replay repeated a scored prediction"
-        )
-    result = _prediction_result(
-        candidate_id=candidate_id,
-        candidate_hash=candidate_hash,
-        seed_result=seed_result,
+    parity = _checkpoint_parity(
+        root=root,
+        artifact=artifact,
         experiment=experiment,
-        records=records,
+        candidate=candidate,
+        split_seed=split_seed,
+        seed_result=seed_result,
+        source_provenance_hash=next(iter(provenance_hashes)),
     )
-    observed_projection = prediction_projection_sha256(result)
-    expected_projection = _required_sha256(
-        seed_result.get("prediction_projection_sha256"),
-        name="expected prediction projection SHA-256",
-    )
-    expected_cohort = _required_sha256(
-        seed_result.get("cohort_projection_sha256"),
-        name="expected cohort projection SHA-256",
-    )
-    expected_count = seed_result.get("prediction_count")
-    if (
-        isinstance(expected_count, bool)
-        or not isinstance(expected_count, int)
-        or expected_count <= 0
-        or len(records) != expected_count
-        or observed_projection != expected_projection
-        or cohort_projection_sha256(result) != expected_cohort
-    ):
-        raise Stage4CompletionDiagnosticsError(
-            "reloaded lifecycle scored trajectory differs from the source artifact"
-        )
-    run_variance = evaluate_same_task_run_variance(tuple(runs))
-    if (
-        run_variance.get("run_variance_id") != RUN_VARIANCE_ID
-        or run_variance.get("run_dispersion_extension_id")
-        != RUN_DISPERSION_EXTENSION_ID
-    ):
-        raise Stage4CompletionDiagnosticsError(
-            "repeated-run dispersion evaluator identity differs"
-        )
-    alpha = float(experiment["alpha"])
     document = {
         "source_name": source_name,
         "condition_id": condition_id,
@@ -897,26 +1637,19 @@ def _replay_candidate_seed(
         "split_plan_id": split_plan_id,
         "bundle_folds": list(range(5)),
         "bundle_projection_sha256": _bundle_projection(inventory),
-        "reload_parity": {
-            "status": "exact",
-            "scored_prediction_count": len(records),
-            "expected_prediction_count": expected_count,
-            "prediction_projection_sha256": observed_projection,
-            "expected_prediction_projection_sha256": expected_projection,
+        "checkpoint_parity": parity,
+        "lifecycle_metrics": {
+            "status": "unavailable",
+            "reason_code": LIFECYCLE_UNAVAILABLE_REASON,
+            "labels_present": False,
+            "lifecycle_sequences_present": False,
+            "unavailable_metrics": list(UNAVAILABLE_LIFECYCLE_METRICS),
+            "historical_stage3_reference": None,
         },
-        "progress": evaluate_progress_checkpoints(tuple(runs), alpha=alpha),
-        "termination": evaluate_termination_strata(tuple(runs), alpha=alpha),
-        "run_variance": run_variance,
     }
-    return ReplayedDiagnostic(
+    return AuditedDiagnostic(
         document=document,
         inventory=tuple(inventory),
-        run_count=len(runs),
-        scored_run_count=sum(bool(run.scored_predictions) for run in runs),
-        scored_boundary_count=len(records),
-        unscored_context_boundary_count=sum(
-            len(run.predictions) - len(run.scored_predictions) for run in runs
-        ),
     )
 
 
@@ -965,52 +1698,14 @@ def _source_artifact_document(
     }
 
 
-def _validate_reconstructed_source(
-    artifact: VerifiedSourceArtifact,
-    loaded_source: Stage2LoadedSource,
-    protocol: DevelopmentProtocol,
-    matrix: Stage4Matrix,
-) -> None:
-    results = artifact.loaded.document
-    source = _mapping(results.get("source"), name="Stage 4 source")
-    dataset = _mapping(results.get("dataset"), name="Stage 4 dataset")
-    matrix_document = _mapping(results.get("matrix"), name="Stage 4 matrix")
-    development_document = _mapping(
-        results.get("development_protocol"), name="Stage 4 development protocol"
-    )
-    if (
-        source.get("source_id")
-        != loaded_source.source_lock.descriptor.source_id
-        or source.get("source_descriptor_hash")
-        != loaded_source.source_lock.descriptor.descriptor_hash
-        or dataset.get("base_dataset_id") != loaded_source.base_dataset_id
-        or dataset.get("derived_dataset_id")
-        != loaded_source.derived_dataset.dataset_id
-        or dataset.get("development_dataset_id")
-        != protocol.development_dataset.dataset_id
-        or development_document.get("protocol_id") != protocol.protocol_id
-        or matrix_document.get("matrix_id") != matrix.matrix_id
-        or matrix_document.get("development_protocol_id") != protocol.protocol_id
-    ):
-        raise Stage4CompletionDiagnosticsError(
-            "reconstructed development source differs from its artifact"
-        )
-    if protocol.development_dataset.task_ids & protocol.final_holdout_tasks:
-        raise Stage4CompletionDiagnosticsError(
-            "reconstructed development dataset intersects final holdout"
-        )
-
-
 def _source_diagnostics(
     *,
     root: Path,
-    lock_context: Any,
     artifact: VerifiedSourceArtifact,
 ) -> tuple[
     dict[str, object],
     list[Mapping[str, object]],
     list[Mapping[str, object]],
-    tuple[int, int, int, int],
 ]:
     source = _mapping(
         artifact.loaded.document.get("source"), name="Stage 4 source"
@@ -1018,18 +1713,6 @@ def _source_diagnostics(
     source_name = _required_string(
         source.get("source_name"), name="Stage 4 source name"
     )
-    loaded_source = load_stage2_source(
-        root,
-        lock_context,
-        source_name=source_name,
-    )
-    protocol = build_development_protocol(loaded_source.derived_dataset)
-    matrix = build_stage4_matrix(
-        protocol,
-        source_id=loaded_source.source_lock.descriptor.source_id,
-        capabilities=loaded_source.source_lock.descriptor.capabilities,
-    )
-    _validate_reconstructed_source(artifact, loaded_source, protocol, matrix)
     artifact_experiments = _artifact_experiments(artifact)
     lifecycle_experiments = []
     for experiment in artifact_experiments:
@@ -1045,7 +1728,6 @@ def _source_diagnostics(
             raise Stage4CompletionDiagnosticsError(
                 "aggregate source unexpectedly exposes lifecycle candidates"
             )
-        _verify_source_inputs(root, lock_context, loaded_source)
         return (
             _source_artifact_document(
                 artifact,
@@ -1053,65 +1735,34 @@ def _source_diagnostics(
             ),
             [],
             [],
-            (0, 0, 0, 0),
         )
     if source_name not in EXPECTED_LIFECYCLE_SOURCES or not lifecycle_experiments:
         raise Stage4CompletionDiagnosticsError(
             "lifecycle source lacks seed-policy experiments"
         )
-    matrix_specs = {spec.experiment_id: spec for spec in matrix.experiments}
     diagnostics: list[Mapping[str, object]] = []
     inventory: list[Mapping[str, object]] = []
-    run_count = 0
-    scored_run_count = 0
-    scored_boundary_count = 0
-    unscored_count = 0
     for experiment, candidates in lifecycle_experiments:
-        experiment_id = _required_string(
-            experiment.get("experiment_id"), name="lifecycle experiment id"
-        )
-        spec = matrix_specs.get(experiment_id)
-        if spec is None:
-            raise Stage4CompletionDiagnosticsError(
-                "reconstructed matrix lacks a lifecycle experiment"
-            )
-        spec_candidates = {candidate.candidate_id: candidate for candidate in spec.candidates}
-        if set(spec_candidates) != EXPECTED_LIFECYCLE_CANDIDATES:
-            raise Stage4CompletionDiagnosticsError(
-                "reconstructed lifecycle candidate set differs"
-            )
         for candidate_id in sorted(EXPECTED_LIFECYCLE_CANDIDATES):
             candidate = candidates[candidate_id]
-            if (
-                candidate.get("candidate_hash")
-                != spec_candidates[candidate_id].content_hash
-            ):
-                raise Stage4CompletionDiagnosticsError(
-                    "reconstructed lifecycle candidate hash differs"
-                )
             for split_seed, seed_result in _seed_results(candidate).items():
-                replayed = _replay_candidate_seed(
+                audited = _audit_candidate_seed_without_raw(
                     root=root,
                     artifact=artifact,
-                    loaded_source=loaded_source,
-                    protocol=protocol,
                     experiment=experiment,
                     candidate=candidate,
                     split_seed=split_seed,
                     seed_result=seed_result,
                 )
-                diagnostics.append(replayed.document)
-                inventory.extend(replayed.inventory)
-                run_count += replayed.run_count
-                scored_run_count += replayed.scored_run_count
-                scored_boundary_count += replayed.scored_boundary_count
-                unscored_count += replayed.unscored_context_boundary_count
-    _verify_source_inputs(root, lock_context, loaded_source)
+                diagnostics.append(audited.document)
+                inventory.extend(audited.inventory)
     return (
-        _source_artifact_document(artifact, lifecycle_status="complete"),
+        _source_artifact_document(
+            artifact,
+            lifecycle_status="unavailable_no_presealed_replay_projection",
+        ),
         diagnostics,
         inventory,
-        (run_count, scored_run_count, scored_boundary_count, unscored_count),
     )
 
 
@@ -1143,7 +1794,7 @@ def _finite_json(value: object, *, path: str = "results") -> None:
 
 def _diagnostic_identity(
     value: Mapping[str, object],
-) -> tuple[str, str, str, int]:
+) -> tuple[str, str, str, str, str, str, int]:
     seed = value.get("split_seed")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise Stage4CompletionDiagnosticsError(
@@ -1152,43 +1803,31 @@ def _diagnostic_identity(
     return (
         _required_string(value.get("source_name"), name="diagnostic source"),
         _required_string(value.get("condition_id"), name="diagnostic condition"),
+        _required_string(
+            value.get("experiment_id"),
+            name="diagnostic experiment",
+        ),
         _required_string(value.get("candidate_id"), name="diagnostic candidate"),
+        _required_sha256(
+            value.get("candidate_hash"),
+            name="diagnostic candidate hash",
+        ),
+        _required_sha256(
+            value.get("split_plan_id"),
+            name="diagnostic split plan id",
+        ),
         seed,
     )
 
 
 def _inventory_identity(
     value: Mapping[str, object],
-) -> tuple[str, str, str, int, int]:
+) -> tuple[str, str, str, str, str, str, int, int]:
     base = _diagnostic_identity(value)
     fold = value.get("fold")
     if isinstance(fold, bool) or not isinstance(fold, int):
         raise Stage4CompletionDiagnosticsError("inventory fold is invalid")
     return (*base, fold)
-
-
-def _count_termination(document: Mapping[str, object]) -> tuple[int, int]:
-    strata = _mapping(document.get("strata"), name="termination strata")
-    scored = 0
-    unscored = 0
-    for value in strata.values():
-        stratum = _mapping(value, name="termination stratum")
-        raw_scored = stratum.get("n_scored")
-        raw_unscored = stratum.get("n_context_only")
-        if (
-            isinstance(raw_scored, bool)
-            or not isinstance(raw_scored, int)
-            or raw_scored < 0
-            or isinstance(raw_unscored, bool)
-            or not isinstance(raw_unscored, int)
-            or raw_unscored < 0
-        ):
-            raise Stage4CompletionDiagnosticsError(
-                "termination counts are invalid"
-            )
-        scored += raw_scored
-        unscored += raw_unscored
-    return scored, unscored
 
 
 def verify_diagnostics_results_document(
@@ -1273,11 +1912,12 @@ def verify_diagnostics_results_document(
         len(source_artifacts) != EXPECTED_BOUND_SOURCE_ARTIFACT_COUNT
         or any(set(item) != SOURCE_ARTIFACT_KEYS for item in source_artifacts)
         or [item["source_name"] for item in source_artifacts]
-        != sorted(SOURCE_NAMES)
+        != sorted(EXPECTED_SOURCE_NAMES)
         or {
             item["source_name"]
             for item in source_artifacts
-            if item["lifecycle_status"] == "complete"
+            if item["lifecycle_status"]
+            == "unavailable_no_presealed_replay_projection"
         }
         != EXPECTED_LIFECYCLE_SOURCES
         or {
@@ -1329,8 +1969,16 @@ def verify_diagnostics_results_document(
         relative = _safe_relative(
             item["bundle_relative_path"], label="bundle inventory path"
         )
+        expected_relative = (
+            PurePosixPath("fold_artifacts")
+            / _artifact_key("e", item["experiment_id"])
+            / _artifact_key("c", item["candidate_hash"])
+            / f"seed_{item['split_seed']}"
+            / f"fold_{item['fold']}"
+            / "bundle"
+        ).as_posix()
         if (
-            not relative.startswith("fold_artifacts/")
+            relative != expected_relative
             or item["load_status"] != "safe_loaded"
             or item["fold"] not in range(5)
             or isinstance(item["bundle_file_count"], bool)
@@ -1376,10 +2024,52 @@ def verify_diagnostics_results_document(
         raise Stage4CompletionDiagnosticsError(
             "diagnostic source/condition/candidate/seed coverage differs"
         )
-    derived_replayed_runs = 0
-    derived_scored_runs = 0
-    derived_scored_boundaries = 0
-    derived_unscored_boundaries = 0
+    condition_cells = {
+        (str(item["source_name"]), str(item["condition_id"]))
+        for item in diagnostics
+    }
+    for source_name, condition_id in condition_cells:
+        cell = [
+            item
+            for item in diagnostics
+            if item["source_name"] == source_name
+            and item["condition_id"] == condition_id
+        ]
+        if (
+            len(cell)
+            != len(EXPECTED_LIFECYCLE_CANDIDATES) * len(STAGE_SPLIT_SEEDS)
+            or {item["candidate_id"] for item in cell}
+            != EXPECTED_LIFECYCLE_CANDIDATES
+            or {item["split_seed"] for item in cell} != set(STAGE_SPLIT_SEEDS)
+            or len({item["experiment_id"] for item in cell}) != 1
+        ):
+            raise Stage4CompletionDiagnosticsError(
+                "diagnostic condition-cell topology differs"
+            )
+        for candidate_id in EXPECTED_LIFECYCLE_CANDIDATES:
+            candidate_rows = [
+                item for item in cell if item["candidate_id"] == candidate_id
+            ]
+            if (
+                len(candidate_rows) != len(STAGE_SPLIT_SEEDS)
+                or {item["split_seed"] for item in candidate_rows}
+                != set(STAGE_SPLIT_SEEDS)
+                or len({item["candidate_hash"] for item in candidate_rows}) != 1
+            ):
+                raise Stage4CompletionDiagnosticsError(
+                    "diagnostic candidate topology differs"
+                )
+        for split_seed in STAGE_SPLIT_SEEDS:
+            seed_rows = [
+                item for item in cell if item["split_seed"] == split_seed
+            ]
+            if (
+                len(seed_rows) != len(EXPECTED_LIFECYCLE_CANDIDATES)
+                or len({item["split_plan_id"] for item in seed_rows}) != 1
+            ):
+                raise Stage4CompletionDiagnosticsError(
+                    "diagnostic split-plan topology differs"
+                )
     for item in diagnostics:
         if item["bundle_folds"] != list(range(5)):
             raise Stage4CompletionDiagnosticsError(
@@ -1396,76 +2086,93 @@ def verify_diagnostics_results_document(
             raise Stage4CompletionDiagnosticsError(
                 "diagnostic bundle projection differs"
             )
-        reload_parity = _mapping(
-            item.get("reload_parity"), name="diagnostic reload parity"
+        checkpoint_parity = _mapping(
+            item.get("checkpoint_parity"), name="diagnostic checkpoint parity"
         )
         if (
-            set(reload_parity) != RELOAD_PARITY_KEYS
-            or reload_parity.get("status") != "exact"
-            or reload_parity.get("scored_prediction_count")
-            != reload_parity.get("expected_prediction_count")
-            or not isinstance(reload_parity.get("scored_prediction_count"), int)
-            or isinstance(reload_parity.get("scored_prediction_count"), bool)
-            or reload_parity["scored_prediction_count"] <= 0
-            or reload_parity.get("prediction_projection_sha256")
-            != reload_parity.get("expected_prediction_projection_sha256")
+            set(checkpoint_parity) != CHECKPOINT_PARITY_KEYS
+            or checkpoint_parity.get("status") != "exact"
+            or checkpoint_parity.get("prediction_count")
+            != checkpoint_parity.get("expected_prediction_count")
+            or not isinstance(checkpoint_parity.get("prediction_count"), int)
+            or isinstance(checkpoint_parity.get("prediction_count"), bool)
+            or checkpoint_parity["prediction_count"] <= 0
+            or checkpoint_parity.get("prediction_projection_sha256")
+            != checkpoint_parity.get("expected_prediction_projection_sha256")
+            or checkpoint_parity.get("cohort_projection_sha256")
+            != checkpoint_parity.get("expected_cohort_projection_sha256")
+            or checkpoint_parity.get("aggregate_metrics_projection_sha256")
+            != checkpoint_parity.get(
+                "expected_aggregate_metrics_projection_sha256"
+            )
+            or checkpoint_parity.get("development_cohort_status")
+            != "development_only"
+            or isinstance(checkpoint_parity.get("development_task_count"), bool)
+            or not isinstance(
+                checkpoint_parity.get("development_task_count"), int
+            )
+            or checkpoint_parity["development_task_count"] <= 0
         ):
             raise Stage4CompletionDiagnosticsError(
-                "diagnostic reload parity differs"
+                "diagnostic checkpoint parity differs"
             )
-        _required_sha256(
-            reload_parity["prediction_projection_sha256"],
-            name="diagnostic prediction projection SHA-256",
-        )
-        progress = _mapping(item.get("progress"), name="diagnostic progress")
-        termination = _mapping(
-            item.get("termination"), name="diagnostic termination"
-        )
-        run_variance = _mapping(
-            item.get("run_variance"), name="diagnostic run variance"
+        for key in (
+            "checkpoint_artifact_id",
+            "checkpoint_result_sha256",
+            "prediction_projection_sha256",
+            "cohort_projection_sha256",
+            "aggregate_metrics_projection_sha256",
+            "development_task_projection_sha256",
+        ):
+            _required_sha256(
+                checkpoint_parity[key],
+                name=f"diagnostic checkpoint {key}",
+            )
+        lifecycle_metrics = _mapping(
+            item.get("lifecycle_metrics"),
+            name="diagnostic lifecycle metrics",
         )
         if (
-            progress.get("stratification_id") != PROGRESS_ID
-            or termination.get("stratification_id") != TERMINATION_ID
-            or run_variance.get("run_variance_id") != RUN_VARIANCE_ID
-            or run_variance.get("run_dispersion_extension_id")
-            != RUN_DISPERSION_EXTENSION_ID
+            set(lifecycle_metrics) != LIFECYCLE_METRICS_KEYS
+            or lifecycle_metrics.get("status") != "unavailable"
+            or lifecycle_metrics.get("reason_code")
+            != LIFECYCLE_UNAVAILABLE_REASON
+            or lifecycle_metrics.get("labels_present") is not False
+            or lifecycle_metrics.get("lifecycle_sequences_present") is not False
+            or lifecycle_metrics.get("unavailable_metrics")
+            != UNAVAILABLE_LIFECYCLE_METRICS
+            or lifecycle_metrics.get("historical_stage3_reference") is not None
         ):
             raise Stage4CompletionDiagnosticsError(
-                "diagnostic evaluator identity differs"
+                "diagnostic unavailable lifecycle declaration differs"
             )
-        progress_strata = _mapping(
-            progress.get("strata"), name="diagnostic progress strata"
-        )
-        if set(progress_strata) != {"p25", "p50", "p75"}:
+
+    for source_name, condition_id in condition_cells:
+        cell = [
+            item
+            for item in diagnostics
+            if item["source_name"] == source_name
+            and item["condition_id"] == condition_id
+        ]
+        task_counts = {
+            _mapping(
+                item["checkpoint_parity"],
+                name="diagnostic checkpoint parity",
+            )["development_task_count"]
+            for item in cell
+        }
+        task_projections = {
+            _mapping(
+                item["checkpoint_parity"],
+                name="diagnostic checkpoint parity",
+            )["development_task_projection_sha256"]
+            for item in cell
+        }
+        if len(task_counts) != 1 or len(task_projections) != 1:
             raise Stage4CompletionDiagnosticsError(
-                "diagnostic progress strata differ"
+                "diagnostic split-independent development task identity "
+                "projection differs within a condition cell"
             )
-        first_progress = _mapping(
-            progress_strata["p25"], name="diagnostic p25 progress"
-        )
-        run_count = first_progress.get("n_sequences")
-        scored_runs = run_variance.get("n_scored_runs")
-        if (
-            isinstance(run_count, bool)
-            or not isinstance(run_count, int)
-            or run_count <= 0
-            or isinstance(scored_runs, bool)
-            or not isinstance(scored_runs, int)
-            or scored_runs <= 0
-        ):
-            raise Stage4CompletionDiagnosticsError(
-                "diagnostic replayed/scored run counts are invalid"
-            )
-        derived_replayed_runs += run_count
-        derived_scored_runs += scored_runs
-        scored_boundaries, unscored_boundaries = _count_termination(termination)
-        if scored_boundaries != reload_parity["scored_prediction_count"]:
-            raise Stage4CompletionDiagnosticsError(
-                "termination and prediction counts differ"
-            )
-        derived_scored_boundaries += scored_boundaries
-        derived_unscored_boundaries += unscored_boundaries
 
     coverage = _mapping(value.get("coverage"), name="diagnostics coverage")
     expected_coverage = {
@@ -1480,10 +2187,13 @@ def verify_diagnostics_results_document(
             EXPECTED_LIFECYCLE_CANDIDATE_SEED_COUNT
         ),
         "lifecycle_bundle_count": EXPECTED_LIFECYCLE_BUNDLE_COUNT,
-        "replayed_run_count": derived_replayed_runs,
-        "scored_run_count": derived_scored_runs,
-        "scored_boundary_count": derived_scored_boundaries,
-        "unscored_context_boundary_count": derived_unscored_boundaries,
+        "checkpoint_verified_candidate_seed_count": (
+            EXPECTED_LIFECYCLE_CANDIDATE_SEED_COUNT
+        ),
+        "lifecycle_replayed_candidate_seed_count": 0,
+        "lifecycle_metrics_unavailable_candidate_seed_count": (
+            EXPECTED_LIFECYCLE_CANDIDATE_SEED_COUNT
+        ),
     }
     if set(coverage) != COVERAGE_KEYS or coverage != expected_coverage:
         raise Stage4CompletionDiagnosticsError(
@@ -1516,9 +2226,7 @@ def _build_results(
     source_artifacts: Sequence[Mapping[str, object]],
     diagnostics: Sequence[Mapping[str, object]],
     inventory: Sequence[Mapping[str, object]],
-    replay_totals: tuple[int, int, int, int],
 ) -> dict[str, object]:
-    run_count, scored_runs, scored_boundaries, unscored_boundaries = replay_totals
     results: dict[str, object] = {
         "results_schema_version": RESULTS_SCHEMA_VERSION,
         "stage_name": STAGE_NAME,
@@ -1529,7 +2237,8 @@ def _build_results(
         "coverage": {
             "bound_source_artifact_count": len(source_artifacts),
             "lifecycle_source_count": sum(
-                item["lifecycle_status"] == "complete"
+                item["lifecycle_status"]
+                == "unavailable_no_presealed_replay_projection"
                 for item in source_artifacts
             ),
             "lifecycle_condition_count": len(
@@ -1553,10 +2262,11 @@ def _build_results(
             ),
             "lifecycle_candidate_seed_count": len(diagnostics),
             "lifecycle_bundle_count": len(inventory),
-            "replayed_run_count": run_count,
-            "scored_run_count": scored_runs,
-            "scored_boundary_count": scored_boundaries,
-            "unscored_context_boundary_count": unscored_boundaries,
+            "checkpoint_verified_candidate_seed_count": len(diagnostics),
+            "lifecycle_replayed_candidate_seed_count": 0,
+            "lifecycle_metrics_unavailable_candidate_seed_count": len(
+                diagnostics
+            ),
         },
         "bundle_inventory": list(inventory),
         "diagnostics": list(diagnostics),
@@ -1601,6 +2311,7 @@ def _load_existing(
     *,
     run_id: str,
     run_semantic: Mapping[str, object],
+    expected_results: Mapping[str, object],
 ) -> CompletionDiagnosticsSummary:
     try:
         manifest = verify_artifact(output)
@@ -1624,16 +2335,47 @@ def _load_existing(
         )
     results_path = output / "results.json"
     try:
-        results = json.loads(results_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        results = _strict_json_object(
+            results_path.read_text(encoding="utf-8"),
+            name="existing diagnostics results",
+        )
+    except (OSError, UnicodeError, Stage4CompletionDiagnosticsError) as exc:
         raise Stage4CompletionDiagnosticsError(
             "existing diagnostics results are invalid"
         ) from exc
     document = _mapping(results, name="existing diagnostics results")
     payload_hash = verify_diagnostics_results_document(document)
-    if metadata.get("results_payload_sha256") != payload_hash:
+    if (
+        document != expected_results
+        or _semantic_sha256(document) != _semantic_sha256(expected_results)
+    ):
         raise Stage4CompletionDiagnosticsError(
-            "existing artifact/result payload hashes differ"
+            "existing diagnostics results differ from the complete recomputation"
+        )
+    expected_metadata = {
+        "run_id": run_id,
+        "run_semantic": dict(run_semantic),
+        "results_payload_sha256": payload_hash,
+        "source_git_commit": EXPECTED_SOURCE_COMMIT,
+        "source_code_tree_sha256": EXPECTED_SOURCE_CODE_TREE_SHA256,
+        "diagnostics_code_binding": expected_results[
+            "diagnostics_code_binding"
+        ],
+        "source_artifact_ids": [
+            item["artifact_id"]
+            for item in _list(
+                expected_results["source_artifacts"],
+                name="recomputed source artifacts",
+            )
+        ],
+        "coverage": expected_results["coverage"],
+        "diagnostics_runner_sha256": run_semantic[
+            "diagnostics_runner_sha256"
+        ],
+    }
+    if metadata != expected_metadata:
+        raise Stage4CompletionDiagnosticsError(
+            "existing diagnostics artifact metadata differs from recomputation"
         )
     coverage = _mapping(document["coverage"], name="existing diagnostics coverage")
     return CompletionDiagnosticsSummary(
@@ -1653,28 +2395,21 @@ def run_completion_diagnostics(
     baseline_lock: str = DEFAULT_BASELINE_LOCK,
     output_root: str = DEFAULT_OUTPUT_ROOT,
 ) -> CompletionDiagnosticsSummary:
-    """Replay all frozen lifecycle candidates and publish one supplement."""
+    """Audit frozen checkpoints/bundles and publish one final-safe supplement."""
 
     supplied_root = Path(repository_root)
-    if _is_link_or_reparse(supplied_root):
-        raise Stage4CompletionDiagnosticsError("repository root must not be linked")
-    root = supplied_root.resolve()
+    supplied_root = _assert_plain_lexical_ancestry(
+        supplied_root,
+        label="repository root",
+    )
+    root = supplied_root.resolve(strict=True)
     if not root.is_dir():
         raise Stage4CompletionDiagnosticsError(
             "repository root is not a directory"
         )
     _verify_runner_origin(root)
     output_parent = _safe_output_parent(root, output_root)
-    try:
-        references = resolve_artifact_references(
-            artifact_inputs,
-            repo_root=root,
-            development_runs_root=root / "workspace" / "stage4" / "runs",
-        )
-    except Exception as exc:
-        raise Stage4CompletionDiagnosticsError(
-            "Stage 4 artifact inputs are unsafe"
-        ) from exc
+    references = _direct_artifact_references(root, artifact_inputs)
     artifacts = _verify_source_artifacts(references)
     source_binding, _source_paths = _source_binding(root, artifacts)
     diagnostics_code_binding = capture_diagnostics_code_binding(root)
@@ -1687,30 +2422,20 @@ def run_completion_diagnostics(
     )
     run_id = _semantic_sha256(run_semantic)[:24]
     output = output_parent / _output_key(run_id)
-    if output.exists():
-        return _load_existing(
-            output,
-            run_id=run_id,
-            run_semantic=run_semantic,
-        )
-    lock_context = load_lock_context(root, baseline_lock)
+    # Kept as a CLI compatibility parameter only.  Final-safe diagnostics do
+    # not load the data-foundation lock or any source/inventory/raw payload.
+    del baseline_lock
     source_documents: list[Mapping[str, object]] = []
     diagnostics: list[Mapping[str, object]] = []
     inventory: list[Mapping[str, object]] = []
-    totals = [0, 0, 0, 0]
     for artifact in artifacts:
-        source_document, source_diagnostics, source_inventory, source_totals = (
-            _source_diagnostics(
-                root=root,
-                lock_context=lock_context,
-                artifact=artifact,
-            )
+        source_document, source_diagnostics, source_inventory = _source_diagnostics(
+            root=root,
+            artifact=artifact,
         )
         source_documents.append(source_document)
         diagnostics.extend(source_diagnostics)
         inventory.extend(source_inventory)
-        for index, count in enumerate(source_totals):
-            totals[index] += count
     source_documents.sort(key=lambda item: str(item["source_name"]))
     diagnostics.sort(key=_diagnostic_identity)
     inventory.sort(key=_inventory_identity)
@@ -1720,7 +2445,6 @@ def run_completion_diagnostics(
         source_artifacts=source_documents,
         diagnostics=diagnostics,
         inventory=inventory,
-        replay_totals=tuple(totals),  # type: ignore[arg-type]
     )
     results_payload_sha256 = verify_diagnostics_results_document(results)
     if (
@@ -1728,15 +2452,26 @@ def run_completion_diagnostics(
         or capture_diagnostics_code_binding(root) != diagnostics_code_binding
     ):
         raise Stage4CompletionDiagnosticsError(
-            "diagnostics runner changed during replay"
+            "diagnostics runner changed during audit"
         )
     for artifact in artifacts:
         if verify_artifact(artifact.loaded.path).artifact_id != (
             artifact.loaded.artifact_id
         ):
             raise Stage4CompletionDiagnosticsError(
-                "source artifact changed during diagnostics replay"
+                "source artifact changed during diagnostics audit"
             )
+    if output.exists():
+        _assert_plain_lexical_ancestry(
+            output,
+            label="existing completion diagnostics artifact",
+        )
+        return _load_existing(
+            output,
+            run_id=run_id,
+            run_semantic=run_semantic,
+            expected_results=results,
+        )
     output_parent.mkdir(parents=True, exist_ok=True)
     if _is_link_or_reparse(output_parent):
         raise Stage4CompletionDiagnosticsError(
@@ -1820,8 +2555,8 @@ def run_completion_diagnostics(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Safely replay frozen Stage 4 development lifecycle bundles and "
-            "publish immutable aggregate diagnostics."
+            "Safely verify frozen Stage 4 development checkpoints and lifecycle "
+            "bundles without reopening source or final payloads."
         )
     )
     parser.add_argument(
@@ -1833,8 +2568,8 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         help=(
-            "Stage 4 development artifact directory; pass exactly four times "
-            "(or pass one completion release lock)"
+            "Stage 4 development artifact directory or its results.json; "
+            "pass exactly four times"
         ),
     )
     parser.add_argument("--baseline-lock", default=DEFAULT_BASELINE_LOCK)

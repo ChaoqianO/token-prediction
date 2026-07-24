@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.freeze_stage4_completion import (
@@ -16,11 +18,12 @@ from scripts.freeze_stage4_completion import (
     EXPECTED_SOURCE_TAG,
     POINT_ONLY_SEED_CANDIDATE_ID,
     RAW_SEED_CANDIDATE_ID,
-    RUN_DISPERSION_EXTENSION_ID,
-    RUN_VARIANCE_ID,
+    DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON,
+    DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS,
     SOURCE_EXPECTATIONS,
     Stage4CompletionFreezeError,
     _audit_diagnostics_code_binding,
+    _require_safe_output_ancestors,
     _semantic_sha256,
     freeze_completion_release,
 )
@@ -115,9 +118,8 @@ def _training_results(
     source_index: int,
     *,
     final_holdout: dict[str, object] | None = None,
-) -> tuple[str, dict[str, object]]:
+) -> tuple[str, dict[str, object], dict[str, object]]:
     expectation = SOURCE_EXPECTATIONS[source_index]
-    run_id = f"{source_index + 1:x}" * 24
     experiments = [
         {
             "experiment_id": f"{expectation.source_name}-experiment-{index}",
@@ -140,12 +142,21 @@ def _training_results(
         "source_id": expectation.source_id,
         "capability_contract_hash": "a" * 64,
         "development_protocol_id": "b" * 64,
+        "minimum_development_tasks": 40,
         "plans": plans,
         "gates": [],
         "telemetry_decisions": [],
         "safety_invariants": [],
     }
     matrix["matrix_id"] = _semantic_sha256(matrix)
+    run_semantic = {
+        "source_name": expectation.source_name,
+        "source_id": expectation.source_id,
+        "matrix_id": matrix["matrix_id"],
+        "git_commit": EXPECTED_SOURCE_COMMIT,
+        "code_tree_sha256": EXPECTED_CODE_TREE_SHA256,
+    }
+    run_id = _semantic_sha256(run_semantic)[:24]
     results: dict[str, object] = {
         "results_schema_version": 1,
         "stage_name": "stage4_development_source",
@@ -164,7 +175,7 @@ def _training_results(
         },
         "runtime_versions": {},
         "dataset": {},
-        "development_protocol": {},
+        "development_protocol": {"protocol_id": "b" * 64},
         "matrix": matrix,
         "experiments": experiments,
         "matched_coverage_calibration": [],
@@ -184,7 +195,7 @@ def _training_results(
         ),
     }
     results["results_payload_sha256"] = _semantic_sha256(results)
-    return run_id, results
+    return run_id, results, run_semantic
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -200,7 +211,7 @@ def _publish_training_artifact(
     *,
     final_holdout: dict[str, object] | None = None,
 ) -> tuple[Path, str]:
-    run_id, results = _training_results(
+    run_id, results, run_semantic = _training_results(
         source_index,
         final_holdout=final_holdout,
     )
@@ -212,33 +223,136 @@ def _publish_training_artifact(
         stage_name="stage4_development_source",
         metadata={
             "run_id": run_id,
+            "run_semantic": run_semantic,
             "results_payload_sha256": results["results_payload_sha256"],
         },
     )
     return path, manifest.artifact_id
 
 
-def _run_dispersion(
-    *,
-    extension_id: str = RUN_DISPERSION_EXTENSION_ID,
-) -> dict[str, object]:
-    return {
-        "run_variance_id": RUN_VARIANCE_ID,
-        "run_dispersion_extension_id": extension_id,
-        "n_tasks": 1,
-        "n_scored_runs": 1,
-        "n_repeated_tasks": 1,
-        "status": "estimable",
-        "mean_within_task_run_mae_variance": 1.0,
-        "median_within_task_run_mae_variance": 1.0,
-        "max_within_task_run_mae_variance": 1.0,
-        "mean_within_task_run_mae_iqr": 1.0,
-        "median_within_task_run_mae_iqr": 1.0,
-        "max_within_task_run_mae_iqr": 1.0,
-        "mean_within_task_run_mae_max_minus_min": 2.0,
-        "median_within_task_run_mae_max_minus_min": 2.0,
-        "max_within_task_run_mae_max_minus_min": 2.0,
-    }
+def _diagnostic_fixture() -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[tuple[object, ...], dict[str, object]],
+    dict[tuple[object, ...], dict[str, object]],
+]:
+    diagnostics: list[dict[str, object]] = []
+    inventory: list[dict[str, object]] = []
+    expected_diagnostics: dict[tuple[object, ...], dict[str, object]] = {}
+    expected_inventory: dict[tuple[object, ...], dict[str, object]] = {}
+    for source_name, condition_count in (
+        ("bagen_sokoban", 1),
+        ("bagen_swebench", 5),
+        ("spend_openhands", 1),
+    ):
+        for condition_index in range(condition_count):
+            condition_id = f"{source_name}:condition:{condition_index}"
+            experiment_id = f"{source_name}:experiment:{condition_index}"
+            for candidate_id in (
+                RAW_SEED_CANDIDATE_ID,
+                POINT_ONLY_SEED_CANDIDATE_ID,
+            ):
+                candidate_hash = _semantic_sha256(
+                    [source_name, condition_id, candidate_id]
+                )
+                for split_seed in (20260719, 20260720, 20260721):
+                    split_plan_id = _semantic_sha256(
+                        [source_name, candidate_id, split_seed]
+                    )
+                    base = {
+                        "source_name": source_name,
+                        "condition_id": condition_id,
+                        "experiment_id": experiment_id,
+                        "candidate_id": candidate_id,
+                        "candidate_hash": candidate_hash,
+                        "split_seed": split_seed,
+                        "split_plan_id": split_plan_id,
+                    }
+                    identity = tuple(base.values())
+                    fold_projection = []
+                    for fold in range(5):
+                        manifest_sha256 = _semantic_sha256(
+                            [*identity, fold, "manifest"]
+                        )
+                        item = {
+                            **base,
+                            "fold": fold,
+                            "bundle_relative_path": (
+                                f"fold_artifacts/e_fixture/c_fixture/"
+                                f"seed_{split_seed}/fold_{fold}/bundle"
+                            ),
+                            "bundle_manifest_sha256": manifest_sha256,
+                            "bundle_file_count": 4,
+                            "load_status": "safe_loaded",
+                        }
+                        inventory.append(item)
+                        expected_inventory[(*identity, fold)] = item
+                        fold_projection.append(
+                            {
+                                "fold": fold,
+                                "bundle_manifest_sha256": manifest_sha256,
+                                "bundle_file_count": 4,
+                            }
+                        )
+                    projection = _semantic_sha256(
+                        [source_name, candidate_id, split_seed, "prediction"]
+                    )
+                    cohort = _semantic_sha256(
+                        [source_name, candidate_id, split_seed, "cohort"]
+                    )
+                    aggregate = _semantic_sha256(
+                        [source_name, candidate_id, split_seed, "aggregate"]
+                    )
+                    parity = {
+                        "status": "exact",
+                        "checkpoint_artifact_id": _semantic_sha256(
+                            [*identity, "checkpoint"]
+                        ),
+                        "checkpoint_result_sha256": _semantic_sha256(
+                            [*identity, "result"]
+                        ),
+                        "prediction_count": 1,
+                        "expected_prediction_count": 1,
+                        "prediction_projection_sha256": projection,
+                        "expected_prediction_projection_sha256": projection,
+                        "cohort_projection_sha256": cohort,
+                        "expected_cohort_projection_sha256": cohort,
+                        "aggregate_metrics_projection_sha256": aggregate,
+                        "expected_aggregate_metrics_projection_sha256": (
+                            aggregate
+                        ),
+                        "development_cohort_status": "development_only",
+                        "development_task_count": 1,
+                        "development_task_projection_sha256": (
+                            _semantic_sha256([*identity, "development"])
+                        ),
+                    }
+                    record = {
+                        **base,
+                        "bundle_folds": list(range(5)),
+                        "bundle_projection_sha256": _semantic_sha256(
+                            fold_projection
+                        ),
+                        "checkpoint_parity": parity,
+                        "lifecycle_metrics": {
+                            "status": "unavailable",
+                            "reason_code": (
+                                DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON
+                            ),
+                            "labels_present": False,
+                            "lifecycle_sequences_present": False,
+                            "unavailable_metrics": list(
+                                DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS
+                            ),
+                            "historical_stage3_reference": None,
+                        },
+                    }
+                    diagnostics.append(record)
+                    expected_diagnostics[identity] = {
+                        **base,
+                        "_checkpoint_parity": parity,
+                    }
+    return diagnostics, inventory, expected_diagnostics, expected_inventory
 
 
 def _publish_diagnostics_artifact(
@@ -246,7 +360,8 @@ def _publish_diagnostics_artifact(
     source_artifact_ids: dict[str, str],
     *,
     final_holdout: dict[str, object] | None = None,
-    extension_id: str = RUN_DISPERSION_EXTENSION_ID,
+    lifecycle_reason: str = DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON,
+    extra_payload: str | None = None,
 ) -> Path:
     run_id = "f" * 24
     coverage = {
@@ -257,13 +372,39 @@ def _publish_diagnostics_artifact(
         "lifecycle_candidate_cell_count": 14,
         "lifecycle_candidate_seed_count": 42,
         "lifecycle_bundle_count": 210,
-        "replayed_run_count": 42,
-        "scored_run_count": 42,
-        "scored_boundary_count": 42,
-        "unscored_context_boundary_count": 0,
+        "checkpoint_verified_candidate_seed_count": 42,
+        "lifecycle_replayed_candidate_seed_count": 0,
+        "lifecycle_metrics_unavailable_candidate_seed_count": 42,
     }
+    diagnostics, inventory, _, _ = _diagnostic_fixture()
+    if lifecycle_reason != DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON:
+        diagnostics[0]["lifecycle_metrics"]["reason_code"] = lifecycle_reason
+    source_artifacts = []
+    for source_index, expectation in enumerate(SOURCE_EXPECTATIONS):
+        training_run_id, training, _run_semantic = _training_results(
+            source_index
+        )
+        source_artifacts.append(
+            {
+                "source_name": expectation.source_name,
+                "source_id": expectation.source_id,
+                "run_id": training_run_id,
+                "artifact_id": source_artifact_ids[expectation.source_name],
+                "results_payload_sha256": training["results_payload_sha256"],
+                "matrix_id": training["matrix"]["matrix_id"],
+                "development_protocol_id": training["development_protocol"][
+                    "protocol_id"
+                ],
+                "lifecycle_status": (
+                    "not_applicable_no_lifecycle"
+                    if expectation.source_name == "spend_aggregate"
+                    else "unavailable_no_presealed_replay_projection"
+                ),
+            }
+        )
+    source_artifacts.sort(key=lambda item: item["source_name"])
     results: dict[str, object] = {
-        "results_schema_version": 1,
+        "results_schema_version": 2,
         "stage_name": DIAGNOSTICS_STAGE_NAME,
         "policy_id": DIAGNOSTICS_POLICY_ID,
         "source_binding": {
@@ -271,25 +412,10 @@ def _publish_diagnostics_artifact(
             "code_tree_sha256": EXPECTED_CODE_TREE_SHA256,
         },
         "diagnostics_code_binding": dict(DIAGNOSTICS_CODE_BINDING),
-        "source_artifacts": [
-            {
-                "source_name": expectation.source_name,
-                "artifact_id": source_artifact_ids[expectation.source_name],
-            }
-            for expectation in sorted(
-                SOURCE_EXPECTATIONS,
-                key=lambda item: item.source_name,
-            )
-        ],
+        "source_artifacts": source_artifacts,
         "coverage": coverage,
-        "bundle_inventory": [{"index": index} for index in range(210)],
-        "diagnostics": [
-            {
-                "index": index,
-                "run_variance": _run_dispersion(extension_id=extension_id),
-            }
-            for index in range(42)
-        ],
+        "bundle_inventory": inventory,
+        "diagnostics": diagnostics,
         "final_holdout": (
             dict(EXPECTED_FINAL_HOLDOUT)
             if final_holdout is None
@@ -306,13 +432,16 @@ def _publish_diagnostics_artifact(
     )
     path.mkdir(parents=True)
     _write_json(path / "results.json", results)
+    if extra_payload is not None:
+        (path / extra_payload).write_bytes(b"must-not-be-published\n")
     publish_artifact(
         path,
         stage_name=DIAGNOSTICS_STAGE_NAME,
+        schema_version=2,
         metadata={
             "run_id": run_id,
             "run_semantic": {
-                "results_schema_version": 1,
+                "results_schema_version": 2,
                 "policy_id": DIAGNOSTICS_POLICY_ID,
                 "source_binding": {
                     "git_commit": EXPECTED_SOURCE_COMMIT,
@@ -321,16 +450,13 @@ def _publish_diagnostics_artifact(
                 "diagnostics_code_binding": dict(DIAGNOSTICS_CODE_BINDING),
                 "source_artifacts": [
                     {
-                        "source_name": expectation.source_name,
-                        "artifact_id": source_artifact_ids[
-                            expectation.source_name
+                        "source_name": item["source_name"],
+                        "artifact_id": item["artifact_id"],
+                        "results_payload_sha256": item[
+                            "results_payload_sha256"
                         ],
-                        "results_payload_sha256": "a" * 64,
                     }
-                    for expectation in sorted(
-                        SOURCE_EXPECTATIONS,
-                        key=lambda item: item.source_name,
-                    )
+                    for item in source_artifacts
                 ],
                 "diagnostics_runner_sha256": "b" * 64,
                 "final_holdout": dict(EXPECTED_FINAL_HOLDOUT),
@@ -358,9 +484,8 @@ def _write_parent_and_report(root: Path) -> None:
     (root / "configs").mkdir()
     _write_json(root / "configs" / "stage4_release.json", parent)
     (root / "docs").mkdir()
-    (root / "docs" / "stage-4-completion-supplement.md").write_text(
-        "# Development-only completion supplement\n",
-        encoding="utf-8",
+    (root / "docs" / "stage-4-completion-supplement.md").write_bytes(
+        b"# Development-only completion supplement\n"
     )
 
 
@@ -378,15 +503,83 @@ def _fixture(root: Path) -> tuple[list[Path], Path]:
 
 class FreezeStage4CompletionTests(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = patch(
-            "scripts.freeze_stage4_completion._audit_diagnostics_code_binding",
-            return_value={
-                **DIAGNOSTICS_CODE_BINDING,
-                "source_tag": EXPECTED_DIAGNOSTICS_SOURCE_TAG,
-            },
+        _, _, expected_diagnostics, expected_inventory = (
+            _diagnostic_fixture()
         )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        patchers = (
+            patch(
+                "scripts.freeze_stage4_completion._audit_diagnostics_code_binding",
+                return_value={
+                    **DIAGNOSTICS_CODE_BINDING,
+                    "source_tag": EXPECTED_DIAGNOSTICS_SOURCE_TAG,
+                },
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._code_binding_at_commit",
+                return_value={
+                    "git_commit": EXPECTED_SOURCE_COMMIT,
+                    "code_tree_sha256": EXPECTED_CODE_TREE_SHA256,
+                },
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._verify_result_coverage",
+                side_effect=self._coverage,
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._load_declared_bundles",
+                side_effect=lambda _root, results, **_kwargs: next(
+                    item.reloadable_bundle_fold_count
+                    for item in SOURCE_EXPECTATIONS
+                    if item.source_name
+                    == results["source"]["source_name"]
+                ),
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._canonical_report_payload",
+                return_value=(
+                    b"# Development-only completion supplement\n"
+                ),
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._expected_diagnostics_scope",
+                return_value=(expected_diagnostics, expected_inventory),
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _coverage(
+        _results: object,
+        *,
+        source_name: str,
+    ) -> SimpleNamespace:
+        expectation = next(
+            item
+            for item in SOURCE_EXPECTATIONS
+            if item.source_name == source_name
+        )
+        if source_name == "spend_aggregate":
+            call_cells = 0
+            seed_cells = 0
+        elif source_name == "bagen_swebench":
+            call_cells = 15
+            seed_cells = 5
+        else:
+            call_cells = 3
+            seed_cells = 1
+        return SimpleNamespace(
+            experiment_count=expectation.experiment_count,
+            candidate_seed_run_count=expectation.candidate_seed_run_count,
+            reloadable_bundle_fold_count=(
+                expectation.reloadable_bundle_fold_count
+            ),
+            call_pre_mlp_cell_count=call_cells,
+            call_pre_mlp_bundle_fold_count=call_cells * 15,
+            seed_policy_cell_count=seed_cells,
+            seed_policy_bundle_fold_count=seed_cells * 30,
+        )
 
     def test_freezes_deterministic_development_only_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -398,7 +591,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                 "diagnostics_artifact_path": diagnostics,
                 "source_tag": EXPECTED_SOURCE_TAG,
                 "diagnostics_source_tag": EXPECTED_DIAGNOSTICS_SOURCE_TAG,
-                "output_path": "configs/fixture-completion.json",
+                "output_path": "configs/stage4_completion_release.json",
             }
             with patch(
                 "scripts.freeze_stage4_completion._tag_commit",
@@ -408,6 +601,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                 second = freeze_completion_release(**arguments)
 
             self.assertEqual(first, second)
+            self.assertEqual(first["release_schema_version"], 2)
             self.assertEqual(
                 [item["source_name"] for item in first["artifacts"]],
                 [item.source_name for item in SOURCE_EXPECTATIONS],
@@ -421,8 +615,20 @@ class FreezeStage4CompletionTests(unittest.TestCase):
             self.assertEqual(first["protocol"]["diagnostics_bundle_count"], 210)
             self.assertFalse(first["protocol"]["final_holdout_evaluated"])
             self.assertEqual(
-                first["diagnostics_artifact"]["coverage"]["scored_run_count"],
+                first["release_control"]["release_tag"],
+                "stage4-completion-release-v1",
+            )
+            self.assertEqual(
+                first["diagnostics_artifact"]["coverage"][
+                    "checkpoint_verified_candidate_seed_count"
+                ],
                 42,
+            )
+            self.assertEqual(
+                first["diagnostics_artifact"]["coverage"][
+                    "lifecycle_replayed_candidate_seed_count"
+                ],
+                0,
             )
             _validate_release_document(first)
 
@@ -444,6 +650,10 @@ class FreezeStage4CompletionTests(unittest.TestCase):
             patch(
                 "scripts.freeze_stage4_completion._git_file",
                 side_effect=lambda _root, _commit, path: payloads[path],
+            ),
+            patch(
+                "scripts.freeze_stage4_completion._diagnostics_code_paths_at_commit",
+                return_value=tuple(paths),
             ),
         ):
             audited = _audit_diagnostics_code_binding(
@@ -504,7 +714,9 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                     diagnostics_source_tag=EXPECTED_DIAGNOSTICS_SOURCE_TAG,
                 )
 
-    def test_rejects_diagnostics_without_dispersion_extension(self) -> None:
+    def test_rejects_diagnostics_that_fabricate_lifecycle_availability(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact_paths: list[Path] = []
@@ -516,7 +728,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
             diagnostics = _publish_diagnostics_artifact(
                 root,
                 artifact_ids,
-                extension_id="legacy_variance_only",
+                lifecycle_reason="fabricated_replay",
             )
             _write_parent_and_report(root)
             with (
@@ -526,7 +738,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     Stage4CompletionFreezeError,
-                    "dispersion extension",
+                    "lifecycle-unavailable",
                 ),
             ):
                 freeze_completion_release(
@@ -570,6 +782,89 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                     diagnostics_source_tag=EXPECTED_DIAGNOSTICS_SOURCE_TAG,
                 )
 
+    def test_rejects_manifest_declared_diagnostics_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact_paths: list[Path] = []
+            artifact_ids: dict[str, str] = {}
+            for source_index, expectation in enumerate(SOURCE_EXPECTATIONS):
+                path, artifact_id = _publish_training_artifact(
+                    root,
+                    source_index,
+                )
+                artifact_paths.append(path)
+                artifact_ids[expectation.source_name] = artifact_id
+            diagnostics = _publish_diagnostics_artifact(
+                root,
+                artifact_ids,
+                extra_payload="secret.env",
+            )
+            _write_parent_and_report(root)
+            with (
+                patch(
+                    "scripts.freeze_stage4_completion._tag_commit",
+                    return_value=EXPECTED_SOURCE_COMMIT,
+                ),
+                self.assertRaisesRegex(
+                    Stage4CompletionFreezeError,
+                    "topology differs",
+                ),
+            ):
+                freeze_completion_release(
+                    repository_root=root,
+                    artifact_paths=artifact_paths,
+                    diagnostics_artifact_path=diagnostics,
+                    source_tag=EXPECTED_SOURCE_TAG,
+                    diagnostics_source_tag=EXPECTED_DIAGNOSTICS_SOURCE_TAG,
+                )
+
+    def test_report_must_equal_canonical_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts, diagnostics = _fixture(root)
+            report = root / "docs" / "stage-4-completion-supplement.md"
+            report.write_bytes(b"# plausible but noncanonical\n")
+            with (
+                patch(
+                    "scripts.freeze_stage4_completion._tag_commit",
+                    return_value=EXPECTED_SOURCE_COMMIT,
+                ),
+                self.assertRaisesRegex(
+                    Stage4CompletionFreezeError,
+                    "canonical artifact summary",
+                ),
+            ):
+                freeze_completion_release(
+                    repository_root=root,
+                    artifact_paths=artifacts,
+                    diagnostics_artifact_path=diagnostics,
+                    source_tag=EXPECTED_SOURCE_TAG,
+                    diagnostics_source_tag=EXPECTED_DIAGNOSTICS_SOURCE_TAG,
+                )
+
+    def test_formal_output_rejects_linked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            try:
+                os.symlink(
+                    outside,
+                    root / "configs",
+                    target_is_directory=True,
+                )
+            except OSError as exc:
+                self.skipTest(f"directory symlink unavailable: {exc}")
+            with self.assertRaisesRegex(
+                Stage4CompletionFreezeError,
+                "linked",
+            ):
+                _require_safe_output_ancestors(
+                    root,
+                    root / "configs" / "stage4_completion_release.json",
+                )
+
     def test_rejects_wrong_source_order_and_source_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -609,7 +904,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifacts, diagnostics = _fixture(root)
-            output = root / "configs" / "fixture-completion.json"
+            output = root / "configs" / "stage4_completion_release.json"
             output.write_text("{}\n", encoding="utf-8")
             with (
                 patch(
@@ -627,7 +922,7 @@ class FreezeStage4CompletionTests(unittest.TestCase):
                     diagnostics_artifact_path=diagnostics,
                     source_tag=EXPECTED_SOURCE_TAG,
                     diagnostics_source_tag=EXPECTED_DIAGNOSTICS_SOURCE_TAG,
-                    output_path="configs/fixture-completion.json",
+                    output_path="configs/stage4_completion_release.json",
                 )
 
 

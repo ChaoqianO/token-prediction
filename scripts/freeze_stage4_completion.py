@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import stat
 import subprocess
@@ -35,6 +34,22 @@ if __package__:
         Stage4ReleaseError,
         _validate_release_document as _validate_parent_release_document,
     )
+    from scripts.summarize_stage4_completion import (
+        ArtifactReference,
+        CompletionSummaryError,
+        build_completion_summary,
+        load_completion_diagnostics_artifact,
+        load_development_artifact,
+        render_markdown,
+    )
+    from scripts.verify_stage4_completion_release import (
+        Stage4CompletionReleaseError,
+        _code_binding_at_commit,
+        _expected_diagnostics_scope,
+        _load_declared_bundles,
+        _training_run_semantic_sha256,
+        _verify_result_coverage,
+    )
 else:  # pragma: no cover - production CLI invocation
     from run_stage4_experiments import (
         Stage4ExperimentError,
@@ -45,16 +60,51 @@ else:  # pragma: no cover - production CLI invocation
         Stage4ReleaseError,
         _validate_release_document as _validate_parent_release_document,
     )
+    from summarize_stage4_completion import (
+        ArtifactReference,
+        CompletionSummaryError,
+        build_completion_summary,
+        load_completion_diagnostics_artifact,
+        load_development_artifact,
+        render_markdown,
+    )
+    from verify_stage4_completion_release import (
+        Stage4CompletionReleaseError,
+        _code_binding_at_commit,
+        _expected_diagnostics_scope,
+        _load_declared_bundles,
+        _training_run_semantic_sha256,
+        _verify_result_coverage,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_SCHEMA_VERSION = 1
+RELEASE_SCHEMA_VERSION = 2
 RELEASE_STAGE_NAME = "stage4_development_completion_supplement"
 RELEASE_POLICY_ID = "stage4_development_only_completion_release_v1"
 SOURCE_BINDING_POLICY_ID = "stage4_completion_source_code_tree_v1"
 EXPECTED_SOURCE_TAG = "stage4-completion-source-v1"
 EXPECTED_DIAGNOSTICS_SOURCE_TAG = "stage4-completion-diagnostics-source-v1"
+EXPECTED_COMPLETION_RELEASE_TAG = "stage4-completion-release-v1"
 DIAGNOSTICS_RUNNER_RELATIVE = "scripts/run_stage4_completion_diagnostics.py"
+DIAGNOSTICS_SUMMARIZER_RELATIVE = "scripts/summarize_stage4_completion.py"
+DIAGNOSTICS_DIRECT_CODE_PATHS = frozenset(
+    {
+        DIAGNOSTICS_RUNNER_RELATIVE,
+        DIAGNOSTICS_SUMMARIZER_RELATIVE,
+    }
+)
+DIAGNOSTICS_TRAINING_CODE_PATHS = frozenset(
+    {
+        "scripts/run_stage4_experiments.py",
+        "scripts/run_stage2_experiments.py",
+        "scripts/extract_swebench_metadata.mjs",
+        "scripts/audit_stage2_sokoban.py",
+        "scripts/verify_stage1_baseline.py",
+        "scripts/run_data_foundation_baseline.py",
+        "configs/stage2_auxiliary_sources.json",
+    }
+)
 EXPECTED_SOURCE_COMMIT = "c1ac2484f44ed65705cdd00eba7b70a739a3ac0b"
 EXPECTED_CODE_TREE_SHA256 = (
     "6418545afa08a39df1797486e4c845063c2de13b29f20c81500933fad2201757"
@@ -90,9 +140,9 @@ EXPECTED_CALL_PRE_MLP_BUNDLE_FOLD_COUNT = 315
 EXPECTED_SEED_POLICY_CELL_COUNT = 7
 EXPECTED_SEED_POLICY_BUNDLE_FOLD_COUNT = 210
 DIAGNOSTICS_PREFIX = PurePosixPath("workspace/stage4/completion_diagnostics")
-DIAGNOSTICS_RESULTS_SCHEMA_VERSION = 1
+DIAGNOSTICS_RESULTS_SCHEMA_VERSION = 2
 DIAGNOSTICS_STAGE_NAME = "stage4_completion_diagnostics"
-DIAGNOSTICS_POLICY_ID = "stage4_completion_development_lifecycle_replay_v1"
+DIAGNOSTICS_POLICY_ID = "stage4_completion_artifact_checkpoint_only_v2"
 EXPECTED_DIAGNOSTICS_BOUND_SOURCE_COUNT = 4
 EXPECTED_DIAGNOSTICS_LIFECYCLE_SOURCE_COUNT = 3
 EXPECTED_DIAGNOSTICS_LIFECYCLE_CONDITION_COUNT = 7
@@ -100,8 +150,51 @@ EXPECTED_DIAGNOSTICS_CANDIDATE_COUNT = 2
 EXPECTED_DIAGNOSTICS_CANDIDATE_CELL_COUNT = 14
 EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT = 42
 EXPECTED_DIAGNOSTICS_BUNDLE_COUNT = 210
-RUN_VARIANCE_ID = "same_task_run_mae_variance_v1"
-RUN_DISPERSION_EXTENSION_ID = "same_task_run_mae_iqr_max_minus_min_v1"
+DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON = (
+    "no_presealed_development_lifecycle_projection_v1"
+)
+DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS = [
+    "progress",
+    "run_variance_iqr_max_minus_min",
+    "termination",
+]
+DIAGNOSTICS_RECORD_KEYS = {
+    "source_name",
+    "condition_id",
+    "experiment_id",
+    "candidate_id",
+    "candidate_hash",
+    "split_seed",
+    "split_plan_id",
+    "bundle_folds",
+    "bundle_projection_sha256",
+    "checkpoint_parity",
+    "lifecycle_metrics",
+}
+CHECKPOINT_PARITY_KEYS = {
+    "status",
+    "checkpoint_artifact_id",
+    "checkpoint_result_sha256",
+    "prediction_count",
+    "expected_prediction_count",
+    "prediction_projection_sha256",
+    "expected_prediction_projection_sha256",
+    "cohort_projection_sha256",
+    "expected_cohort_projection_sha256",
+    "aggregate_metrics_projection_sha256",
+    "expected_aggregate_metrics_projection_sha256",
+    "development_cohort_status",
+    "development_task_count",
+    "development_task_projection_sha256",
+}
+LIFECYCLE_METRICS_KEYS = {
+    "status",
+    "reason_code",
+    "labels_present",
+    "lifecycle_sequences_present",
+    "unavailable_metrics",
+    "historical_stage3_reference",
+}
 MAX_JSON_BYTES = 256 * 1024 * 1024
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 
@@ -154,6 +247,8 @@ class Stage4CompletionFreezeError(RuntimeError):
 @dataclass(frozen=True)
 class ArtifactAudit:
     record: Mapping[str, object]
+    results: Mapping[str, object]
+    run_semantic_sha256: str
     reloadable_bundle_fold_count: int
     call_pre_mlp_cell_count: int
     call_pre_mlp_bundle_fold_count: int
@@ -365,6 +460,74 @@ def _git_file(root: Path, commit: str, relative: str) -> bytes:
     return completed.stdout
 
 
+def _diagnostics_code_paths_at_commit(
+    root: Path,
+    commit: str,
+) -> tuple[str, ...]:
+    """Derive the replay closure from the tagged tree, never from artifact data."""
+
+    completed = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotepath=false",
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            commit,
+            "--",
+            "src/token_prediction",
+            *sorted(
+                DIAGNOSTICS_DIRECT_CODE_PATHS
+                | DIAGNOSTICS_TRAINING_CODE_PATHS
+            ),
+        ],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise Stage4CompletionFreezeError(
+            f"diagnostics source tree cannot be enumerated: {message}"
+        )
+    paths: list[str] = []
+    for item in completed.stdout.split(b"\0"):
+        if not item:
+            continue
+        try:
+            relative = item.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise Stage4CompletionFreezeError(
+                "diagnostics source tree contains a non-UTF-8 path"
+            ) from exc
+        relative = _safe_relative(
+            relative,
+            description="diagnostics historical code path",
+        )
+        if relative in (
+            DIAGNOSTICS_DIRECT_CODE_PATHS
+            | DIAGNOSTICS_TRAINING_CODE_PATHS
+        ) or (
+            relative.startswith("src/token_prediction/")
+            and relative.endswith(".py")
+        ):
+            paths.append(relative)
+    resolved = tuple(sorted(set(paths)))
+    required = (
+        DIAGNOSTICS_DIRECT_CODE_PATHS | DIAGNOSTICS_TRAINING_CODE_PATHS
+    )
+    if not required <= set(resolved) or not any(
+        path.startswith("src/token_prediction/") for path in resolved
+    ):
+        raise Stage4CompletionFreezeError(
+            "diagnostics source commit lacks its complete execution closure"
+        )
+    return resolved
+
+
 def _commit(value: object, *, description: str) -> str:
     text = _text(value, description=description)
     if (
@@ -412,15 +575,10 @@ def _audit_diagnostics_code_binding(
         )
         for path in raw_paths
     ]
-    required = {
-        DIAGNOSTICS_RUNNER_RELATIVE,
-        "src/token_prediction/evaluation/stratification.py",
-        "src/token_prediction/lifecycle_bundle.py",
-        "src/token_prediction/lifecycle.py",
-    }
-    if paths != sorted(set(paths)) or not required <= set(paths):
+    expected_paths = _diagnostics_code_paths_at_commit(root, git_commit)
+    if paths != list(expected_paths):
         raise Stage4CompletionFreezeError(
-            "completion diagnostics code closure is incomplete or unordered"
+            "completion diagnostics code closure differs from the tagged tree"
         )
     if _tag_commit(root, source_tag) != git_commit:
         raise Stage4CompletionFreezeError(
@@ -612,10 +770,13 @@ def _audit_training_artifact(
         results.get("code_binding"),
         description=f"{expectation.source_name} code binding",
     )
-    if (
-        code.get("git_commit") != EXPECTED_SOURCE_COMMIT
-        or code.get("code_tree_sha256") != EXPECTED_CODE_TREE_SHA256
-    ):
+    try:
+        expected_code = _code_binding_at_commit(root, EXPECTED_SOURCE_COMMIT)
+    except Stage4CompletionReleaseError as exc:
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} source code cannot be reconstructed"
+        ) from exc
+    if dict(code) != dict(expected_code):
         raise Stage4CompletionFreezeError(
             f"{expectation.source_name} code binding differs from c1ac248"
         )
@@ -629,6 +790,7 @@ def _audit_training_artifact(
         "source_id",
         "capability_contract_hash",
         "development_protocol_id",
+        "minimum_development_tasks",
         "plans",
         "gates",
         "telemetry_decisions",
@@ -699,6 +861,33 @@ def _audit_training_artifact(
         seed_policy_cell_count,
         seed_policy_bundle_fold_count,
     ) = _candidate_seed_audit(experiments)
+    try:
+        independent_coverage = _verify_result_coverage(
+            results,
+            source_name=expectation.source_name,
+        )
+    except (Stage4CompletionReleaseError, TypeError, ValueError) as exc:
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} matrix/hash reconstruction failed"
+        ) from exc
+    if (
+        independent_coverage.experiment_count != len(experiments)
+        or independent_coverage.candidate_seed_run_count
+        != candidate_seed_run_count
+        or independent_coverage.reloadable_bundle_fold_count
+        != reloadable_bundle_fold_count
+        or independent_coverage.call_pre_mlp_cell_count
+        != call_pre_mlp_cell_count
+        or independent_coverage.call_pre_mlp_bundle_fold_count
+        != call_pre_mlp_bundle_fold_count
+        or independent_coverage.seed_policy_cell_count
+        != seed_policy_cell_count
+        or independent_coverage.seed_policy_bundle_fold_count
+        != seed_policy_bundle_fold_count
+    ):
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} independent matrix coverage differs"
+        )
     summary = _mapping(
         results.get("summary"),
         description=f"{expectation.source_name} summary",
@@ -729,13 +918,45 @@ def _audit_training_artifact(
         raise Stage4CompletionFreezeError(
             f"{expectation.source_name} artifact path and run id differ"
         )
-    if (
-        manifest.metadata.get("run_id") != run_id
-        or manifest.metadata.get("results_payload_sha256")
-        != results_payload_sha256
-    ):
+    try:
+        run_semantic_sha256 = _training_run_semantic_sha256(
+            manifest.metadata,
+            expected_run_id=run_id,
+            expected_results_payload_sha256=results_payload_sha256,
+            description=f"Stage 4 completion {expectation.source_name}",
+        )
+    except Stage4CompletionReleaseError as exc:
         raise Stage4CompletionFreezeError(
             f"{expectation.source_name} manifest/results metadata differs"
+        ) from exc
+    run_semantic = _mapping(
+        manifest.metadata["run_semantic"],
+        description=f"{expectation.source_name} run semantic",
+    )
+    if (
+        run_semantic.get("source_name") != expectation.source_name
+        or run_semantic.get("source_id") != expectation.source_id
+        or run_semantic.get("matrix_id") != matrix_id
+        or run_semantic.get("git_commit") != EXPECTED_SOURCE_COMMIT
+        or run_semantic.get("code_tree_sha256")
+        != EXPECTED_CODE_TREE_SHA256
+    ):
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} run semantic identity differs"
+        )
+    try:
+        loaded_bundle_count = _load_declared_bundles(
+            artifact_root,
+            results,
+            manifest_files=manifest.files,
+        )
+    except (Stage4CompletionReleaseError, OSError, TypeError, ValueError) as exc:
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} artifact topology or bundle load failed"
+        ) from exc
+    if loaded_bundle_count != reloadable_bundle_fold_count:
+        raise Stage4CompletionFreezeError(
+            f"{expectation.source_name} loaded bundle count differs"
         )
     record = {
         "source_name": expectation.source_name,
@@ -752,6 +973,8 @@ def _audit_training_artifact(
     }
     return ArtifactAudit(
         record=record,
+        results=results,
+        run_semantic_sha256=run_semantic_sha256,
         reloadable_bundle_fold_count=reloadable_bundle_fold_count,
         call_pre_mlp_cell_count=call_pre_mlp_cell_count,
         call_pre_mlp_bundle_fold_count=call_pre_mlp_bundle_fold_count,
@@ -770,10 +993,9 @@ def _diagnostics_coverage(value: object) -> Mapping[str, object]:
         "lifecycle_candidate_cell_count",
         "lifecycle_candidate_seed_count",
         "lifecycle_bundle_count",
-        "replayed_run_count",
-        "scored_run_count",
-        "scored_boundary_count",
-        "unscored_context_boundary_count",
+        "checkpoint_verified_candidate_seed_count",
+        "lifecycle_replayed_candidate_seed_count",
+        "lifecycle_metrics_unavailable_candidate_seed_count",
     }
     if set(coverage) != expected_keys:
         raise Stage4CompletionFreezeError("diagnostics coverage keys differ")
@@ -791,91 +1013,19 @@ def _diagnostics_coverage(value: object) -> Mapping[str, object]:
             EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
         ),
         "lifecycle_bundle_count": EXPECTED_DIAGNOSTICS_BUNDLE_COUNT,
+        "checkpoint_verified_candidate_seed_count": (
+            EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+        ),
+        "lifecycle_replayed_candidate_seed_count": 0,
+        "lifecycle_metrics_unavailable_candidate_seed_count": (
+            EXPECTED_DIAGNOSTICS_CANDIDATE_SEED_COUNT
+        ),
     }
     if any(coverage.get(key) != expected for key, expected in fixed.items()):
         raise Stage4CompletionFreezeError(
             "diagnostics fixed coverage differs from the completion protocol"
         )
-    replayed = _integer(
-        coverage.get("replayed_run_count"),
-        description="diagnostics replayed run count",
-        minimum=1,
-    )
-    scored = _integer(
-        coverage.get("scored_run_count"),
-        description="diagnostics scored run count",
-        minimum=1,
-    )
-    if scored > replayed:
-        raise Stage4CompletionFreezeError(
-            "diagnostics scored run count exceeds replayed run count"
-        )
-    _integer(
-        coverage.get("scored_boundary_count"),
-        description="diagnostics scored boundary count",
-        minimum=1,
-    )
-    _integer(
-        coverage.get("unscored_context_boundary_count"),
-        description="diagnostics unscored context boundary count",
-    )
     return dict(coverage)
-
-
-def _verify_run_dispersion(value: object) -> int:
-    dispersion = _mapping(value, description="completion run dispersion")
-    required = {
-        "run_variance_id",
-        "run_dispersion_extension_id",
-        "n_tasks",
-        "n_scored_runs",
-        "n_repeated_tasks",
-        "status",
-        "mean_within_task_run_mae_variance",
-        "median_within_task_run_mae_variance",
-        "max_within_task_run_mae_variance",
-        "mean_within_task_run_mae_iqr",
-        "median_within_task_run_mae_iqr",
-        "max_within_task_run_mae_iqr",
-        "mean_within_task_run_mae_max_minus_min",
-        "median_within_task_run_mae_max_minus_min",
-        "max_within_task_run_mae_max_minus_min",
-    }
-    if set(dispersion) != required:
-        raise Stage4CompletionFreezeError("completion run dispersion keys differ")
-    if (
-        dispersion.get("run_variance_id") != RUN_VARIANCE_ID
-        or dispersion.get("run_dispersion_extension_id")
-        != RUN_DISPERSION_EXTENSION_ID
-        or dispersion.get("status") not in {"estimable", "not_estimable"}
-    ):
-        raise Stage4CompletionFreezeError(
-            "completion run dispersion extension is missing or invalid"
-        )
-    for key in ("n_tasks", "n_scored_runs", "n_repeated_tasks"):
-        _integer(
-            dispersion.get(key),
-            description=f"completion run dispersion {key}",
-        )
-    for key in required - {
-        "run_variance_id",
-        "run_dispersion_extension_id",
-        "n_tasks",
-        "n_scored_runs",
-        "n_repeated_tasks",
-        "status",
-    }:
-        number = dispersion.get(key)
-        if (
-            isinstance(number, bool)
-            or not isinstance(number, (int, float))
-            or not math.isfinite(float(number))
-            or float(number) < 0
-        ):
-            raise Stage4CompletionFreezeError(
-                f"completion run dispersion {key} is invalid"
-            )
-    return int(dispersion["n_scored_runs"])
 
 
 def _audit_diagnostics_artifact(
@@ -883,6 +1033,9 @@ def _audit_diagnostics_artifact(
     raw_path: str | os.PathLike[str],
     *,
     source_artifact_ids: Mapping[str, str],
+    training_results: Mapping[str, Mapping[str, object]],
+    expected_diagnostics: Mapping[tuple[object, ...], Mapping[str, object]],
+    expected_inventory: Mapping[tuple[object, ...], Mapping[str, object]],
     diagnostics_source_tag: str,
 ) -> Mapping[str, object]:
     relative, artifact_root = _bound_repo_path(
@@ -904,10 +1057,10 @@ def _audit_diagnostics_artifact(
     if (
         manifest.stage_name != DIAGNOSTICS_STAGE_NAME
         or manifest.schema_version != DIAGNOSTICS_RESULTS_SCHEMA_VERSION
-        or not manifest.files
+        or set(manifest.files) != {"results.json"}
     ):
         raise Stage4CompletionFreezeError(
-            "completion diagnostics manifest identity differs"
+            "completion diagnostics manifest identity or topology differs"
         )
     results = _json_object(
         _regular_bytes(
@@ -983,6 +1136,19 @@ def _audit_diagnostics_artifact(
             raw_source,
             description=f"completion diagnostics source_artifacts[{index}]",
         )
+        if set(source) != {
+            "source_name",
+            "source_id",
+            "run_id",
+            "artifact_id",
+            "results_payload_sha256",
+            "matrix_id",
+            "development_protocol_id",
+            "lifecycle_status",
+        }:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics source artifact keys differ"
+            )
         source_name = _text(
             source.get("source_name"),
             description="completion diagnostics source name",
@@ -991,6 +1157,43 @@ def _audit_diagnostics_artifact(
             source.get("artifact_id"),
             description=f"completion diagnostics {source_name} artifact id",
         )
+        training = training_results.get(source_name)
+        if training is None:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics bind an unknown source"
+            )
+        training_source = _mapping(
+            training.get("source"),
+            description=f"{source_name} training source",
+        )
+        training_matrix = _mapping(
+            training.get("matrix"),
+            description=f"{source_name} training matrix",
+        )
+        training_protocol = _mapping(
+            training.get("development_protocol"),
+            description=f"{source_name} training protocol",
+        )
+        expected_source = {
+            "source_name": source_name,
+            "source_id": training_source.get("source_id"),
+            "run_id": training.get("run_id"),
+            "artifact_id": source_artifact_ids.get(source_name),
+            "results_payload_sha256": training.get(
+                "results_payload_sha256"
+            ),
+            "matrix_id": training_matrix.get("matrix_id"),
+            "development_protocol_id": training_protocol.get("protocol_id"),
+            "lifecycle_status": (
+                "not_applicable_no_lifecycle"
+                if source_name == "spend_aggregate"
+                else "unavailable_no_presealed_replay_projection"
+            ),
+        }
+        if dict(source) != expected_source:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics source binding differs"
+            )
         observed_source_names.append(source_name)
         observed_source_ids[source_name] = artifact_id
     expected_names = sorted(item.source_name for item in SOURCE_EXPECTATIONS)
@@ -1017,16 +1220,114 @@ def _audit_diagnostics_artifact(
         raise Stage4CompletionFreezeError(
             "completion diagnostics inventory or record count differs"
         )
-    scored_run_count = 0
+    observed_inventory: set[tuple[object, ...]] = set()
+    for index, raw_record in enumerate(inventory):
+        record = _mapping(
+            raw_record,
+            description=f"completion diagnostics inventory[{index}]",
+        )
+        identity = (
+            record.get("source_name"),
+            record.get("condition_id"),
+            record.get("experiment_id"),
+            record.get("candidate_id"),
+            record.get("candidate_hash"),
+            record.get("split_seed"),
+            record.get("split_plan_id"),
+            record.get("fold"),
+        )
+        if (
+            identity in observed_inventory
+            or expected_inventory.get(identity) != dict(record)
+        ):
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics bundle inventory differs"
+            )
+        observed_inventory.add(identity)
+    if observed_inventory != set(expected_inventory):
+        raise Stage4CompletionFreezeError(
+            "completion diagnostics bundle inventory is incomplete"
+        )
+    observed_diagnostics: set[tuple[object, ...]] = set()
     for index, raw_record in enumerate(diagnostics):
         record = _mapping(
             raw_record,
             description=f"completion diagnostics records[{index}]",
         )
-        scored_run_count += _verify_run_dispersion(record.get("run_variance"))
-    if scored_run_count != coverage["scored_run_count"]:
+        if set(record) != DIAGNOSTICS_RECORD_KEYS:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics record keys differ"
+            )
+        identity = (
+            record.get("source_name"),
+            record.get("condition_id"),
+            record.get("experiment_id"),
+            record.get("candidate_id"),
+            record.get("candidate_hash"),
+            record.get("split_seed"),
+            record.get("split_plan_id"),
+        )
+        expected_record = expected_diagnostics.get(identity)
+        if identity in observed_diagnostics or expected_record is None:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics record identity differs"
+            )
+        observed_diagnostics.add(identity)
+        if record.get("bundle_folds") != list(range(EXPECTED_OUTER_FOLDS)):
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics bundle folds differ"
+            )
+        bundle_projection = _semantic_sha256(
+            [
+                {
+                    "fold": fold,
+                    "bundle_manifest_sha256": expected_inventory[
+                        (*identity, fold)
+                    ]["bundle_manifest_sha256"],
+                    "bundle_file_count": expected_inventory[
+                        (*identity, fold)
+                    ]["bundle_file_count"],
+                }
+                for fold in range(EXPECTED_OUTER_FOLDS)
+            ]
+        )
+        if record.get("bundle_projection_sha256") != bundle_projection:
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics bundle projection differs"
+            )
+        parity = _mapping(
+            record.get("checkpoint_parity"),
+            description="completion diagnostics checkpoint parity",
+        )
+        if (
+            set(parity) != CHECKPOINT_PARITY_KEYS
+            or dict(parity) != expected_record["_checkpoint_parity"]
+        ):
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics checkpoint parity differs from its "
+                "training seed or independently reopened checkpoint"
+            )
+        lifecycle = _mapping(
+            record.get("lifecycle_metrics"),
+            description="completion diagnostics lifecycle metric availability",
+        )
+        if (
+            set(lifecycle) != LIFECYCLE_METRICS_KEYS
+            or lifecycle.get("status") != "unavailable"
+            or lifecycle.get("reason_code")
+            != DIAGNOSTICS_LIFECYCLE_UNAVAILABLE_REASON
+            or lifecycle.get("labels_present") is not False
+            or lifecycle.get("lifecycle_sequences_present") is not False
+            or lifecycle.get("unavailable_metrics")
+            != DIAGNOSTICS_UNAVAILABLE_LIFECYCLE_METRICS
+            or lifecycle.get("historical_stage3_reference") is not None
+        ):
+            raise Stage4CompletionFreezeError(
+                "completion diagnostics lifecycle-unavailable declaration differs"
+            )
+    if observed_diagnostics != set(expected_diagnostics):
         raise Stage4CompletionFreezeError(
-            "completion run dispersion scored-run coverage does not close"
+            "completion diagnostics candidate-seed records are incomplete"
         )
     expected_metadata_keys = {
         "run_id",
@@ -1118,6 +1419,15 @@ def _protocol_with_diagnostics(
             "lifecycle_candidate_seed_count"
         ],
         "diagnostics_bundle_count": coverage["lifecycle_bundle_count"],
+        "diagnostics_checkpoint_verified_candidate_seed_count": coverage[
+            "checkpoint_verified_candidate_seed_count"
+        ],
+        "diagnostics_lifecycle_replayed_candidate_seed_count": coverage[
+            "lifecycle_replayed_candidate_seed_count"
+        ],
+        "diagnostics_lifecycle_metrics_unavailable_candidate_seed_count": (
+            coverage["lifecycle_metrics_unavailable_candidate_seed_count"]
+        ),
     }
 
 
@@ -1182,6 +1492,8 @@ def _parent_release_binding(
 def _report_binding(
     root: Path,
     raw_path: str | os.PathLike[str],
+    *,
+    expected_payload: bytes,
 ) -> Mapping[str, object]:
     relative, path = _bound_repo_path(
         root,
@@ -1195,7 +1507,52 @@ def _report_binding(
         maximum_bytes=MAX_REPORT_BYTES,
         description="completion supplement report",
     )
+    if payload != expected_payload:
+        raise Stage4CompletionFreezeError(
+            "completion report bytes differ from the canonical artifact summary"
+        )
     return {"path": relative, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def _canonical_report_payload(
+    root: Path,
+    audits: Sequence[ArtifactAudit],
+    diagnostics_artifact_path: str | os.PathLike[str],
+) -> bytes:
+    try:
+        artifacts = tuple(
+            load_development_artifact(
+                ArtifactReference(
+                    path=root.joinpath(
+                        *PurePosixPath(str(audit.record["path"])).parts
+                    ),
+                    expected_artifact_id=str(audit.record["artifact_id"]),
+                    expected_results_payload_sha256=str(
+                        audit.record["results_payload_sha256"]
+                    ),
+                )
+            )
+            for audit in audits
+        )
+        diagnostics = load_completion_diagnostics_artifact(
+            diagnostics_artifact_path,
+            repo_root=root,
+            diagnostics_root=(
+                root
+                / "workspace"
+                / "stage4"
+                / "completion_diagnostics"
+            ),
+        )
+        summary = build_completion_summary(
+            artifacts,
+            diagnostics=diagnostics,
+        )
+        return (render_markdown(summary) + "\n").encode("utf-8")
+    except (CompletionSummaryError, OSError, TypeError, ValueError) as exc:
+        raise Stage4CompletionFreezeError(
+            "canonical completion report cannot be reconstructed"
+        ) from exc
 
 
 def _training_protocol(audits: Sequence[ArtifactAudit]) -> Mapping[str, object]:
@@ -1271,6 +1628,9 @@ def build_release_document(
         "release_schema_version": RELEASE_SCHEMA_VERSION,
         "stage_name": RELEASE_STAGE_NAME,
         "policy_id": RELEASE_POLICY_ID,
+        "release_control": {
+            "release_tag": EXPECTED_COMPLETION_RELEASE_TAG,
+        },
         "source_binding": {
             "policy_id": SOURCE_BINDING_POLICY_ID,
             "git_commit": EXPECTED_SOURCE_COMMIT,
@@ -1296,7 +1656,10 @@ def _write_release(path: Path, document: Mapping[str, object]) -> None:
         ).encode("utf-8")
         + b"\n"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir():
+        raise Stage4CompletionFreezeError(
+            "formal completion lock parent directory is missing"
+        )
     if path.exists() or path.is_symlink():
         existing = _regular_bytes(
             path,
@@ -1323,6 +1686,42 @@ def _write_release(path: Path, document: Mapping[str, object]) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _require_safe_output_ancestors(root: Path, output: Path) -> None:
+    """Reject link/reparse traversal before creating the immutable formal lock."""
+
+    try:
+        canonical_root = root.resolve(strict=True)
+        relative = output.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise Stage4CompletionFreezeError(
+            "formal completion lock must remain inside the repository"
+        ) from exc
+    candidate = root
+    for part in (None, *relative.parts[:-1]):
+        if part is not None:
+            candidate = candidate / part
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            raise Stage4CompletionFreezeError(
+                "formal completion lock ancestor is missing"
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise Stage4CompletionFreezeError(
+                "formal completion lock ancestor is linked or not a directory"
+            )
+    try:
+        output.parent.resolve(strict=True).relative_to(canonical_root)
+    except (OSError, ValueError) as exc:
+        raise Stage4CompletionFreezeError(
+            "formal completion lock parent escapes the repository"
+        ) from exc
 
 
 def freeze_completion_release(
@@ -1366,13 +1765,42 @@ def freeze_completion_release(
         str(audit.record["source_name"]): str(audit.record["artifact_id"])
         for audit in audits
     }
+    training_results = {
+        str(audit.record["source_name"]): audit.results for audit in audits
+    }
+    training_run_semantic_sha256_by_source = {
+        str(audit.record["source_name"]): audit.run_semantic_sha256
+        for audit in audits
+    }
+    try:
+        expected_diagnostics, expected_inventory = (
+            _expected_diagnostics_scope(
+                root,
+                {"artifacts": [dict(audit.record) for audit in audits]},
+                training_results,
+                training_run_semantic_sha256_by_source,
+            )
+        )
+    except Stage4CompletionReleaseError as exc:
+        raise Stage4CompletionFreezeError(
+            "completion diagnostics expected checkpoint scope cannot be "
+            "reconstructed"
+        ) from exc
     diagnostics_artifact = _audit_diagnostics_artifact(
         root,
         diagnostics_artifact_path,
         source_artifact_ids=source_artifact_ids,
+        training_results=training_results,
+        expected_diagnostics=expected_diagnostics,
+        expected_inventory=expected_inventory,
         diagnostics_source_tag=diagnostics_source_tag,
     )
     protocol = _protocol_with_diagnostics(protocol, diagnostics_artifact)
+    report_payload = _canonical_report_payload(
+        root,
+        audits,
+        diagnostics_artifact_path,
+    )
     document = build_release_document(
         source_tag=source_tag,
         source_tag_commit=tag_commit,
@@ -1380,10 +1808,19 @@ def freeze_completion_release(
         artifacts=audits,
         diagnostics_artifact=diagnostics_artifact,
         protocol=protocol,
-        report=_report_binding(root, report_path),
+        report=_report_binding(
+            root,
+            report_path,
+            expected_payload=report_payload,
+        ),
     )
     output_relative = _safe_relative(output_path, description="completion lock output")
+    if output_relative != DEFAULT_OUTPUT:
+        raise Stage4CompletionFreezeError(
+            "completion lock output must use the formal frozen path"
+        )
     output = root.joinpath(*PurePosixPath(output_relative).parts)
+    _require_safe_output_ancestors(root, output)
     _write_release(output, document)
     return document
 
