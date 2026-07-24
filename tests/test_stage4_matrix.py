@@ -80,6 +80,47 @@ def _bagen_dataset() -> SupervisedDataset:
     )
 
 
+def _bagen_call_update_dataset(
+    telemetry_observables: frozenset[Observable],
+) -> tuple[SupervisedDataset, SourceCapabilities]:
+    capabilities = SourceCapabilities(
+        BAGEN_SOURCE_ID,
+        _bagen_capabilities().observables | telemetry_observables,
+    )
+    base = _bagen_dataset()
+    rows = list(base.rows)
+    for task_index in range(100):
+        point = replace(
+            _point(
+                task_index,
+                position=PredictionPosition.TASK_UPDATE,
+                target=PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS,
+                condition_id=PRIMARY_CONDITION,
+            ),
+            point_id=f"call-update-point-{task_index:03d}",
+            source_event_id=f"call-update-event-{task_index:03d}",
+            logical_call_id=f"call-{task_index:03d}",
+            cutoff_event_seq=30,
+            position=PredictionPosition.CALL_UPDATE,
+            target=PredictionTarget.CALL_REMAINING_OUTPUT_TOKENS,
+        )
+        rows.append(
+            DatasetRow(
+                point,
+                100 + task_index,
+                LabelStatus.OBSERVED,
+            )
+        )
+    return (
+        replace(
+            base,
+            rows=tuple(rows),
+            capability_contract_hash=capabilities.contract_hash,
+        ),
+        capabilities,
+    )
+
+
 def _aggregate_dataset() -> tuple[SupervisedDataset, SourceCapabilities]:
     capabilities = SourceCapabilities(
         SPEND_AGGREGATE_SOURCE_ID,
@@ -237,6 +278,89 @@ class Stage4MatrixTests(unittest.TestCase):
         self.assertFalse(decisions[TelemetrySurface.G3_ENTROPY_STOP].available)
         self.assertFalse(decisions[TelemetrySurface.G3_HIDDEN_STATE].available)
         self.assertFalse(decisions[TelemetrySurface.G3_RESUMABLE_STATE].available)
+
+    def test_composite_g3_candidate_requires_all_feature_telemetry(self) -> None:
+        cases = (
+            (
+                "output-only",
+                frozenset({Observable.OUTPUT_DELTAS}),
+                "missing_observables:hidden_state,logprobs",
+                {"empirical"},
+                "g3_composite",
+            ),
+            (
+                "logprobs-only",
+                frozenset({Observable.LOGPROBS}),
+                "missing_observables:output_deltas",
+                set(),
+                "call_update",
+            ),
+            (
+                "hidden-only",
+                frozenset({Observable.HIDDEN_STATE}),
+                "missing_observables:output_deltas",
+                set(),
+                "call_update",
+            ),
+            (
+                "full",
+                frozenset(
+                    {
+                        Observable.OUTPUT_DELTAS,
+                        Observable.LOGPROBS,
+                        Observable.HIDDEN_STATE,
+                    }
+                ),
+                None,
+                {"empirical", "lightgbm_g3"},
+                None,
+            ),
+        )
+        for (
+            name,
+            telemetry,
+            expected_reason,
+            expected_candidates,
+            expected_gate_surface,
+        ) in cases:
+            with self.subTest(name=name):
+                dataset, capabilities = _bagen_call_update_dataset(telemetry)
+                matrix = build_stage4_matrix(
+                    build_development_protocol(dataset),
+                    source_id=BAGEN_SOURCE_ID,
+                    capabilities=capabilities,
+                )
+                plans = tuple(
+                    plan
+                    for plan in matrix.plans
+                    if plan.spec.condition_id == PRIMARY_CONDITION
+                    and plan.spec.position == PredictionPosition.CALL_UPDATE
+                )
+                self.assertEqual(bool(plans), bool(expected_candidates))
+                if expected_candidates:
+                    self.assertEqual(len(plans), 1)
+                    self.assertEqual(
+                        {
+                            candidate.candidate_id
+                            for candidate in plans[0].spec.candidates
+                        },
+                        expected_candidates,
+                    )
+                matching_gates = [
+                    gate
+                    for gate in matrix.gates
+                    if gate.condition_id == PRIMARY_CONDITION
+                    and gate.surface in {"call_update", "g3_composite"}
+                ]
+                if expected_gate_surface is None:
+                    self.assertFalse(matching_gates)
+                else:
+                    gate = next(
+                        gate
+                        for gate in matching_gates
+                        if gate.surface == expected_gate_surface
+                    )
+                    self.assertEqual(gate.reason, expected_reason)
 
     def test_aggregate_remains_task_launch_only_with_calibration_ablation(self) -> None:
         dataset, capabilities = _aggregate_dataset()

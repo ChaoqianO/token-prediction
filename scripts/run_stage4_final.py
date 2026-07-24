@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from token_prediction.dataset import (
     DatasetSlice,
@@ -102,6 +104,28 @@ DEFAULT_OUTPUT_ROOT = "workspace/stage4/final"
 ALLOWED_OUTPUT_PREFIX = "workspace/stage4/final/"
 DEFAULT_CHECKPOINT_ROOT = "workspace/stage4/final-checkpoints"
 ALLOWED_CHECKPOINT_PREFIX = "workspace/stage4/final-checkpoints/"
+FINAL_GUARD_ROOT = "workspace/stage4/final-guard"
+FINAL_PROCESS_LOCK_RELATIVE = f"{FINAL_GUARD_ROOT}/process.lock"
+FINAL_TOMBSTONE_POLICY_ID = "stage4_fixed_single_open_tombstone_v1"
+FINAL_TOMBSTONE_SCHEMA_VERSION = 1
+TRACKED_RELEASE_TOMBSTONE = "configs/stage4_release.json"
+STAGE2_AUXILIARY_MANIFEST_RELATIVE = "configs/stage2_auxiliary_sources.json"
+FINAL_EVALUATION_EXPLICIT_PATHS = frozenset(
+    {
+        DEFAULT_BASELINE_LOCK,
+        "configs/data_foundation_prediction_baseline.json",
+        DEFAULT_SELECTION_LOCK,
+        STAGE2_AUXILIARY_MANIFEST_RELATIVE,
+        "configs/source_descriptors/bagen_swebench.json",
+        "configs/source_descriptors/spend_openhands.json",
+        FINAL_RUNNER_RELATIVE,
+        "scripts/prepare_stage4_selection.py",
+        "scripts/run_data_foundation_baseline.py",
+        "scripts/run_stage2_experiments.py",
+        "scripts/run_stage3_experiments.py",
+        "scripts/run_stage4_experiments.py",
+    }
+)
 
 
 class Stage4FinalError(RuntimeError):
@@ -270,15 +294,10 @@ def load_selection_lock(
             "status",
             "--porcelain=v1",
             "-z",
-            "--untracked-files=all",
-            "--",
-            relative,
-            "src/token_prediction",
-            FINAL_RUNNER_RELATIVE,
-            "scripts/prepare_stage4_selection.py",
+            "--untracked-files=no",
         )
         if status:
-            raise Stage4FinalError("final evaluation code or selection lock is dirty")
+            raise Stage4FinalError("tracked worktree must be completely clean for final evaluation")
     artifact_lock = document["selection_artifact"]
     selection_relative = _safe_relative(
         artifact_lock["path"],
@@ -356,6 +375,227 @@ def _safe_workspace_root(
     if destination.exists() and _is_link_or_reparse(destination):
         raise Stage4FinalError(f"{label} is unsafe")
     return relative, destination
+
+
+def _require_canonical_final_arguments(
+    *,
+    selection_lock: str,
+    output_root: str,
+    checkpoint_root: str,
+) -> None:
+    expected = {
+        "selection lock": DEFAULT_SELECTION_LOCK,
+        "final output root": DEFAULT_OUTPUT_ROOT,
+        "final checkpoint root": DEFAULT_CHECKPOINT_ROOT,
+    }
+    supplied = {
+        "selection lock": selection_lock,
+        "final output root": output_root,
+        "final checkpoint root": checkpoint_root,
+    }
+    for label, canonical in expected.items():
+        if supplied[label] != canonical:
+            raise Stage4FinalError(f"{label} must be exactly {canonical!r}")
+        _safe_relative(canonical, label=label)
+
+
+@contextlib.contextmanager
+def _exclusive_final_process_lock(root: Path) -> Iterator[None]:
+    guard_root = _repo_path(root, FINAL_GUARD_ROOT, label="final guard root")
+    guard_root.mkdir(parents=True, exist_ok=True)
+    if _is_link_or_reparse(guard_root):
+        raise Stage4FinalError("final guard root is unsafe")
+    lock_path = _repo_path(root, FINAL_PROCESS_LOCK_RELATIVE, label="final process lock")
+    flags = os.O_RDWR | os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise Stage4FinalError("final process lock cannot be opened safely") from exc
+    locked = False
+    try:
+        if _is_link_or_reparse(lock_path):
+            raise Stage4FinalError("final process lock is unsafe")
+        status = os.fstat(descriptor)
+        if status.st_size < 1:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - exercised by Linux CI
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise Stage4FinalError(
+                "another Stage 4 final process already holds the fixed lock"
+            ) from exc
+        locked = True
+        yield
+    finally:
+        if locked:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - exercised by Linux CI
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+
+def _final_tombstone_path(root: Path, selection_id: str) -> Path:
+    _sha256(selection_id, name="final tombstone selection id")
+    return _repo_path(
+        root,
+        f"{FINAL_GUARD_ROOT}/{selection_id}.json",
+        label="final tombstone",
+    )
+
+
+def _tombstone_document(
+    *,
+    selection_id: str,
+    selection_commit: str,
+    run_id: str,
+    status: str,
+    final_artifact_id: str | None = None,
+) -> dict[str, object]:
+    if status not in {"opened", "published"}:
+        raise Stage4FinalError("final tombstone status is invalid")
+    if (
+        not isinstance(selection_commit, str)
+        or len(selection_commit) != 40
+        or any(character not in "0123456789abcdef" for character in selection_commit)
+    ):
+        raise Stage4FinalError("final tombstone selection commit is invalid")
+    if not isinstance(run_id, str) or len(run_id) != 24:
+        raise Stage4FinalError("final tombstone run id is invalid")
+    if final_artifact_id is not None:
+        _sha256(final_artifact_id, name="final tombstone artifact id")
+    if status == "opened" and final_artifact_id is not None:
+        raise Stage4FinalError("open final tombstone cannot name an artifact")
+    if status == "published" and final_artifact_id is None:
+        raise Stage4FinalError("published final tombstone must name its artifact")
+    return {
+        "tombstone_schema_version": FINAL_TOMBSTONE_SCHEMA_VERSION,
+        "policy_id": FINAL_TOMBSTONE_POLICY_ID,
+        "selection_id": selection_id,
+        "selection_commit": selection_commit,
+        "run_id": run_id,
+        "output_root": DEFAULT_OUTPUT_ROOT,
+        "checkpoint_root": DEFAULT_CHECKPOINT_ROOT,
+        "status": status,
+        "final_artifact_id": final_artifact_id,
+    }
+
+
+def _validate_tombstone(
+    value: Mapping[str, Any],
+    *,
+    selection_id: str,
+    selection_commit: str,
+    run_id: str,
+) -> None:
+    expected = _tombstone_document(
+        selection_id=selection_id,
+        selection_commit=selection_commit,
+        run_id=run_id,
+        status=str(value.get("status", "")),
+        final_artifact_id=value.get("final_artifact_id"),
+    )
+    if dict(value) != expected:
+        raise Stage4FinalError("final tombstone identity is invalid")
+
+
+def _open_final_tombstone(
+    root: Path,
+    *,
+    selection_id: str,
+    selection_commit: str,
+    run_id: str,
+    ledger_path: Path,
+) -> Path:
+    path = _final_tombstone_path(root, selection_id)
+    if path.exists():
+        value = _load_json(path, description="final tombstone")
+        _validate_tombstone(
+            value,
+            selection_id=selection_id,
+            selection_commit=selection_commit,
+            run_id=run_id,
+        )
+        if value["status"] == "published":
+            raise Stage4FinalError("final tombstone is published but artifact is missing")
+        if not ledger_path.is_file() or _is_link_or_reparse(ledger_path):
+            raise Stage4FinalError("open final tombstone has no resumable canonical ledger")
+        return path
+    document = _tombstone_document(
+        selection_id=selection_id,
+        selection_commit=selection_commit,
+        run_id=run_id,
+        status="opened",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raise Stage4FinalError("final tombstone appeared concurrently") from None
+    except OSError as exc:
+        raise Stage4FinalError("final tombstone cannot be created safely") from exc
+    try:
+        payload = canonical_json_bytes(document) + b"\n"
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _publish_final_tombstone(
+    path: Path,
+    *,
+    selection_id: str,
+    selection_commit: str,
+    run_id: str,
+    final_artifact_id: str,
+) -> None:
+    existing = _load_json(path, description="final tombstone")
+    _validate_tombstone(
+        existing,
+        selection_id=selection_id,
+        selection_commit=selection_commit,
+        run_id=run_id,
+    )
+    if existing["status"] != "opened":
+        raise Stage4FinalError("final tombstone cannot be published twice")
+    _atomic_json(
+        path,
+        _tombstone_document(
+            selection_id=selection_id,
+            selection_commit=selection_commit,
+            run_id=run_id,
+            status="published",
+            final_artifact_id=final_artifact_id,
+        ),
+    )
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -476,6 +716,81 @@ def _verify_cell_checkpoint(
     if declared != actual:
         raise Stage4FinalError("final cell checkpoint checksum does not match")
     return actual
+
+
+def _verify_checkpoint_selection_binding(
+    value: Mapping[str, Any],
+    *,
+    selection: Mapping[str, Any],
+    cell: Mapping[str, Any],
+) -> None:
+    for key in (
+        "cell_id",
+        "source_name",
+        "source_id",
+        "condition_id",
+        "position",
+        "target",
+        "candidate_id",
+        "candidate_hash",
+        "calibrator_id",
+        "alpha",
+    ):
+        if value.get(key) != cell.get(key):
+            raise Stage4FinalError(f"final checkpoint differs from selected cell field {key}")
+    model_execution = value.get("model_execution")
+    if not isinstance(model_execution, Mapping):
+        raise Stage4FinalError("final checkpoint model execution is invalid")
+    expected_mode = (
+        "strict_loaded_calibrated_full_trajectory_only"
+        if cell.get("selected_artifact_key") == "stage3_spend_openhands"
+        else "strict_loaded_bundle_only"
+    )
+    expected_member_projection = semantic_sha256(
+        [member["member_sha256"] for member in cell["members"]]
+    )
+    if model_execution != {
+        "ensemble_policy_id": FINAL_ENSEMBLE_POLICY_ID,
+        "member_count": len(cell["members"]),
+        "member_projection_sha256": expected_member_projection,
+        "execution_mode": expected_mode,
+        "refit": False,
+        "calibration_application_count": 1,
+    }:
+        raise Stage4FinalError("final checkpoint model execution differs from selection")
+    final_dataset = value.get("final_dataset")
+    if not isinstance(final_dataset, Mapping):
+        raise Stage4FinalError("final checkpoint dataset binding is invalid")
+    expected_parent, _expected_protocol = _source_expected_dataset(
+        selection,
+        str(cell["source_name"]),
+    )
+    if final_dataset.get("parent_dataset_id") != expected_parent:
+        raise Stage4FinalError("final checkpoint parent dataset differs from selection")
+    _sha256(final_dataset.get("dataset_id"), name="final checkpoint dataset id")
+    for key in ("task_count", "trajectory_count", "scored_point_count"):
+        value_count = final_dataset.get(key)
+        if isinstance(value_count, bool) or not isinstance(value_count, int) or value_count < 0:
+            raise Stage4FinalError(f"final checkpoint {key} is invalid")
+    if final_dataset["scored_point_count"] != value.get("prediction_count"):
+        raise Stage4FinalError("final checkpoint prediction count differs from dataset")
+    _sha256(
+        value.get("prediction_projection_sha256"),
+        name="final checkpoint prediction projection",
+    )
+    _sha256(
+        value.get("cohort_projection_sha256"),
+        name="final checkpoint cohort projection",
+    )
+    if (
+        not isinstance(value.get("metrics"), Mapping)
+        or not value["metrics"]
+        or not isinstance(value.get("task_metrics"), list)
+        or not value["task_metrics"]
+        or not isinstance(value.get("diagnostics"), Mapping)
+        or not value["diagnostics"]
+    ):
+        raise Stage4FinalError("final checkpoint scored evidence is incomplete")
 
 
 def _member_integrity(member: Mapping[str, Any]) -> None:
@@ -965,6 +1280,12 @@ def _evaluate_missing_cells(
 ) -> list[Mapping[str, Any]]:
     selection_id = str(lock.selection["selection_id"])
     cells = list(lock.selection["cells"])
+    ledger = _load_json(ledger_path, description="final holdout ledger")
+    declared_completed = ledger.get("completed_cell_ids")
+    if not isinstance(declared_completed, list) or any(
+        not isinstance(value, str) for value in declared_completed
+    ):
+        raise Stage4FinalError("final ledger completed cells are invalid")
     completed: dict[str, Mapping[str, Any]] = {}
     for cell in cells:
         cell_id = str(cell["cell_id"])
@@ -979,7 +1300,18 @@ def _evaluate_missing_cells(
                 selection_id=selection_id,
                 cell_id=cell_id,
             )
+            _verify_checkpoint_selection_binding(
+                value,
+                selection=lock.selection,
+                cell=cell,
+            )
             completed[cell_id] = value
+    if set(declared_completed) != set(completed) or len(declared_completed) != len(
+        set(declared_completed)
+    ):
+        raise Stage4FinalError(
+            "final ledger and checkpoint files disagree; final labels cannot be reopened"
+        )
     by_source: dict[str, list[Mapping[str, Any]]] = {}
     for cell in cells:
         if cell["cell_id"] not in completed:
@@ -1036,6 +1368,11 @@ def _evaluate_missing_cells(
                 reloaded,
                 selection_id=selection_id,
                 cell_id=str(cell["cell_id"]),
+            )
+            _verify_checkpoint_selection_binding(
+                reloaded,
+                selection=lock.selection,
+                cell=cell,
             )
             completed[str(cell["cell_id"])] = reloaded
             _atomic_json(
@@ -1195,9 +1532,7 @@ def _evaluation_code_binding(root: Path) -> Mapping[str, object]:
         "-z",
         "--",
         "src/token_prediction",
-        FINAL_RUNNER_RELATIVE,
-        "scripts/prepare_stage4_selection.py",
-        DEFAULT_SELECTION_LOCK,
+        *sorted(FINAL_EVALUATION_EXPLICIT_PATHS),
     )
     paths = tuple(
         sorted(
@@ -1206,11 +1541,7 @@ def _evaluation_code_binding(root: Path) -> Mapping[str, object]:
             if item
         )
     )
-    required = {
-        FINAL_RUNNER_RELATIVE,
-        "scripts/prepare_stage4_selection.py",
-        DEFAULT_SELECTION_LOCK,
-    }
+    required = set(FINAL_EVALUATION_EXPLICIT_PATHS)
     if not required <= set(paths):
         raise Stage4FinalError("final evaluation code closure is incomplete")
     digest = hashlib.sha256(b"stage4-final-evaluation-code-tree-v1\0")
@@ -1230,6 +1561,41 @@ def _evaluation_code_binding(root: Path) -> Mapping[str, object]:
         "code_tree_sha256": digest.hexdigest(),
         "paths": list(paths),
     }
+
+
+def _validate_runtime_module_origins(root: Path) -> None:
+    package_root = (root / "src" / "token_prediction").resolve()
+    package_modules = [
+        module
+        for name, module in sys.modules.items()
+        if name == "token_prediction" or name.startswith("token_prediction.")
+    ]
+    if not package_modules:
+        raise Stage4FinalError("token_prediction package is not loaded")
+    for module in package_modules:
+        origin = getattr(module, "__file__", None)
+        if not isinstance(origin, str):
+            raise Stage4FinalError("a token_prediction runtime module has no file origin")
+        try:
+            Path(origin).resolve().relative_to(package_root)
+        except ValueError as exc:
+            raise Stage4FinalError(
+                "token_prediction runtime module is outside the bound repository"
+            ) from exc
+    for module_name, relative in (
+        ("prepare_stage4_selection", "scripts/prepare_stage4_selection.py"),
+        ("run_data_foundation_baseline", "scripts/run_data_foundation_baseline.py"),
+        ("run_stage2_experiments", "scripts/run_stage2_experiments.py"),
+        ("run_stage3_experiments", "scripts/run_stage3_experiments.py"),
+        ("run_stage4_experiments", "scripts/run_stage4_experiments.py"),
+    ):
+        module = sys.modules.get(module_name) or sys.modules.get(f"scripts.{module_name}")
+        origin = getattr(module, "__file__", None) if module is not None else None
+        expected = _repo_path(root, relative, label=f"{module_name} runtime module")
+        if not isinstance(origin, str) or Path(origin).resolve() != expected.resolve():
+            raise Stage4FinalError(
+                f"{module_name} runtime module is outside the bound repository"
+            )
 
 
 def _existing_final_summary(
@@ -1279,6 +1645,37 @@ def run_stage4_final(
         Path(__file__)
     ):
         raise Stage4FinalError("executing final runner is outside repository_root")
+    _require_canonical_final_arguments(
+        selection_lock=selection_lock,
+        output_root=output_root,
+        checkpoint_root=checkpoint_root,
+    )
+    with _exclusive_final_process_lock(root):
+        release_tombstone = _repo_path(
+            root,
+            TRACKED_RELEASE_TOMBSTONE,
+            label="tracked final release tombstone",
+        )
+        if release_tombstone.exists():
+            raise Stage4FinalError(
+                "the tracked Stage 4 release permanently closes final evaluation"
+            )
+        return _run_stage4_final_locked(
+            root,
+            selection_lock=selection_lock,
+            output_root=output_root,
+            checkpoint_root=checkpoint_root,
+        )
+
+
+def _run_stage4_final_locked(
+    root: Path,
+    *,
+    selection_lock: str,
+    output_root: str,
+    checkpoint_root: str,
+) -> FinalSummary:
+    _validate_runtime_module_origins(root)
     _output_relative, output_parent = _safe_workspace_root(
         root,
         output_root,
@@ -1315,6 +1712,13 @@ def run_stage4_final(
             run_id=run_id,
             selection_id=str(lock.selection["selection_id"]),
         )
+    tombstone_path = _open_final_tombstone(
+        root,
+        selection_id=str(lock.selection["selection_id"]),
+        selection_commit=lock.selection_commit,
+        run_id=run_id,
+        ledger_path=ledger_path,
+    )
     checkpoint.mkdir(parents=True, exist_ok=True)
     ledger = _load_or_create_ledger(
         ledger_path,
@@ -1372,6 +1776,13 @@ def run_stage4_final(
             completed_cells=[str(value["cell_id"]) for value in cell_results],
             final_artifact_id=manifest.artifact_id,
         ),
+    )
+    _publish_final_tombstone(
+        tombstone_path,
+        selection_id=str(lock.selection["selection_id"]),
+        selection_commit=lock.selection_commit,
+        run_id=run_id,
+        final_artifact_id=manifest.artifact_id,
     )
     return FinalSummary(
         run_id=run_id,

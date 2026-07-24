@@ -35,6 +35,7 @@ from token_prediction.stage2_matrix import (
     STAGE2_STRUCTURED_FEATURES,
 )
 from token_prediction.telemetry import (
+    TELEMETRY_REQUIREMENTS,
     TelemetryDecision,
     TelemetrySurface,
     decide_telemetry_surface,
@@ -52,6 +53,11 @@ STAGE4_CALL_PRE_TARGETS = (
     PredictionTarget.CALL_FINAL_RESPONSE_OUTPUT_TOKENS,
 )
 STAGE4_TELEMETRY_SURFACES = tuple(TelemetrySurface)
+STAGE4_G3_REQUIRED_OBSERVABLES = frozenset(
+    TELEMETRY_REQUIREMENTS[TelemetrySurface.CALL_UPDATE]
+    | TELEMETRY_REQUIREMENTS[TelemetrySurface.G3_ENTROPY_STOP]
+    | TELEMETRY_REQUIREMENTS[TelemetrySurface.G3_HIDDEN_STATE]
+)
 
 _PROGRESS_FEATURES = frozenset(
     {
@@ -846,6 +852,50 @@ def build_stage4_matrix(
                 )
             )
         else:
+            candidates = [
+                CandidateSpec(
+                    "empirical",
+                    "empirical_quantile",
+                    FeatureSet("none", include_all=False),
+                    params={"alpha": STAGE4_ALPHA},
+                    role=CandidateRole.BASELINE,
+                )
+            ]
+            missing_g3_observables = tuple(
+                sorted(
+                    observable.value
+                    for observable in (
+                        STAGE4_G3_REQUIRED_OBSERVABLES
+                        - capabilities.observables
+                    )
+                )
+            )
+            if missing_g3_observables:
+                gates.append(
+                    Stage4Gate(
+                        source_id,
+                        condition_id,
+                        "g3_composite",
+                        (
+                            "missing_observables:"
+                            f"{','.join(missing_g3_observables)}"
+                        ),
+                        capabilities.contract_hash,
+                        update_task_count,
+                        update_point_count,
+                        PredictionPosition.CALL_UPDATE,
+                        call_update_target,
+                    )
+                )
+            else:
+                candidates.append(
+                    CandidateSpec(
+                        "lightgbm_g3",
+                        "lightgbm_quantile",
+                        STAGE4_G3_FEATURES,
+                        params=_lightgbm_params(),
+                    )
+                )
             plans.append(
                 Stage4ExperimentPlan(
                     ExperimentSpec(
@@ -858,21 +908,7 @@ def build_stage4_matrix(
                         ),
                         PredictionPosition.CALL_UPDATE,
                         call_update_target,
-                        (
-                            CandidateSpec(
-                                "empirical",
-                                "empirical_quantile",
-                                FeatureSet("none", include_all=False),
-                                params={"alpha": STAGE4_ALPHA},
-                                role=CandidateRole.BASELINE,
-                            ),
-                            CandidateSpec(
-                                "lightgbm_g3",
-                                "lightgbm_quantile",
-                                STAGE4_G3_FEATURES,
-                                params=_lightgbm_params(),
-                            ),
-                        ),
+                        tuple(candidates),
                         alpha=STAGE4_ALPHA,
                         calibrator_id=STAGE4_PRIMARY_CALIBRATOR_ID,
                         condition_id=condition_id,

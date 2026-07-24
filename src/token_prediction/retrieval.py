@@ -12,11 +12,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from token_prediction.contracts import Observable, SourceCapabilities
 from token_prediction.dataset import PredictionPoint
+from token_prediction.development import DevelopmentProtocol
 from token_prediction.features.reducer import FeatureValue
 
 
-RETRIEVAL_SCHEMA_VERSION = 1
-RETRIEVAL_POLICY_ID = "fold_fitted_word_unigram_bigram_tfidf_v1"
+RETRIEVAL_SCHEMA_VERSION = 2
+RETRIEVAL_POLICY_ID = "fold_fitted_word_unigram_bigram_tfidf_v2"
 RETRIEVAL_FEATURE_NAMES = frozenset(
     {
         "similar_task_total_tokens_median",
@@ -207,11 +208,149 @@ class _RetrievalDocument:
 
 
 @dataclass(frozen=True)
+class RetrievalProvenance:
+    dataset_id: str
+    development_protocol_id: str
+    split_plan_id: str
+    split_seed: int
+    outer_fold: int
+    capability_contract_hash: str
+    input_contract_hash: str
+    fit_task_set_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "dataset_id",
+            "development_protocol_id",
+            "split_plan_id",
+            "capability_contract_hash",
+            "input_contract_hash",
+            "fit_task_set_sha256",
+        ):
+            _required_sha256(
+                getattr(self, name),
+                name=f"retrieval provenance {name}",
+            )
+        if (
+            isinstance(self.split_seed, bool)
+            or not isinstance(self.split_seed, int)
+            or self.split_seed < 0
+        ):
+            raise ValueError("retrieval provenance split_seed must be non-negative")
+        if (
+            isinstance(self.outer_fold, bool)
+            or not isinstance(self.outer_fold, int)
+            or self.outer_fold < 0
+        ):
+            raise ValueError("retrieval provenance outer_fold must be non-negative")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "dataset_id": self.dataset_id,
+            "development_protocol_id": self.development_protocol_id,
+            "split_plan_id": self.split_plan_id,
+            "split_seed": self.split_seed,
+            "outer_fold": self.outer_fold,
+            "capability_contract_hash": self.capability_contract_hash,
+            "input_contract_hash": self.input_contract_hash,
+            "fit_task_set_sha256": self.fit_task_set_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> RetrievalProvenance:
+        expected = {
+            "dataset_id",
+            "development_protocol_id",
+            "split_plan_id",
+            "split_seed",
+            "outer_fold",
+            "capability_contract_hash",
+            "input_contract_hash",
+            "fit_task_set_sha256",
+        }
+        if set(value) != expected:
+            raise ValueError("retrieval provenance has missing or extra fields")
+        for name in expected - {"split_seed", "outer_fold"}:
+            if not isinstance(value[name], str):
+                raise TypeError(f"retrieval provenance {name} must be a string")
+        for name in ("split_seed", "outer_fold"):
+            if isinstance(value[name], bool) or not isinstance(value[name], int):
+                raise TypeError(f"retrieval provenance {name} must be an integer")
+        return cls(
+            dataset_id=value["dataset_id"],
+            development_protocol_id=value["development_protocol_id"],
+            split_plan_id=value["split_plan_id"],
+            split_seed=value["split_seed"],
+            outer_fold=value["outer_fold"],
+            capability_contract_hash=value["capability_contract_hash"],
+            input_contract_hash=value["input_contract_hash"],
+            fit_task_set_sha256=value["fit_task_set_sha256"],
+        )
+
+
+def _frozen_outer_provenance(
+    *,
+    development_protocol: DevelopmentProtocol,
+    split_seed: int,
+    outer_fold: int,
+    capabilities: SourceCapabilities,
+    input_contract_hash: str,
+) -> tuple[RetrievalProvenance, frozenset[str]]:
+    if Observable.TASK_TEXT not in capabilities.observables:
+        raise ValueError("fold-fitted retrieval is gated: missing_observables:task_text")
+    _required_sha256(input_contract_hash, name="retrieval input_contract_hash")
+    if (
+        development_protocol.parent_capability_contract_hash
+        != capabilities.contract_hash
+        or development_protocol.development_dataset.capability_contract_hash
+        != capabilities.contract_hash
+    ):
+        raise ValueError(
+            "retrieval capabilities do not match the frozen development protocol"
+        )
+    if (
+        development_protocol.parent_input_contract_hash != input_contract_hash
+        or development_protocol.development_dataset.input_contract_hash
+        != input_contract_hash
+    ):
+        raise ValueError(
+            "retrieval input contract does not match the frozen development protocol"
+        )
+    matching_plans = tuple(
+        plan for plan in development_protocol.outer_plans if plan.seed == split_seed
+    )
+    if len(matching_plans) != 1:
+        raise ValueError(
+            "retrieval split seed does not identify one frozen outer split plan"
+        )
+    split_plan = matching_plans[0]
+    if split_plan.dataset_id != development_protocol.development_dataset.dataset_id:
+        raise ValueError(
+            "retrieval outer split is not bound to the development dataset"
+        )
+    partition = split_plan.partition(outer_fold)
+    fit_task_hashes = sorted(_task_hash(task_id) for task_id in partition.train_tasks)
+    return (
+        RetrievalProvenance(
+            dataset_id=development_protocol.development_dataset.dataset_id,
+            development_protocol_id=development_protocol.protocol_id,
+            split_plan_id=split_plan.split_plan_id,
+            split_seed=split_plan.seed,
+            outer_fold=outer_fold,
+            capability_contract_hash=capabilities.contract_hash,
+            input_contract_hash=input_contract_hash,
+            fit_task_set_sha256=_semantic_sha256(fit_task_hashes),
+        ),
+        partition.train_tasks,
+    )
+
+
+@dataclass(frozen=True)
 class FoldFittedTfidfRetriever:
     vocabulary: tuple[str, ...]
     idf: tuple[float, ...]
     documents: tuple[_RetrievalDocument, ...]
-    fit_task_set_sha256: str
+    provenance: RetrievalProvenance
     k: int = 5
     max_features: int = 4096
     policy_id: str = RETRIEVAL_POLICY_ID
@@ -258,13 +397,13 @@ class FoldFittedTfidfRetriever:
                 raise ValueError("retrieval sparse vector index is out of range")
             if any(not math.isfinite(value) or value <= 0 for _index, value in document.vector):
                 raise ValueError("retrieval sparse vector values must be finite and positive")
-        _required_sha256(
-            self.fit_task_set_sha256,
-            name="retrieval fit task set SHA-256",
-        )
         expected_set_hash = _semantic_sha256(task_hashes)
-        if self.fit_task_set_sha256 != expected_set_hash:
+        if self.provenance.fit_task_set_sha256 != expected_set_hash:
             raise ValueError("retrieval fit task set hash does not match documents")
+
+    @property
+    def fit_task_set_sha256(self) -> str:
+        return self.provenance.fit_task_set_sha256
 
     @property
     def content_hash(self) -> str:
@@ -276,7 +415,7 @@ class FoldFittedTfidfRetriever:
             "policy_id": self.policy_id,
             "k": self.k,
             "max_features": self.max_features,
-            "fit_task_set_sha256": self.fit_task_set_sha256,
+            "provenance": self.provenance.to_dict(),
             "vocabulary": list(self.vocabulary),
             "idf": list(self.idf),
             "documents": [document.to_dict() for document in self.documents],
@@ -288,14 +427,44 @@ class FoldFittedTfidfRetriever:
     def to_json_bytes(self) -> bytes:
         return _canonical_json_bytes(self.to_dict())
 
+    def validate_provenance(
+        self,
+        *,
+        development_protocol: DevelopmentProtocol,
+        split_seed: int,
+        outer_fold: int,
+        capabilities: SourceCapabilities,
+        input_contract_hash: str,
+    ) -> None:
+        expected, _fit_tasks = _frozen_outer_provenance(
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
+        if self.provenance != expected:
+            raise ValueError(
+                "retrieval artifact provenance does not match the frozen outer partition"
+            )
+
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> FoldFittedTfidfRetriever:
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        development_protocol: DevelopmentProtocol,
+        split_seed: int,
+        outer_fold: int,
+        capabilities: SourceCapabilities,
+        input_contract_hash: str,
+    ) -> FoldFittedTfidfRetriever:
         expected = {
             "schema_version",
             "policy_id",
             "k",
             "max_features",
-            "fit_task_set_sha256",
+            "provenance",
             "vocabulary",
             "idf",
             "documents",
@@ -321,10 +490,10 @@ class FoldFittedTfidfRetriever:
             )
         if not isinstance(payload["policy_id"], str):
             raise TypeError("retrieval policy_id must be a string")
-        _required_sha256(
-            payload["fit_task_set_sha256"],
-            name="retrieval fit task set SHA-256",
-        )
+        raw_provenance = payload["provenance"]
+        if not isinstance(raw_provenance, Mapping):
+            raise TypeError("retrieval provenance must be an object")
+        provenance = RetrievalProvenance.from_dict(raw_provenance)
         raw_documents = payload["documents"]
         if not isinstance(raw_documents, list):
             raise TypeError("retrieval documents must be an array")
@@ -380,19 +549,36 @@ class FoldFittedTfidfRetriever:
             for item in raw_idf
         ):
             raise TypeError("retrieval idf must be an array of numbers")
-        return cls(
+        fitted = cls(
             vocabulary=tuple(raw_vocabulary),
             idf=tuple(float(item) for item in raw_idf),
             documents=tuple(documents),
-            fit_task_set_sha256=payload["fit_task_set_sha256"],
+            provenance=provenance,
             k=payload["k"],
             max_features=payload["max_features"],
             policy_id=payload["policy_id"],
             schema_version=payload["schema_version"],
         )
+        fitted.validate_provenance(
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
+        return fitted
 
     @classmethod
-    def from_json_bytes(cls, payload: bytes) -> FoldFittedTfidfRetriever:
+    def from_json_bytes(
+        cls,
+        payload: bytes,
+        *,
+        development_protocol: DevelopmentProtocol,
+        split_seed: int,
+        outer_fold: int,
+        capabilities: SourceCapabilities,
+        input_contract_hash: str,
+    ) -> FoldFittedTfidfRetriever:
         def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             for key, item in pairs:
@@ -413,9 +599,33 @@ class FoldFittedTfidfRetriever:
             raise ValueError("retrieval bundle is not strict UTF-8 JSON") from exc
         if not isinstance(value, Mapping):
             raise TypeError("retrieval bundle root must be an object")
-        return cls.from_dict(value)
+        return cls.from_dict(
+            value,
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
 
-    def transform(self, *, task_id: str, task_text: str) -> RetrievalFeatures:
+    def transform(
+        self,
+        *,
+        task_id: str,
+        task_text: str,
+        development_protocol: DevelopmentProtocol,
+        split_seed: int,
+        outer_fold: int,
+        capabilities: SourceCapabilities,
+        input_contract_hash: str,
+    ) -> RetrievalFeatures:
+        self.validate_provenance(
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
         if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError("retrieval query task_id is required")
         if not isinstance(task_text, str) or not task_text.strip():
@@ -451,13 +661,38 @@ class FoldFittedTfidfRetriever:
             neighbor_count=len(neighbors),
         )
 
-    def transform_point(self, point: PredictionPoint, *, task_text: str) -> PredictionPoint:
+    def transform_point(
+        self,
+        point: PredictionPoint,
+        *,
+        task_text: str,
+        development_protocol: DevelopmentProtocol,
+        split_seed: int,
+        outer_fold: int,
+        capabilities: SourceCapabilities,
+        input_contract_hash: str,
+    ) -> PredictionPoint:
+        self.validate_provenance(
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
         overlap = RETRIEVAL_FEATURE_NAMES & set(point.features)
         if overlap:
             raise ValueError(
                 f"point already contains retrieval features: {', '.join(sorted(overlap))}"
             )
-        features = self.transform(task_id=point.task_id, task_text=task_text)
+        features = self.transform(
+            task_id=point.task_id,
+            task_text=task_text,
+            development_protocol=development_protocol,
+            split_seed=split_seed,
+            outer_fold=outer_fold,
+            capabilities=capabilities,
+            input_contract_hash=input_contract_hash,
+        )
         return point.with_features({**point.features, **features.as_point_features()})
 
 
@@ -465,12 +700,20 @@ def fit_fold_tfidf_retriever(
     examples: Iterable[RetrievalExample],
     *,
     capabilities: SourceCapabilities,
-    fit_task_ids: frozenset[str],
+    input_contract_hash: str,
+    development_protocol: DevelopmentProtocol,
+    split_seed: int,
+    outer_fold: int,
     k: int = 5,
     max_features: int = 4096,
 ) -> FoldFittedTfidfRetriever:
-    if Observable.TASK_TEXT not in capabilities.observables:
-        raise ValueError("fold-fitted retrieval is gated: missing_observables:task_text")
+    provenance, fit_task_ids = _frozen_outer_provenance(
+        development_protocol=development_protocol,
+        split_seed=split_seed,
+        outer_fold=outer_fold,
+        capabilities=capabilities,
+        input_contract_hash=input_contract_hash,
+    )
     if k <= 0 or max_features <= 0:
         raise ValueError("retrieval k and max_features must be positive")
     resolved = tuple(examples)
@@ -480,7 +723,13 @@ def fit_fold_tfidf_retriever(
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("retrieval fit task ids must be unique")
     if frozenset(task_ids) != fit_task_ids:
-        raise ValueError("retrieval examples must exactly match the declared fold-fit tasks")
+        non_train_count = len(frozenset(task_ids) - fit_task_ids)
+        missing_train_count = len(fit_task_ids - frozenset(task_ids))
+        raise ValueError(
+            "retrieval examples must exactly match the frozen outer-train partition; "
+            f"non_train_count={non_train_count}, "
+            f"missing_train_count={missing_train_count}"
+        )
 
     term_sets = [set(_terms(example.task_text)) for example in resolved]
     document_frequency = Counter(
@@ -511,12 +760,11 @@ def fit_fold_tfidf_retriever(
             key=lambda document: document.task_hash,
         )
     )
-    task_hashes = [document.task_hash for document in documents]
     return FoldFittedTfidfRetriever(
         vocabulary=vocabulary,
         idf=idf,
         documents=documents,
-        fit_task_set_sha256=_semantic_sha256(task_hashes),
+        provenance=provenance,
         k=k,
         max_features=max_features,
     )
@@ -529,5 +777,6 @@ __all__ = [
     "FoldFittedTfidfRetriever",
     "RetrievalExample",
     "RetrievalFeatures",
+    "RetrievalProvenance",
     "fit_fold_tfidf_retriever",
 ]

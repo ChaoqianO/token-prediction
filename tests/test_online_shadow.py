@@ -17,15 +17,39 @@ from token_prediction.dataset import (
     lifecycle_scored_hash,
     point_input_semantic,
 )
+from token_prediction.dataset.points import (
+    prediction_input_contract_hash_from_capability,
+)
 from token_prediction.estimators import SessionSeed, TokenForecast
 from token_prediction.estimators.cross_position_deduct import FittedCrossPositionDeduct
 from token_prediction.lifecycle import run_lifecycle_sequence
-from token_prediction.online_shadow import OnlineShadowSession
+from token_prediction.online_shadow import (
+    OnlineShadowProvenance,
+    OnlineShadowSession,
+    fitted_model_provenance_hash,
+)
 from token_prediction.telemetry import TelemetryCapabilityError
 
 
 TARGET = PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS
-CONTRACT = "a" * 64
+
+
+def _capabilities(source_id: str = "source") -> SourceCapabilities:
+    return SourceCapabilities(
+        source_id,
+        frozenset(
+            {
+                Observable.ATTEMPT_USAGE,
+                Observable.REQUEST_BOUNDARIES,
+            }
+        ),
+    )
+
+
+CAPABILITIES = _capabilities()
+CONTRACT = prediction_input_contract_hash_from_capability(
+    capability_contract_hash=CAPABILITIES.contract_hash
+)
 
 
 def _hash(value: object) -> str:
@@ -121,6 +145,25 @@ def _seed(point: PredictionPoint) -> SessionSeed:
     )
 
 
+def _provenance(
+    fitted: FittedCrossPositionDeduct,
+    seed: SessionSeed,
+    *,
+    capabilities: SourceCapabilities = CAPABILITIES,
+) -> OnlineShadowProvenance:
+    return OnlineShadowProvenance(
+        source_id=capabilities.source_id,
+        capability_contract_hash=capabilities.contract_hash,
+        dataset_id=fitted.dataset_id,
+        input_contract_hash=fitted.input_contract_hash,
+        condition_id=fitted.condition_id,
+        target=fitted.target,
+        estimator_id=fitted.estimator_id,
+        fitted_model_provenance_hash=fitted_model_provenance_hash(fitted),
+        seed_component_bundle_hashes=seed.component_bundle_hashes,
+    )
+
+
 class OnlineShadowTests(unittest.TestCase):
     def test_incremental_shadow_uses_the_exact_offline_driver_order(self) -> None:
         sequence = _sequence()
@@ -136,15 +179,8 @@ class OnlineShadowTests(unittest.TestCase):
         emitted = []
         shadow = OnlineShadowSession(
             fitted,
-            capabilities=SourceCapabilities(
-                "source",
-                frozenset(
-                    {
-                        Observable.ATTEMPT_USAGE,
-                        Observable.REQUEST_BOUNDARIES,
-                    }
-                ),
-            ),
+            capabilities=CAPABILITIES,
+            provenance=_provenance(fitted, seed),
             dataset_id=sequence.dataset_id,
             input_contract_hash=sequence.input_contract_hash,
             condition_id=sequence.condition_id,
@@ -189,11 +225,160 @@ class OnlineShadowTests(unittest.TestCase):
                     "source",
                     frozenset({Observable.REQUEST_BOUNDARIES}),
                 ),
+                provenance=_provenance(fitted, _seed(sequence.steps[0].point)),
                 dataset_id=sequence.dataset_id,
                 input_contract_hash=sequence.input_contract_hash,
                 condition_id=sequence.condition_id,
                 task_pre_point=sequence.steps[0].point,
                 seed=_seed(sequence.steps[0].point),
+            )
+
+    def test_online_shadow_rejects_capabilities_from_another_source(self) -> None:
+        sequence = _sequence()
+        fitted = FittedCrossPositionDeduct(
+            "cross_position_deduct",
+            sequence.dataset_id,
+            TARGET,
+            sequence.condition_id,
+            sequence.input_contract_hash,
+        )
+        seed = _seed(sequence.steps[0].point)
+        with self.assertRaisesRegex(ValueError, "source_id"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=_capabilities("other-source"),
+                provenance=_provenance(fitted, seed),
+                dataset_id=sequence.dataset_id,
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+
+    def test_online_shadow_rejects_wrong_capability_contract(self) -> None:
+        sequence = _sequence()
+        fitted = FittedCrossPositionDeduct(
+            "cross_position_deduct",
+            sequence.dataset_id,
+            TARGET,
+            sequence.condition_id,
+            sequence.input_contract_hash,
+        )
+        seed = _seed(sequence.steps[0].point)
+        changed = SourceCapabilities(
+            CAPABILITIES.source_id,
+            CAPABILITIES.observables | {Observable.TASK_TERMINATION},
+        )
+        with self.assertRaisesRegex(ValueError, "capability contract"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=changed,
+                provenance=_provenance(fitted, seed),
+                dataset_id=sequence.dataset_id,
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+
+    def test_online_shadow_rejects_wrong_dataset_or_input_contract(self) -> None:
+        sequence = _sequence()
+        fitted = FittedCrossPositionDeduct(
+            "cross_position_deduct",
+            sequence.dataset_id,
+            TARGET,
+            sequence.condition_id,
+            sequence.input_contract_hash,
+        )
+        seed = _seed(sequence.steps[0].point)
+        provenance = _provenance(fitted, seed)
+        with self.assertRaisesRegex(ValueError, "dataset"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=CAPABILITIES,
+                provenance=provenance,
+                dataset_id="other-dataset",
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+        with self.assertRaisesRegex(ValueError, "input contract"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=CAPABILITIES,
+                provenance=provenance,
+                dataset_id=sequence.dataset_id,
+                input_contract_hash="f" * 64,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+
+    def test_online_shadow_rejects_wrong_target_provenance(self) -> None:
+        sequence = _sequence()
+        fitted = FittedCrossPositionDeduct(
+            "cross_position_deduct",
+            sequence.dataset_id,
+            TARGET,
+            sequence.condition_id,
+            sequence.input_contract_hash,
+        )
+        seed = _seed(sequence.steps[0].point)
+        provenance = replace(
+            _provenance(fitted, seed),
+            target=PredictionTarget.TASK_TOTAL_ACCOUNTED_TOKENS,
+        )
+        with self.assertRaisesRegex(ValueError, "target"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=CAPABILITIES,
+                provenance=provenance,
+                dataset_id=sequence.dataset_id,
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+
+    def test_online_shadow_rejects_wrong_model_or_seed_bundle_identity(self) -> None:
+        sequence = _sequence()
+        fitted = FittedCrossPositionDeduct(
+            "cross_position_deduct",
+            sequence.dataset_id,
+            TARGET,
+            sequence.condition_id,
+            sequence.input_contract_hash,
+        )
+        seed = _seed(sequence.steps[0].point)
+        provenance = _provenance(fitted, seed)
+        with self.assertRaisesRegex(ValueError, "fitted model provenance"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=CAPABILITIES,
+                provenance=replace(
+                    provenance,
+                    fitted_model_provenance_hash="f" * 64,
+                ),
+                dataset_id=sequence.dataset_id,
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
+            )
+        with self.assertRaisesRegex(ValueError, "seed bundle identity"):
+            OnlineShadowSession(
+                fitted,
+                capabilities=CAPABILITIES,
+                provenance=replace(
+                    provenance,
+                    seed_component_bundle_hashes=("e" * 64,),
+                ),
+                dataset_id=sequence.dataset_id,
+                input_contract_hash=sequence.input_contract_hash,
+                condition_id=sequence.condition_id,
+                task_pre_point=sequence.steps[0].point,
+                seed=seed,
             )
 
 

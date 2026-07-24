@@ -8,7 +8,11 @@ from pathlib import Path
 
 from scripts.prepare_stage4_selection import SOURCE_ARTIFACTS
 from scripts.run_stage4_final import (
+    DEFAULT_CHECKPOINT_ROOT,
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_SELECTION_LOCK,
     FINAL_COHORT_PROJECTION_ID,
+    FINAL_EVALUATION_EXPLICIT_PATHS,
     FINAL_RESULTS_SCHEMA_VERSION,
     FINAL_RUN_POLICY_ID,
     FINAL_SCORE_PROJECTION_ID,
@@ -16,8 +20,15 @@ from scripts.run_stage4_final import (
     SELECTION_LOCK_POLICY_ID,
     SELECTION_LOCK_SCHEMA_VERSION,
     SELECTION_TAG,
+    SelectionLockContext,
     Stage4FinalError,
     _directory_projection_sha256,
+    _exclusive_final_process_lock,
+    _evaluate_missing_cells,
+    _open_final_tombstone,
+    _publish_final_tombstone,
+    _require_canonical_final_arguments,
+    _verify_checkpoint_selection_binding,
     _validate_selection_lock_document,
     verify_final_results_document,
 )
@@ -116,6 +127,201 @@ def _final_results() -> dict[str, object]:
 
 
 class Stage4FinalTests(unittest.TestCase):
+    def test_final_paths_are_fixed_and_alternate_roots_are_rejected(self) -> None:
+        _require_canonical_final_arguments(
+            selection_lock=DEFAULT_SELECTION_LOCK,
+            output_root=DEFAULT_OUTPUT_ROOT,
+            checkpoint_root=DEFAULT_CHECKPOINT_ROOT,
+        )
+        with self.assertRaisesRegex(Stage4FinalError, "exactly"):
+            _require_canonical_final_arguments(
+                selection_lock=DEFAULT_SELECTION_LOCK,
+                output_root=f"{DEFAULT_OUTPUT_ROOT}/alternate",
+                checkpoint_root=DEFAULT_CHECKPOINT_ROOT,
+            )
+        with self.assertRaisesRegex(Stage4FinalError, "exactly"):
+            _require_canonical_final_arguments(
+                selection_lock=DEFAULT_SELECTION_LOCK,
+                output_root=DEFAULT_OUTPUT_ROOT,
+                checkpoint_root=f"{DEFAULT_CHECKPOINT_ROOT}/alternate",
+            )
+
+    def test_final_process_lock_is_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with _exclusive_final_process_lock(root):
+                with self.assertRaisesRegex(Stage4FinalError, "already holds"):
+                    with _exclusive_final_process_lock(root):
+                        self.fail("nested final process lock unexpectedly succeeded")
+
+    def test_tombstone_fails_closed_without_ledger_and_publishes_once(self) -> None:
+        selection_id = "a" * 64
+        selection_commit = "b" * 40
+        run_id = "c" * 24
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = root / DEFAULT_CHECKPOINT_ROOT / run_id / "ledger.json"
+            tombstone = _open_final_tombstone(
+                root,
+                selection_id=selection_id,
+                selection_commit=selection_commit,
+                run_id=run_id,
+                ledger_path=ledger,
+            )
+            with self.assertRaisesRegex(Stage4FinalError, "no resumable canonical ledger"):
+                _open_final_tombstone(
+                    root,
+                    selection_id=selection_id,
+                    selection_commit=selection_commit,
+                    run_id=run_id,
+                    ledger_path=ledger,
+                )
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                _open_final_tombstone(
+                    root,
+                    selection_id=selection_id,
+                    selection_commit=selection_commit,
+                    run_id=run_id,
+                    ledger_path=ledger,
+                ),
+                tombstone,
+            )
+            _publish_final_tombstone(
+                tombstone,
+                selection_id=selection_id,
+                selection_commit=selection_commit,
+                run_id=run_id,
+                final_artifact_id="d" * 64,
+            )
+            with self.assertRaisesRegex(Stage4FinalError, "published"):
+                _open_final_tombstone(
+                    root,
+                    selection_id=selection_id,
+                    selection_commit=selection_commit,
+                    run_id=run_id,
+                    ledger_path=ledger,
+                )
+
+    def test_final_code_closure_contains_all_executed_loaders_and_controls(self) -> None:
+        self.assertTrue(
+            {
+                "scripts/run_data_foundation_baseline.py",
+                "scripts/run_stage2_experiments.py",
+                "scripts/run_stage3_experiments.py",
+                "scripts/run_stage4_experiments.py",
+                "configs/data_foundation_v2_baseline.json",
+                "configs/stage2_auxiliary_sources.json",
+                "configs/source_descriptors/bagen_swebench.json",
+                "configs/source_descriptors/spend_openhands.json",
+            }
+            <= FINAL_EVALUATION_EXPLICIT_PATHS
+        )
+
+    def test_resume_rejects_ledger_checkpoint_disagreement(self) -> None:
+        selection_id = "a" * 64
+        lock = SelectionLockContext(
+            path=DEFAULT_SELECTION_LOCK,
+            sha256="b" * 64,
+            document={},
+            selection_root=Path("."),
+            selection_manifest_id="c" * 64,
+            selection={"selection_id": selection_id, "cells": []},
+            selection_commit="d" * 40,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoints" / ("e" * 24)
+            checkpoint.mkdir(parents=True)
+            ledger = checkpoint / "ledger.json"
+            ledger.write_text(
+                '{"completed_cell_ids":["orphaned-cell"]}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Stage4FinalError, "cannot be reopened"):
+                _evaluate_missing_cells(root, lock, checkpoint, ledger)
+
+    def test_resume_checkpoint_is_bound_to_selected_model_and_dataset(self) -> None:
+        member_hash = "1" * 64
+        cell = {
+            "cell_id": "2" * 64,
+            "source_name": "source-0",
+            "source_id": "source-id-0",
+            "condition_id": "condition-0",
+            "position": "call_pre",
+            "target": "call_billable_total_tokens",
+            "candidate_id": "lightgbm_history",
+            "candidate_hash": "3" * 64,
+            "calibrator_id": "task_max_conformal",
+            "alpha": 0.1,
+            "selected_artifact_key": "stage4_bagen_sokoban",
+            "members": [{"member_sha256": member_hash}],
+        }
+        selection = {
+            "source_artifacts": [
+                {
+                    "source_name": "source-0",
+                    "derived_dataset_id": "4" * 64,
+                    "development_protocol_id": "5" * 64,
+                }
+            ]
+        }
+        checkpoint = {
+            key: cell[key]
+            for key in (
+                "cell_id",
+                "source_name",
+                "source_id",
+                "condition_id",
+                "position",
+                "target",
+                "candidate_id",
+                "candidate_hash",
+                "calibrator_id",
+                "alpha",
+            )
+        }
+        checkpoint.update(
+            {
+                "final_dataset": {
+                    "dataset_id": "6" * 64,
+                    "parent_dataset_id": "4" * 64,
+                    "task_count": 1,
+                    "trajectory_count": 1,
+                    "scored_point_count": 1,
+                },
+                "model_execution": {
+                    "ensemble_policy_id": (
+                        "development_three_seed_five_fold_mean_v1"
+                    ),
+                    "member_count": 1,
+                    "member_projection_sha256": semantic_sha256([member_hash]),
+                    "execution_mode": "strict_loaded_bundle_only",
+                    "refit": False,
+                    "calibration_application_count": 1,
+                },
+                "metrics": {"mae": 1.0},
+                "task_metrics": [{"task": "pseudonym"}],
+                "diagnostics": {"status": "point_cell"},
+                "prediction_projection_sha256": "7" * 64,
+                "cohort_projection_sha256": "8" * 64,
+                "prediction_count": 1,
+            }
+        )
+        _verify_checkpoint_selection_binding(
+            checkpoint,
+            selection=selection,
+            cell=cell,
+        )
+        checkpoint["candidate_hash"] = "9" * 64
+        with self.assertRaisesRegex(Stage4FinalError, "candidate_hash"):
+            _verify_checkpoint_selection_binding(
+                checkpoint,
+                selection=selection,
+                cell=cell,
+            )
+
     def test_selection_lock_requires_exact_one_time_no_refit_protocol(self) -> None:
         _validate_selection_lock_document(_selection_lock())
         tampered = _selection_lock()
