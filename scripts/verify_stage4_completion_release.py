@@ -212,6 +212,20 @@ _DIAGNOSTIC_RECORD_KEYS = {
     "checkpoint_parity",
     "lifecycle_metrics",
 }
+_BUNDLE_INVENTORY_KEYS = {
+    "source_name",
+    "condition_id",
+    "experiment_id",
+    "candidate_id",
+    "candidate_hash",
+    "split_seed",
+    "split_plan_id",
+    "fold",
+    "bundle_relative_path",
+    "bundle_manifest_sha256",
+    "bundle_file_count",
+    "load_status",
+}
 _CHECKPOINT_PARITY_KEYS = {
     "status",
     "checkpoint_artifact_id",
@@ -2428,6 +2442,16 @@ def _inventory_identity(value: Mapping[str, Any]) -> tuple[object, ...]:
     return (*_diagnostic_identity(value), value.get("fold"))
 
 
+def _diagnostic_bundle_projection(
+    inventory: Sequence[Mapping[str, Any]],
+) -> str:
+    projection = [
+        {key: item[key] for key in sorted(_BUNDLE_INVENTORY_KEYS)}
+        for item in sorted(inventory, key=lambda value: int(value["fold"]))
+    ]
+    return _semantic_sha256(projection)
+
+
 def _verify_shared_development_task_projection(
     diagnostics: Sequence[Mapping[str, Any]],
 ) -> None:
@@ -3298,20 +3322,7 @@ def _verify_diagnostics_artifact(
     for item in inventory:
         record = _exact(
             item,
-            {
-                "source_name",
-                "condition_id",
-                "experiment_id",
-                "candidate_id",
-                "candidate_hash",
-                "split_seed",
-                "split_plan_id",
-                "fold",
-                "bundle_relative_path",
-                "bundle_manifest_sha256",
-                "bundle_file_count",
-                "load_status",
-            },
+            _BUNDLE_INVENTORY_KEYS,
             description="Stage 4 completion diagnostics bundle inventory",
         )
         identity = _inventory_identity(record)
@@ -3358,20 +3369,12 @@ def _verify_diagnostics_artifact(
                 "Stage 4 completion diagnostic bundle folds differ"
             )
         projection_items = [
-            {
-                "fold": fold,
-                "bundle_manifest_sha256": expected_inventory[
-                    (*identity, fold)
-                ]["bundle_manifest_sha256"],
-                "bundle_file_count": expected_inventory[
-                    (*identity, fold)
-                ]["bundle_file_count"],
-            }
+            expected_inventory[(*identity, fold)]
             for fold in range(EXPECTED_OUTER_FOLDS)
         ]
-        if record["bundle_projection_sha256"] != _semantic_sha256(
-            projection_items
-        ):
+        if record[
+            "bundle_projection_sha256"
+        ] != _diagnostic_bundle_projection(projection_items):
             raise Stage4CompletionReleaseError(
                 "Stage 4 completion diagnostic bundle projection differs"
             )

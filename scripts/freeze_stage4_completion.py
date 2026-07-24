@@ -45,6 +45,7 @@ if __package__:
     from scripts.verify_stage4_completion_release import (
         Stage4CompletionReleaseError,
         _code_binding_at_commit,
+        _diagnostic_bundle_projection,
         _expected_diagnostics_scope,
         _load_declared_bundles,
         _training_run_semantic_sha256,
@@ -71,6 +72,7 @@ else:  # pragma: no cover - production CLI invocation
     from verify_stage4_completion_release import (
         Stage4CompletionReleaseError,
         _code_binding_at_commit,
+        _diagnostic_bundle_projection,
         _expected_diagnostics_scope,
         _load_declared_bundles,
         _training_run_semantic_sha256,
@@ -1277,17 +1279,9 @@ def _audit_diagnostics_artifact(
             raise Stage4CompletionFreezeError(
                 "completion diagnostics bundle folds differ"
             )
-        bundle_projection = _semantic_sha256(
+        bundle_projection = _diagnostic_bundle_projection(
             [
-                {
-                    "fold": fold,
-                    "bundle_manifest_sha256": expected_inventory[
-                        (*identity, fold)
-                    ]["bundle_manifest_sha256"],
-                    "bundle_file_count": expected_inventory[
-                        (*identity, fold)
-                    ]["bundle_file_count"],
-                }
+                expected_inventory[(*identity, fold)]
                 for fold in range(EXPECTED_OUTER_FOLDS)
             ]
         )

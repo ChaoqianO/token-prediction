@@ -287,13 +287,7 @@ def _diagnostic_fixture() -> tuple[
                         }
                         inventory.append(item)
                         expected_inventory[(*identity, fold)] = item
-                        fold_projection.append(
-                            {
-                                "fold": fold,
-                                "bundle_manifest_sha256": manifest_sha256,
-                                "bundle_file_count": 4,
-                            }
-                        )
+                        fold_projection.append(item)
                     projection = _semantic_sha256(
                         [source_name, candidate_id, split_seed, "prediction"]
                     )
