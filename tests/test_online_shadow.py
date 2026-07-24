@@ -160,6 +160,7 @@ def _provenance(
         target=fitted.target,
         estimator_id=fitted.estimator_id,
         fitted_model_provenance_hash=fitted_model_provenance_hash(fitted),
+        seed_content_hash=seed.content_hash,
         seed_component_bundle_hashes=seed.component_bundle_hashes,
     )
 
@@ -380,6 +381,36 @@ class OnlineShadowTests(unittest.TestCase):
                 task_pre_point=sequence.steps[0].point,
                 seed=seed,
             )
+        changed_seeds = {
+            "forecast": replace(
+                seed,
+                forecast=TokenForecast(
+                    seed.forecast.point_id,
+                    seed.forecast.target,
+                    21,
+                    31,
+                    41,
+                    raw_lower=21,
+                    raw_point=31,
+                    raw_upper=41,
+                ),
+            ),
+            "initializer": replace(seed, initializer_hash="e" * 64),
+            "seed-policy": replace(seed, seed_policy_hash="f" * 64),
+        }
+        for name, changed_seed in changed_seeds.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "complete session seed"):
+                    OnlineShadowSession(
+                        fitted,
+                        capabilities=CAPABILITIES,
+                        provenance=provenance,
+                        dataset_id=sequence.dataset_id,
+                        input_contract_hash=sequence.input_contract_hash,
+                        condition_id=sequence.condition_id,
+                        task_pre_point=sequence.steps[0].point,
+                        seed=changed_seed,
+                    )
 
 
 if __name__ == "__main__":

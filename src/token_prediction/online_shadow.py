@@ -178,11 +178,12 @@ class OnlineShadowProvenance:
     target: PredictionTarget
     estimator_id: str
     fitted_model_provenance_hash: str
+    seed_content_hash: str
     seed_component_bundle_hashes: tuple[str, ...]
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported online shadow provenance schema version")
         for name in ("source_id", "dataset_id", "condition_id", "estimator_id"):
             value = getattr(self, name)
@@ -192,6 +193,7 @@ class OnlineShadowProvenance:
             "capability_contract_hash",
             "input_contract_hash",
             "fitted_model_provenance_hash",
+            "seed_content_hash",
         ):
             _require_sha256(getattr(self, name), name=name)
         if not isinstance(self.target, PredictionTarget):
@@ -224,6 +226,7 @@ class OnlineShadowProvenance:
                 "fitted_model_provenance_hash": (
                     self.fitted_model_provenance_hash
                 ),
+                "seed_content_hash": self.seed_content_hash,
                 "seed_component_bundle_hashes": list(
                     self.seed_component_bundle_hashes
                 ),
@@ -296,6 +299,10 @@ def _validate_shadow_provenance(
     if seed.component_bundle_hashes != provenance.seed_component_bundle_hashes:
         raise ValueError(
             "online shadow seed bundle identity differs from frozen provenance"
+        )
+    if seed.content_hash != provenance.seed_content_hash:
+        raise ValueError(
+            "online shadow complete session seed differs from frozen provenance"
         )
 
 
