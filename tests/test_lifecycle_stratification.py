@@ -216,6 +216,43 @@ class LifecycleStratificationTests(unittest.TestCase):
         self.assertEqual(report["status"], "estimable")
         self.assertEqual(report["mean_within_task_run_mae_variance"], 1.0)
 
+    def test_same_task_run_iqr_and_max_minus_min_are_task_equal(self) -> None:
+        runs = (
+            _run("task-a", "run-1", labels=(10,), predictions=(10,)),
+            _run("task-a", "run-2", labels=(10,), predictions=(12,)),
+            _run("task-a", "run-3", labels=(10,), predictions=(14,)),
+            _run("task-a", "run-4", labels=(10,), predictions=(20,)),
+            _run("task-b", "run-1", labels=(10,), predictions=(11,)),
+            _run("task-b", "run-2", labels=(10,), predictions=(15,)),
+            _run("task-c", "run-1", labels=(10,), predictions=(19,)),
+        )
+        report = evaluate_same_task_run_variance(runs)
+        self.assertEqual(report["n_repeated_tasks"], 2)
+        self.assertEqual(report["mean_within_task_run_mae_iqr"], 3.0)
+        self.assertEqual(report["median_within_task_run_mae_iqr"], 3.0)
+        self.assertEqual(report["max_within_task_run_mae_iqr"], 4.0)
+        self.assertEqual(
+            report["mean_within_task_run_mae_max_minus_min"],
+            7.0,
+        )
+        self.assertEqual(
+            report["median_within_task_run_mae_max_minus_min"],
+            7.0,
+        )
+        self.assertEqual(
+            report["max_within_task_run_mae_max_minus_min"],
+            10.0,
+        )
+
+    def test_run_dispersion_empty_and_nonfinite_inputs_fail_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least one run"):
+            evaluate_same_task_run_variance(())
+
+        run = _run("task", "run", labels=(10,), predictions=(10,))
+        object.__setattr__(run.predictions[0].forecast, "point", float("nan"))
+        with self.assertRaisesRegex(ValueError, "errors must be finite"):
+            evaluate_same_task_run_variance((run,))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,11 @@ from unittest.mock import patch
 import token_prediction.lifecycle_bundle as lifecycle_bundle_module
 from token_prediction import __version__ as TOKEN_PREDICTION_VERSION
 from token_prediction.contracts import Observable, SourceCapabilities, SourceDescriptor
-from token_prediction.crossfit import SEED_POLICY_ID
+from token_prediction.crossfit import (
+    POINT_ONLY_SEED_POLICY_HASH,
+    POINT_ONLY_SEED_POLICY_ID,
+    SEED_POLICY_ID,
+)
 from token_prediction.dataset import (
     INNER_FOLD_POLICY_ID,
     LabelStatus,
@@ -353,6 +357,74 @@ class LifecycleExperimentTests(unittest.TestCase):
             {step.point.point_id for step in self.lifecycle.scored_steps},
         )
         self.assertEqual(len(self.empirical_result.fold_artifacts), 5)
+
+    def test_point_only_seed_policy_bundle_reloads_calibrated_trajectories(self) -> None:
+        primary = _empirical_candidate()
+        candidate = replace(
+            primary,
+            candidate_id="point-only-seeded-cross-position-deduct",
+            graph=replace(
+                primary.graph,
+                seed_policy_id=POINT_ONLY_SEED_POLICY_ID,
+            ),
+        )
+        result = run_lifecycle_candidate_cv(
+            self.dataset,
+            self.lifecycle,
+            self.split_plan,
+            candidate,
+            builtin_registry(),
+            alpha=0.10,
+            calibrator_id="task_max_conformal",
+            seed=self.split_plan.seed,
+            inner_plans=self.inner_plans,
+            source_provenance=self.source_provenance,
+        )
+        self.assertEqual(len(result.fold_artifacts), 5)
+        for artifact in result.fold_artifacts:
+            bundle = dict(artifact.bundle_files or {})
+            manifest = json.loads(bundle["manifest.json"])
+            self.assertEqual(
+                manifest["seed_policy_id"],
+                POINT_ONLY_SEED_POLICY_ID,
+            )
+            self.assertEqual(
+                manifest["seed_policy_hash"],
+                POINT_ONLY_SEED_POLICY_HASH,
+            )
+            loaded = load_lifecycle_bundle(
+                bundle,
+                expected_source_provenance=self.source_provenance,
+            )
+            test_tasks = self.split_plan.partition(artifact.fold).test_tasks
+            sequences = tuple(
+                sequence
+                for sequence in self.lifecycle.sequences
+                if sequence.task_id in test_tasks
+            )
+            seeds = loaded.external_seeds(sequences)
+            self.assertTrue(
+                all(
+                    seed.forecast.lower
+                    == seed.forecast.point
+                    == seed.forecast.upper
+                    for seed in seeds.values()
+                )
+            )
+            replay = loaded.run_calibrated(sequences)
+            expected = {
+                record.point_id: _without_latency(record.forecast)
+                for record in result.predictions
+                if record.fold == artifact.fold
+            }
+            actual = {
+                prediction.step.point.point_id: _without_latency(
+                    prediction.forecast
+                )
+                for run in replay
+                for prediction in run.scored_predictions
+            }
+            self.assertEqual(actual, expected)
 
     @unittest.skipUnless(HAS_NEURAL, "requires token-prediction[neural]")
     def test_gru_lifecycle_bundle_reloads_complete_calibrated_trajectories(self) -> None:

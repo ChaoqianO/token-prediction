@@ -52,6 +52,127 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["interval_score"]), 25.0)
         self.assertAlmostEqual(float(metrics["normalized_interval_width"]), 0.35)
 
+    def test_interval_tail_and_reserved_capacity_metrics_are_weighted(self) -> None:
+        target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
+        rows = (
+            ScoredForecast(
+                "below",
+                "run-below",
+                TokenForecast(
+                    "point-below",
+                    target,
+                    0,
+                    5,
+                    8,
+                    raw_lower=0,
+                    raw_point=5,
+                    raw_upper=8,
+                ),
+                10,
+                1,
+            ),
+            ScoredForecast(
+                "above",
+                "run-above",
+                TokenForecast(
+                    "point-above",
+                    target,
+                    7,
+                    8,
+                    10,
+                    raw_lower=7,
+                    raw_point=8,
+                    raw_upper=10,
+                ),
+                5,
+                2,
+            ),
+            ScoredForecast(
+                "covered",
+                "run-covered",
+                TokenForecast(
+                    "point-covered",
+                    target,
+                    4,
+                    6,
+                    9,
+                    raw_lower=4,
+                    raw_point=6,
+                    raw_upper=9,
+                ),
+                6,
+                3,
+            ),
+        )
+        metrics = evaluate_forecasts(rows)
+        self.assertAlmostEqual(metrics["interval_below_truth_rate"], 1 / 6)
+        self.assertAlmostEqual(metrics["interval_above_truth_rate"], 2 / 6)
+        self.assertAlmostEqual(metrics["target_exceeds_upper_rate"], 1 / 6)
+        self.assertAlmostEqual(metrics["mean_extra_reserved_tokens"], 19 / 6)
+        self.assertAlmostEqual(
+            metrics["coverage"]
+            + metrics["interval_below_truth_rate"]
+            + metrics["interval_above_truth_rate"],
+            1.0,
+        )
+        self.assertEqual(
+            metrics["raw_interval_below_truth_rate"],
+            metrics["interval_below_truth_rate"],
+        )
+        self.assertEqual(
+            metrics["raw_interval_above_truth_rate"],
+            metrics["interval_above_truth_rate"],
+        )
+        self.assertEqual(
+            metrics["raw_target_exceeds_upper_rate"],
+            metrics["target_exceeds_upper_rate"],
+        )
+        self.assertEqual(
+            metrics["raw_mean_extra_reserved_tokens"],
+            metrics["mean_extra_reserved_tokens"],
+        )
+
+    def test_interval_tail_boundaries_are_inclusive_coverage(self) -> None:
+        target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
+        rows = (
+            ScoredForecast(
+                "at-upper",
+                "run-upper",
+                TokenForecast("point-upper", target, 0, 5, 10),
+                10,
+                1,
+            ),
+            ScoredForecast(
+                "at-lower",
+                "run-lower",
+                TokenForecast("point-lower", target, 10, 12, 15),
+                10,
+                1,
+            ),
+        )
+        metrics = evaluate_forecasts(rows)
+        self.assertEqual(metrics["coverage"], 1.0)
+        self.assertEqual(metrics["interval_below_truth_rate"], 0.0)
+        self.assertEqual(metrics["interval_above_truth_rate"], 0.0)
+        self.assertEqual(metrics["target_exceeds_upper_rate"], 0.0)
+
+    def test_empty_or_nonfinite_metric_inputs_fail_closed(self) -> None:
+        target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
+        with self.assertRaisesRegex(ValueError, "empty"):
+            evaluate_forecasts(())
+        with self.assertRaisesRegex(ValueError, "target values must be finite"):
+            evaluate_forecasts(
+                (
+                    ScoredForecast(
+                        "task",
+                        "run",
+                        TokenForecast("point", target, 0, 1, 2),
+                        float("nan"),
+                        1,
+                    ),
+                )
+            )
+
     def test_zero_target_does_not_divide_by_zero(self) -> None:
         target = PredictionTarget.CALL_BILLABLE_OUTPUT_TOKENS
         metrics = evaluate_forecasts(

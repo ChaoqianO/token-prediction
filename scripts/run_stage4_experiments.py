@@ -463,6 +463,13 @@ def _result_document(
     }
 
 
+def _requires_reloadable_bundle(candidate: Any) -> bool:
+    return (
+        candidate.estimator_id in {"independent_mlp", "lightgbm_quantile"}
+        or candidate.graph.is_lifecycle
+    )
+
+
 def _result_for(
     execution: DevelopmentExperimentResults,
     *,
@@ -621,10 +628,7 @@ def build_stage4_results(
                     spec_index=spec_index,
                     candidate_id=candidate.candidate_id,
                 )
-                requires_bundle = candidate.estimator_id in {
-                    "independent_mlp",
-                    "lightgbm_quantile",
-                }
+                requires_bundle = _requires_reloadable_bundle(candidate)
                 result_document = _result_document(
                     result,
                     require_reloadable_bundle=requires_bundle,

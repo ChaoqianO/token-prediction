@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 from scripts import run_stage4_experiments as stage4
 from token_prediction.dataset import PredictionPosition, PredictionTarget
@@ -93,6 +94,23 @@ def _results_document() -> dict[str, object]:
 
 
 class Stage4RunnerTests(unittest.TestCase):
+    def test_neural_and_lifecycle_candidates_require_reloadable_bundles(self) -> None:
+        point_mlp = SimpleNamespace(
+            estimator_id="independent_mlp",
+            graph=SimpleNamespace(is_lifecycle=False),
+        )
+        lifecycle = SimpleNamespace(
+            estimator_id="cross_position_deduct",
+            graph=SimpleNamespace(is_lifecycle=True),
+        )
+        stateless = SimpleNamespace(
+            estimator_id="empirical_quantile",
+            graph=SimpleNamespace(is_lifecycle=False),
+        )
+        self.assertTrue(stage4._requires_reloadable_bundle(point_mlp))
+        self.assertTrue(stage4._requires_reloadable_bundle(lifecycle))
+        self.assertFalse(stage4._requires_reloadable_bundle(stateless))
+
     def test_prediction_projection_excludes_latency_but_binds_forecasts(self) -> None:
         first = _result(latency_ms=1.0)
         second = _result(latency_ms=999.0)

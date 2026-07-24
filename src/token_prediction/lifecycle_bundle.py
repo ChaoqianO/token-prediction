@@ -21,9 +21,10 @@ from typing import Any, Mapping, Sequence
 from token_prediction import __version__ as TOKEN_PREDICTION_VERSION
 from token_prediction.contracts import SourceDescriptor
 from token_prediction.crossfit import (
-    SEED_POLICY_HASH,
-    SEED_POLICY_ID,
+    SUPPORTED_SEED_POLICY_IDS,
     ensemble_repaired_forecasts,
+    prepare_seed_forecast,
+    seed_policy_hash,
 )
 from token_prediction.dataset import (
     CAPABILITY_DATASET_SCHEMA_VERSION,
@@ -815,20 +816,17 @@ class LoadedLifecycleBundle:
                     )
                 )
                 forecast = session.predict(point)
-                repaired_point = max(0.0, forecast.point)
                 forecasts.append(
-                    TokenForecast(
-                        point_id=point.point_id,
-                        target=point.target,
-                        lower=min(max(0.0, forecast.lower), repaired_point),
-                        point=repaired_point,
-                        upper=max(max(0.0, forecast.upper), repaired_point),
-                        raw_lower=forecast.lower,
-                        raw_point=forecast.point,
-                        raw_upper=forecast.upper,
+                    prepare_seed_forecast(
+                        forecast,
+                        seed_policy_id=str(manifest["seed_policy_id"]),
                     )
                 )
-            ensemble = ensemble_repaired_forecasts(point, forecasts)
+            ensemble = ensemble_repaired_forecasts(
+                point,
+                forecasts,
+                seed_policy_id=str(manifest["seed_policy_id"]),
+            )
             bundle_hashes = tuple(
                 digest
                 for component in self.initializers
@@ -841,8 +839,8 @@ class LoadedLifecycleBundle:
                 initializer_hash=str(manifest["initializer_hash"]),
                 inner_split_id=str(manifest["inner_split_id"]),
                 component_bundle_hashes=bundle_hashes,
-                seed_policy_id=SEED_POLICY_ID,
-                seed_policy_hash=SEED_POLICY_HASH,
+                seed_policy_id=str(manifest["seed_policy_id"]),
+                seed_policy_hash=str(manifest["seed_policy_hash"]),
             )
             if point.point_id in seeds:
                 raise LifecycleBundleError("duplicate Task-pre point in reload batch")
@@ -1098,15 +1096,13 @@ def load_lifecycle_bundle(
     _string(manifest["condition_id"], description="manifest condition id")
     graph = _mapping(manifest["candidate_graph"], description="candidate graph")
     _keys(graph, _CANDIDATE_GRAPH_KEYS, description="candidate graph")
-    if dict(graph) not in (
-        {
-            "initializer_estimator_id": "empirical_quantile",
-            "updater_estimator_id": updater_id,
-            "lifecycle_schema_id": _TASK_LIFECYCLE_SCHEMA_ID,
-            "seed_policy_id": SEED_POLICY_ID,
-            "inner_split_policy_id": INNER_FOLD_POLICY_ID,
-        }
-        for updater_id in ("cross_position_deduct", "gru_residual")
+    if (
+        graph.get("initializer_estimator_id") != "empirical_quantile"
+        or graph.get("updater_estimator_id")
+        not in {"cross_position_deduct", "gru_residual"}
+        or graph.get("lifecycle_schema_id") != _TASK_LIFECYCLE_SCHEMA_ID
+        or graph.get("seed_policy_id") not in SUPPORTED_SEED_POLICY_IDS
+        or graph.get("inner_split_policy_id") != INNER_FOLD_POLICY_ID
     ):
         raise LifecycleBundleError("unsupported lifecycle candidate graph")
     descriptor_document = _mapping(
@@ -1151,9 +1147,11 @@ def load_lifecycle_bundle(
         raise LifecycleBundleError("lifecycle bundle position is invalid")
     if manifest["target"] != PredictionTarget.TASK_PROVIDER_ACCOUNTED_REMAINING_TOKENS.value:
         raise LifecycleBundleError("lifecycle bundle target is invalid")
-    if manifest["seed_policy_id"] != SEED_POLICY_ID:
+    if manifest["seed_policy_id"] not in SUPPORTED_SEED_POLICY_IDS:
         raise LifecycleBundleError("lifecycle seed policy id is invalid")
-    if manifest["seed_policy_hash"] != SEED_POLICY_HASH:
+    if manifest["seed_policy_id"] != graph["seed_policy_id"]:
+        raise LifecycleBundleError("lifecycle seed policy differs from candidate graph")
+    if manifest["seed_policy_hash"] != seed_policy_hash(str(manifest["seed_policy_id"])):
         raise LifecycleBundleError("lifecycle seed policy hash is invalid")
     if manifest["lifecycle_schema_version"] != LIFECYCLE_SCHEMA_VERSION:
         raise LifecycleBundleError("lifecycle schema version is invalid")

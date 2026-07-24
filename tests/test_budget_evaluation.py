@@ -51,6 +51,29 @@ class BudgetEvaluationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "budgets"):
                     evaluate_budget_scenarios(rows, budgets=budgets)  # type: ignore[arg-type]
 
+    def test_empty_or_nonfinite_budget_inputs_fail_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires scored forecasts"):
+            evaluate_budget_scenarios((), budgets=(100,))
+        with self.assertRaisesRegex(ValueError, "target values must be finite"):
+            evaluate_budget_scenarios(
+                (
+                    ScoredForecast(
+                        task_id="task",
+                        trajectory_id="trajectory",
+                        forecast=TokenForecast(
+                            point_id="point",
+                            target=TARGET,
+                            lower=0,
+                            point=1,
+                            upper=2,
+                        ),
+                        target_value=float("inf"),
+                        sample_weight=1.0,
+                    ),
+                ),
+                budgets=(100,),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
