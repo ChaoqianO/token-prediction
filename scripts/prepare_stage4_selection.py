@@ -780,6 +780,7 @@ def _fit_empirical_members(
     matrix = build_stage4_matrix(
         protocol,
         source_id=loaded.source_lock.descriptor.source_id,
+        capabilities=loaded.source_lock.descriptor.capabilities,
     )
     specs = [
         spec

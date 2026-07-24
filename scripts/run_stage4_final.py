@@ -313,6 +313,23 @@ def load_selection_lock(
         or code.get("code_tree_sha256") != artifact_lock["selection_code_tree_sha256"]
     ):
         raise Stage4FinalError("selection artifact payload differs from the lock")
+    for source_spec in SOURCE_ARTIFACTS:
+        source_relative = _safe_relative(
+            source_spec.path,
+            label=f"{source_spec.key} artifact path",
+        )
+        source_manifest = verify_artifact(
+            _repo_path(root, source_relative, label=f"{source_spec.key} artifact")
+        )
+        if (
+            source_manifest.artifact_id != source_spec.artifact_id
+            or source_manifest.metadata.get("run_id") != source_spec.run_id
+            or source_manifest.metadata.get("results_payload_sha256")
+            != source_spec.results_payload_sha256
+        ):
+            raise Stage4FinalError(
+                f"{source_spec.key} development artifact differs from final selection"
+            )
     return SelectionLockContext(
         path=relative,
         sha256=sha256_file(path),
@@ -481,6 +498,20 @@ def _load_calibrator(root: Path, relative: str) -> FittedExpansionCalibrator:
         raise Stage4FinalError("selected calibrator is invalid") from exc
 
 
+def _verify_member_auxiliary_files(
+    root: Path,
+    member: Mapping[str, Any],
+) -> None:
+    for role in ("calibrator", "provenance"):
+        relative = _safe_relative(
+            member[f"{role}_path"],
+            label=f"selected {role} path",
+        )
+        path = _repo_path(root, relative, label=f"selected {role}")
+        if sha256_file(path) != member[f"{role}_sha256"]:
+            raise Stage4FinalError(f"selected {role} differs from frozen selection")
+
+
 def _point_cell_rows(
     dataset: Any,
     *,
@@ -538,6 +569,7 @@ def _lightgbm_member_predictions(
     bundle_root = _repo_path(root, bundle_relative, label="selected LightGBM bundle")
     if member["bundle_tree_sha256"] != _directory_projection_sha256(bundle_root):
         raise Stage4FinalError("selected LightGBM bundle tree differs from selection")
+    _verify_member_auxiliary_files(root, member)
     calibrator_relative = _safe_relative(
         member["calibrator_path"],
         label="selected calibrator path",
@@ -598,6 +630,7 @@ def _lifecycle_member_runs(
     bundle_root = _repo_path(root, relative, label="selected lifecycle bundle")
     if member["bundle_tree_sha256"] != _directory_projection_sha256(bundle_root):
         raise Stage4FinalError("selected lifecycle bundle tree differs from selection")
+    _verify_member_auxiliary_files(root, member)
     loaded = load_lifecycle_bundle(bundle_root)
     training_dataset_id = str(loaded.manifest["dataset_id"])
     adapted = tuple(
